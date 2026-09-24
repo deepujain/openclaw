@@ -50,7 +50,7 @@ import { recordSessionParticipantBestEffort } from "../../sessions/session-parti
 import { registerSessionStateWatch } from "../../sessions/session-state-events.js";
 import { normalizeDeliveryContext } from "../../utils/delivery-context.shared.js";
 import { INTERNAL_MESSAGE_CHANNEL } from "../../utils/message-channel.js";
-import { listAgentIds, resolveSessionAgentId } from "../agent-scope.js";
+import { listAgentIds, resolveAgentConfig, resolveSessionAgentId } from "../agent-scope.js";
 import { resolveNestedAgentLaneForSession } from "../lanes.js";
 import { runOutsidePreparedModelRuntimePluginGenerationScope } from "../prepared-model-runtime-generation-scope.js";
 import {
@@ -97,6 +97,14 @@ const log = createSubsystemLogger("agents/sessions-send");
 
 type GatewayCaller = AgentToolGatewayRequestCaller;
 const NO_REPLY_MESSAGE = "No visible reply or pending announcement. Continue or retry if needed.";
+
+function resolveRequesterIdentityName(params: {
+  cfg: OpenClawConfig;
+  requesterAgentId: string;
+}): string | undefined {
+  const name = resolveAgentConfig(params.cfg, params.requesterAgentId)?.identity?.name?.trim();
+  return name || undefined;
+}
 
 function resolveConfiguredAgentMainSessionKey(params: {
   cfg: OpenClawConfig;
@@ -255,6 +263,8 @@ export function createSessionsSendTool(opts?: SessionsSendToolOptions): AnyAgent
           error: formatErrorMessage(err),
         });
       }
+
+      const requesterName = resolveRequesterIdentityName({ cfg, requesterAgentId });
 
       const sessionKeyParam = readToolStringParam(params, "sessionKey");
       const labelParam = normalizeOptionalString(readToolStringParam(params, "label"));
@@ -783,6 +793,7 @@ export function createSessionsSendTool(opts?: SessionsSendToolOptions): AnyAgent
             requesterIsSubagent || targetIsSubagent
               ? undefined
               : buildAgentToAgentMessageContext({
+                  requesterName,
                   requesterSessionKey: replyRequesterSessionKey,
                   requesterChannel,
                   targetSessionKey: displayKey,
@@ -968,6 +979,7 @@ export function createSessionsSendTool(opts?: SessionsSendToolOptions): AnyAgent
                         announceTimeoutMs,
                         // Isolated Cron jobs retain target announcements without requester turns.
                         maxPingPongTurns: isIsolatedCronRequester ? 0 : 5,
+                        requesterName,
                         replyMode,
                         requesterSessionKey: replyRequesterSessionKey,
                         requesterAgentId,
