@@ -5,6 +5,7 @@ import {
 import type { SessionProjectionScope } from "@openclaw/gateway-client/browser";
 import { asNonArrayRecord } from "@openclaw/normalization-core/record-coerce";
 import { extractText } from "../../lib/chat/message-extract.ts";
+import { normalizeRoleForGrouping } from "../../lib/chat/message-normalizer.ts";
 import { resolveChatAgentId } from "./chat-agent-id.ts";
 import type { ChatState } from "./chat-state-contract.ts";
 import {
@@ -18,11 +19,11 @@ import {
   persistedSteerTargetRunId,
   rolloverChatStream,
 } from "./stream-causal-boundary.ts";
+import { maybeResetToolStreamRun } from "./stream-reconciliation.ts";
 import {
-  assistantMessageReplacesCurrentStream,
-  maybeResetToolStreamRun,
-} from "./stream-reconciliation.ts";
-import { prunePersistedAssistantStreamSegments } from "./stream-segment-pruning.ts";
+  prunePersistedAssistantStreamSegments,
+  reconcilePersistedAssistantStream,
+} from "./stream-segment-pruning.ts";
 
 type SessionMessageApplySource =
   | { kind: "history-delta" }
@@ -55,7 +56,7 @@ function finishingChatRunId(
   if (producerRunId) {
     return producerRunId === runId ? runId : null;
   }
-  const projected = getChatSessionProjection(state, state.chatMessages, scope).runs[runId]?.message;
+  const projected = getChatSessionProjection(state, scope).runs[runId]?.message;
   const projectedText = extractText(projected)?.trim();
   return projectedText && projectedText === extractText(message)?.trim() ? runId : null;
 }
@@ -72,6 +73,7 @@ export function applySessionMessagePayload(
     return;
   }
   const sourceMessage = event.message;
+  const sourceRecord = asNonArrayRecord(sourceMessage);
   const incoming = readSessionMessageIdentity(sourceMessage, event);
   if (!incoming) {
     return;
@@ -95,11 +97,27 @@ export function applySessionMessagePayload(
     (producerRunId || (!incoming.runId && runActive !== true))
       ? finishingChatRunId(state, source, sourceMessage, scope, producerRunId)
       : null;
+  const toolImageOwnerRunId =
+    normalizeRoleForGrouping(incoming.role) === "tool" &&
+    incoming.id &&
+    incoming.sequence !== null &&
+    !incoming.isImported &&
+    producerRunId &&
+    Array.isArray(sourceRecord.content) &&
+    sourceRecord.content.some((part) => {
+      const block = asNonArrayRecord(part);
+      return (
+        block.type === "image" && typeof block.artifactId === "string" && block.artifactId.trim()
+      );
+    })
+      ? finishingChatRunId(state, source, sourceMessage, scope, producerRunId)
+      : null;
   if (
     source.kind === "live" &&
     incoming.role !== "user" &&
     !isPreviousRunAssistant &&
-    !assistantOwnerRunId
+    !assistantOwnerRunId &&
+    !toolImageOwnerRunId
   ) {
     return;
   }
@@ -115,7 +133,6 @@ export function applySessionMessagePayload(
   if (!incoming.id && !incoming.idempotencyKey && incoming.sequence === null) {
     return;
   }
-  const sourceRecord = asNonArrayRecord(sourceMessage);
   if (!sourceRecord) {
     return;
   }
@@ -127,6 +144,7 @@ export function applySessionMessagePayload(
       ...(incoming.id ? { id: incoming.id } : {}),
       ...(incoming.idempotencyKey ? { idempotencyKey: incoming.idempotencyKey } : {}),
       ...(incoming.sequence !== null ? { seq: incoming.sequence } : {}),
+      ...(producerRunId ? { runId: producerRunId } : {}),
     },
   };
   const projection = reduceChatSessionProjection(
@@ -140,18 +158,12 @@ export function applySessionMessagePayload(
   );
   if (incoming.role === "assistant" && projection.messages.includes(message)) {
     prunePersistedAssistantStreamSegments(state, message);
-    if (assistantOwnerRunId) {
-      if (
-        runActive === false ||
-        (state.chatStream !== null && assistantMessageReplacesCurrentStream(state, message))
-      ) {
-        state.chatStream = null;
-        state.chatStreamStartedAt = null;
-      }
-      if (runActive === false) {
-        maybeResetToolStreamRun(state, assistantOwnerRunId);
-      }
+    if (assistantOwnerRunId && runActive === false) {
+      state.chatStream = null;
+      state.chatStreamStartedAt = null;
+      maybeResetToolStreamRun(state, assistantOwnerRunId);
     }
+    reconcilePersistedAssistantStream(state);
   }
   const steerTargetRunId = persistedSteerTargetRunId(message);
   const currentRunId = state.chatRunId;
@@ -160,7 +172,7 @@ export function applySessionMessagePayload(
     : null;
   if (
     incoming.role === "user" &&
-    runActive === true &&
+    (runActive === true || (runActive === undefined && currentRunId === steerTargetRunId)) &&
     incoming.runId &&
     steerTargetRunId &&
     (!currentRunId || currentRunId === steerTargetRunId || currentRunId === incoming.runId) &&

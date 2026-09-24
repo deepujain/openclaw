@@ -146,8 +146,13 @@ describe("browser plugin", () => {
     });
   });
 
-  it("initializes the shared durable session-tab registry without loading browser control", () => {
+  it("initializes the durable tab registry without loading browser control or Gateway runtime", () => {
     const { api, openSyncKeyedStore } = createApi();
+    Object.defineProperty(api.runtime, "gateway", {
+      get() {
+        throw new Error("Gateway runtime must stay lazy during Browser registration");
+      },
+    });
     registerBrowserPlugin(api);
 
     expect(openSyncKeyedStore).toHaveBeenCalledWith({
@@ -161,7 +166,19 @@ describe("browser plugin", () => {
   it("exposes static browser metadata on the plugin definition", () => {
     expect(browserPluginReload).toEqual({
       restartPrefixes: ["browser"],
-      hotPrefixes: ["browser.profiles"],
+      hotPrefixes: [
+        "browser.profiles",
+        "browser.defaultProfile",
+        "browser.headless",
+        "browser.executablePath",
+        "browser.attachOnly",
+        "browser.cdpUrl",
+        "browser.noSandbox",
+        "browser.extraArgs",
+        "browser.snapshotDefaults",
+        "browser.tabCleanup",
+        "browser.allowSystemProfileImport",
+      ],
     });
     expect(browserPluginNodeHostCommands.map((entry) => entry.command)).toEqual([
       "browser.proxy",
@@ -223,6 +240,14 @@ describe("browser plugin", () => {
     expect(tool.description).toContain("action=profiles");
     expect(tool.description).not.toContain('profile="user"');
     expect(tool.outputSchema).toBe(BrowserToolOutputSchema);
+    const properties = (
+      tool.parameters as {
+        properties: Record<string, { description?: string }>;
+      }
+    ).properties;
+    expect(properties.actions?.description).toContain("batch");
+    expect(properties.doubleClick?.description).toContain("clickCoords");
+    expect(properties.labels?.description).toContain("snapshot");
     expect(runtimeApiMocks.createBrowserTool).not.toHaveBeenCalled();
     await tool.execute("call-1", { action: "status" });
     expect(runtimeApiMocks.createBrowserTool).toHaveBeenCalledWith({
@@ -261,6 +286,7 @@ describe("browser plugin", () => {
     await tool.execute("call-1", { action: "status" });
     expect(runtimeApiMocks.createBrowserTool).toHaveBeenCalledWith({
       agentSessionKey: "agent:main:webchat:direct:123",
+      agentId: "main",
       agentDir: "/tmp/agent",
       workspaceDir: "/tmp/workspace",
       activeModel: { provider: "openai", model: "gpt-5.5" },
@@ -332,6 +358,10 @@ describe("browser plugin", () => {
       "act",
       "close",
       "console",
+      "requests",
+      "errors",
+      "text",
+      "emulate",
       "dialog",
       "download",
       "focus",
@@ -390,9 +420,21 @@ describe("browser plugin", () => {
     const actions = (properties.action as { enum?: string[] }).enum;
     const actKinds = (properties.kind as { enum?: string[] }).enum;
 
-    expect(actions).not.toEqual(expect.arrayContaining(["pdf", "download", "waitfordownload"]));
+    for (const action of [
+      "pdf",
+      "download",
+      "waitfordownload",
+      "requests",
+      "errors",
+      "text",
+      "emulate",
+    ]) {
+      expect(actions).not.toContain(action);
+    }
     expect(actions).toEqual(expect.arrayContaining(["snapshot", "screenshot"]));
     expect(actKinds).not.toContain("batch");
+    expect((properties.actions as { description?: string }).description).toBeUndefined();
+    expect((properties.stopOnError as { description?: string }).description).toBeUndefined();
   });
 
   it("rejects malformed run bindings before creating the lazy browser tool", () => {
@@ -467,7 +509,7 @@ describe("browser plugin", () => {
     const { api, registerGatewayMethod } = createApi();
     registerBrowserPlugin(api);
 
-    expect(registerGatewayMethod).toHaveBeenCalledTimes(1);
+    expect(registerGatewayMethod).toHaveBeenCalledTimes(2);
     expect(mockCallArg(registerGatewayMethod)).toBe("browser.request");
     const handler = mockCallArg(registerGatewayMethod, 0, 1) as (request: {
       method: string;

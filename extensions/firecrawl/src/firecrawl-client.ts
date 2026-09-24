@@ -1,7 +1,10 @@
 // Firecrawl plugin module implements firecrawl client behavior.
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
-import { parseFiniteNumber } from "openclaw/plugin-sdk/number-runtime";
-import { readProviderJsonObjectResponse } from "openclaw/plugin-sdk/provider-http";
+import { parseDateStringTimestampMs, parseFiniteNumber } from "openclaw/plugin-sdk/number-runtime";
+import {
+  ProviderHttpError,
+  readProviderJsonObjectResponse,
+} from "openclaw/plugin-sdk/provider-http";
 import {
   DEFAULT_CACHE_TTL_MINUTES,
   markdownToText,
@@ -13,6 +16,7 @@ import {
   withStrictWebToolsEndpoint,
   writeCache,
 } from "openclaw/plugin-sdk/provider-web-fetch";
+import { resolveSiteName } from "openclaw/plugin-sdk/provider-web-search";
 import { normalizeSecretInput } from "openclaw/plugin-sdk/secret-input";
 import {
   truncateSanitizedExternalContent,
@@ -26,7 +30,10 @@ import {
   resolvePinnedHostnameWithPolicy,
   type LookupFn,
 } from "openclaw/plugin-sdk/ssrf-runtime";
-import { normalizeOptionalString } from "openclaw/plugin-sdk/string-coerce-runtime";
+import {
+  asOptionalRecord,
+  normalizeOptionalString,
+} from "openclaw/plugin-sdk/string-coerce-runtime";
 import { z } from "zod";
 import {
   DEFAULT_FIRECRAWL_BASE_URL,
@@ -70,14 +77,6 @@ type FirecrawlSearchItem = {
   published?: string;
   siteName?: string;
 };
-
-async function readFirecrawlJsonResponse(
-  response: Response,
-  label: string,
-  opts?: { maxBytes?: number },
-): Promise<Record<string, unknown>> {
-  return await readProviderJsonObjectResponse(response, label, opts);
-}
 
 type FirecrawlSearchParams = {
   cfg?: OpenClawConfig;
@@ -265,22 +264,16 @@ async function postFirecrawlJson<T>(
           truncateSanitizedExternalContent(detail, 1_000).text,
           "web_fetch",
         );
-        throw new Error(`${params.errorLabel} API error (${response.status}): ${safeDetail}`);
+        throw new ProviderHttpError(
+          `${params.errorLabel} API error (${response.status}): ${safeDetail}`,
+          { status: response.status },
+        );
       }
       return await parse(response);
     },
   );
   params.signal?.throwIfAborted();
   return result;
-}
-
-function resolveSiteName(urlRaw: string): string | undefined {
-  try {
-    const host = new URL(urlRaw).hostname.replace(/^www\./, "");
-    return host || undefined;
-  } catch {
-    return undefined;
-  }
 }
 
 function normalizeFirecrawlResultUrl(value: unknown): string | undefined {
@@ -302,8 +295,16 @@ function normalizeFirecrawlResultUrl(value: unknown): string | undefined {
   }
 }
 
+function isValidFirecrawlPublishedDate(value: string): boolean {
+  if (!FIRECRAWL_PUBLISHED_DATE_RE.test(value)) {
+    return false;
+  }
+  const calendarDate = value.slice(0, 10);
+  const timestamp = parseDateStringTimestampMs(calendarDate);
+  return timestamp !== undefined && new Date(timestamp).toISOString().startsWith(calendarDate);
+}
+
 const optionalFirecrawlStringSchema = z.string().optional().catch(undefined);
-const invalidFirecrawlSearchItemSchema = z.unknown().transform(() => null);
 const firecrawlSearchMetadataSchema = z
   .object({
     sourceURL: optionalFirecrawlStringSchema,
@@ -328,43 +329,37 @@ const firecrawlSearchItemSchema = z.object({
   published: optionalFirecrawlStringSchema,
   metadata: firecrawlSearchMetadataSchema,
 });
-const firecrawlSearchItemsSchema = z
-  .array(z.union([firecrawlSearchItemSchema, invalidFirecrawlSearchItemSchema]))
-  .transform((items) => items.filter((item) => item !== null));
-const firecrawlNestedSearchDataSchema = z.looseObject({
-  results: firecrawlSearchItemsSchema.optional().catch(undefined),
-  data: firecrawlSearchItemsSchema.optional().catch(undefined),
-  web: firecrawlSearchItemsSchema.optional().catch(undefined),
-});
-const firecrawlSearchPayloadSchema = z.looseObject({
-  data: z
-    .union([firecrawlSearchItemsSchema, firecrawlNestedSearchDataSchema])
-    .optional()
-    .catch(undefined),
-  results: firecrawlSearchItemsSchema.optional().catch(undefined),
-  web: z
-    .looseObject({ results: firecrawlSearchItemsSchema.optional().catch(undefined) })
-    .optional()
-    .catch(undefined),
-});
 
-function resolveSearchItems(payload: Record<string, unknown>): FirecrawlSearchItem[] {
-  const parsed = firecrawlSearchPayloadSchema.parse(payload);
-  const nestedData = Array.isArray(parsed.data) ? undefined : parsed.data;
+function resolveSearchItems(
+  payload: Record<string, unknown>,
+  count: number,
+): FirecrawlSearchItem[] {
+  const nestedData = asOptionalRecord(payload.data);
   const candidates = [
-    Array.isArray(parsed.data) ? parsed.data : undefined,
-    parsed.results,
+    payload.data,
+    payload.results,
     nestedData?.results,
     nestedData?.data,
     nestedData?.web,
-    parsed.web?.results,
+    asOptionalRecord(payload.web)?.results,
   ];
-  const rawItems = candidates.find((candidate) => candidate !== undefined);
+  const rawItems = candidates.find((candidate): candidate is unknown[] => Array.isArray(candidate));
   if (!rawItems) {
     return [];
   }
   const items: FirecrawlSearchItem[] = [];
-  for (const entry of rawItems.slice(0, FIRECRAWL_SEARCH_MAX_RESULTS)) {
+  let inspectedObjects = 0;
+  for (const rawItem of rawItems) {
+    if (inspectedObjects >= FIRECRAWL_SEARCH_MAX_RESULTS || items.length >= count) {
+      break;
+    }
+    const record = asOptionalRecord(rawItem);
+    if (!record) {
+      continue;
+    }
+    // The scan cap counts objects, including invalid URLs, after discarding non-object rows.
+    inspectedObjects += 1;
+    const entry = firecrawlSearchItemSchema.parse(record);
     const metadata = entry.metadata;
     const rawUrl = entry.url || entry.sourceURL || entry.sourceUrl || metadata?.sourceURL || "";
     const url = normalizeFirecrawlResultUrl(rawUrl);
@@ -381,14 +376,14 @@ function resolveSearchItems(payload: Record<string, unknown>): FirecrawlSearchIt
       metadata?.publishedDate ||
       undefined;
     const published =
-      rawPublished && FIRECRAWL_PUBLISHED_DATE_RE.test(rawPublished) ? rawPublished : undefined;
+      rawPublished && isValidFirecrawlPublishedDate(rawPublished) ? rawPublished : undefined;
     items.push({
       title,
       url,
       description,
       content,
       published,
-      siteName: resolveSiteName(url),
+      siteName: resolveSiteName(url)?.replace(/^www\./, ""),
     });
   }
   return items;
@@ -485,7 +480,11 @@ export async function runFirecrawlSearch(
       scrapeResults,
     }),
   );
-  const cached = readCache(SEARCH_CACHE, cacheKey);
+  const cacheTtlMs = resolveCacheTtlMs(
+    params.cfg?.tools?.web?.search?.cacheTtlMinutes,
+    DEFAULT_CACHE_TTL_MINUTES,
+  );
+  const cached = readCache(SEARCH_CACHE, cacheKey, cacheTtlMs);
   if (cached) {
     return { ...cached.value, cached: true };
   }
@@ -534,7 +533,10 @@ export async function runFirecrawlSearch(
       ...(params.signal ? { signal: params.signal } : {}),
     },
     async (response) => {
-      const payloadValue = await readFirecrawlJsonResponse(response, "Firecrawl Search API error");
+      const payloadValue = await readProviderJsonObjectResponse(
+        response,
+        "Firecrawl Search API error",
+      );
       if (payloadValue.success === false) {
         const error =
           typeof payloadValue.error === "string"
@@ -554,16 +556,11 @@ export async function runFirecrawlSearch(
   const result = buildSearchPayload({
     query: params.query,
     provider: providerId,
-    items: resolveSearchItems(payload).slice(0, count),
+    items: resolveSearchItems(payload, count),
     tookMs: Date.now() - start,
     scrapeResults,
   });
-  writeCache(
-    SEARCH_CACHE,
-    cacheKey,
-    result,
-    resolveCacheTtlMs(undefined, DEFAULT_CACHE_TTL_MINUTES),
-  );
+  writeCache(SEARCH_CACHE, cacheKey, result, cacheTtlMs);
   return result;
 }
 
@@ -697,16 +694,16 @@ export async function runFirecrawlScrape(
       },
     },
     async (response) => {
-      const payloadLocal = await readFirecrawlJsonResponse(response, "Firecrawl fetch failed", {
+      const data = await readProviderJsonObjectResponse(response, "Firecrawl fetch failed", {
         // Scrape can legitimately return page bodies before maxChars truncates parsed output.
         maxBytes: FIRECRAWL_SCRAPE_RESPONSE_MAX_BYTES,
       });
-      if (payloadLocal.success === false) {
+      if (data.success === false) {
         const detail =
-          typeof payloadLocal.error === "string"
-            ? payloadLocal.error
-            : typeof payloadLocal.message === "string"
-              ? payloadLocal.message
+          typeof data.error === "string"
+            ? data.error
+            : typeof data.message === "string"
+              ? data.message
               : response.statusText;
         throw new Error(
           `Firecrawl fetch failed (${response.status}): ${wrapWebContent(
@@ -715,7 +712,7 @@ export async function runFirecrawlScrape(
           )}`.trim(),
         );
       }
-      return payloadLocal;
+      return data;
     },
   );
   return parseFirecrawlScrapePayload({
@@ -730,7 +727,6 @@ export const testing = {
   assertFirecrawlScrapeTargetAllowed,
   parseFirecrawlScrapePayload,
   postFirecrawlJson,
-  readFirecrawlJsonResponse,
   resolveEndpoint,
   resolveSearchItems,
 };

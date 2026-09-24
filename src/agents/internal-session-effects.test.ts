@@ -16,9 +16,9 @@ import {
 import { withTestDir } from "../test-helpers/temp-dir.js";
 import { withEnvAsync } from "../test-utils/env.js";
 import {
+  createInternalSessionEffectsCleanup,
   prepareInternalSessionEffectsSession,
   removeInternalSessionEffectsSession,
-  resolveInternalSessionEffectsTarget,
 } from "./internal-session-effects.js";
 
 describe("internal session effects", () => {
@@ -72,6 +72,7 @@ describe("internal session effects", () => {
 
           await persistSessionResetLifecycle({
             agentId: "main",
+            workspaceDir: dir,
             cleanupPreviousTranscript: true,
             nextEntry: {
               ...previousEntry,
@@ -131,7 +132,7 @@ describe("internal session effects", () => {
 
   it("escapes the reserved prefix for a durable internal-effects run id", async () => {
     await withTestDir({ prefix: "openclaw-internal-session-effects-" }, async (dir) => {
-      const target = resolveInternalSessionEffectsTarget({
+      const target = await prepareInternalSessionEffectsSession({
         agentId: "main",
         runId: "incognito-not-private",
         storePath: path.join(dir, "sessions.json"),
@@ -178,6 +179,117 @@ describe("internal session effects", () => {
       ]);
     });
   });
+
+  it.each(["copy", "reopen"] as const)(
+    "requires the retained source and current owner during %s",
+    async (phase) => {
+      await withTestDir({ prefix: "openclaw-internal-session-effects-" }, async (dir) => {
+        const storePath = path.join(dir, "sessions.json");
+        const source = await prepareInternalSessionEffectsSession({
+          agentId: "main",
+          runId: "required-source",
+          storePath,
+        });
+        await appendTranscriptMessage(source, {
+          message: { role: "assistant", content: "retained progress", timestamp: 1 },
+        });
+        const request = {
+          agentId: "main",
+          runId: "required-successor",
+          source,
+          storePath,
+          requireSource: true,
+        };
+        if (phase === "reopen") {
+          await prepareInternalSessionEffectsSession(request);
+        }
+        let current = phase === "copy";
+        await expect(
+          prepareInternalSessionEffectsSession({
+            ...request,
+            commitGuard: () => {
+              if (!current) {
+                throw new Error("recovery owner retired");
+              }
+              queueMicrotask(() => {
+                current = false;
+              });
+            },
+          }),
+        ).rejects.toThrow("recovery owner retired");
+        expect(JSON.stringify(await loadTranscriptEvents(source))).toContain("retained progress");
+        await removeInternalSessionEffectsSession(source);
+        await expect(prepareInternalSessionEffectsSession(request)).rejects.toThrow(
+          "Required internal-effects source session is unavailable",
+        );
+      });
+    },
+  );
+
+  it.each([true, false])(
+    "cleans only the latest tracked hidden identities when enabled=%s",
+    async (enabled) => {
+      await withTestDir({ prefix: "openclaw-internal-effects-cleanup-" }, async (dir) => {
+        const storePath = path.join(dir, "sessions.json");
+        const errors: unknown[] = [];
+        const cleanup = createInternalSessionEffectsCleanup({
+          enabled,
+          agentId: "main",
+          runId: "tracked-run",
+          storePath,
+          onError: (error) => errors.push(error),
+        });
+        const initial = await prepareInternalSessionEffectsSession({
+          agentId: "main",
+          runId: "tracked-run",
+          storePath,
+        });
+        const rotated = {
+          agentId: initial.agentId,
+          sessionId: "rotated-hidden-session",
+          sessionKey: initial.sessionKey,
+          storePath,
+        };
+        await upsertSessionEntryCore(rotated, { sessionId: rotated.sessionId, updatedAt: 2 });
+        const additional = await prepareInternalSessionEffectsSession({
+          agentId: "main",
+          runId: "additional-binding",
+          storePath,
+        });
+        const untracked = await prepareInternalSessionEffectsSession({
+          agentId: "main",
+          runId: "other-run",
+          storePath,
+        });
+        const untrackedBefore = structuredClone(loadExactSessionEntry(untracked));
+        expect(untrackedBefore).toBeDefined();
+        for (const target of [rotated, additional]) {
+          await appendTranscriptMessage(target, {
+            message: { role: "assistant", content: "private", timestamp: 3 },
+          });
+          cleanup.track(target);
+        }
+
+        await cleanup.cleanup();
+
+        expect(errors).toEqual([]);
+        expect(loadExactSessionEntry(untracked)).toEqual(untrackedBefore);
+        for (const target of [rotated, additional]) {
+          if (enabled) {
+            expect(loadExactSessionEntry(target)).toBeUndefined();
+            await expect(loadTranscriptEvents(target)).resolves.toEqual([]);
+          } else {
+            expect(loadExactSessionEntry(target)?.entry.sessionId).toBe(target.sessionId);
+            await expect(loadTranscriptEvents(target)).resolves.toContainEqual(
+              expect.objectContaining({
+                message: expect.objectContaining({ role: "assistant", content: "private" }),
+              }),
+            );
+          }
+        }
+      });
+    },
+  );
 
   it("hard-deletes the hidden entry and transcript rows", async () => {
     await withTestDir({ prefix: "openclaw-internal-session-effects-" }, async (dir) => {

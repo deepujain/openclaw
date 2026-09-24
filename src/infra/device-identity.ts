@@ -1,9 +1,12 @@
 // Gateway/device Ed25519 identity API backed by canonical shared SQLite state.
 import crypto from "node:crypto";
-import fs from "node:fs";
 import path from "node:path";
 import { resolveOpenClawStateDirForDatabasePath } from "../state/openclaw-state-db.paths.js";
 import { acquireDeviceIdentityCoordinator } from "./device-identity-coordinator.js";
+import {
+  cacheProcessDeviceIdentity,
+  readProcessDeviceIdentity,
+} from "./device-identity-process-cache.js";
 import {
   generateStoredDeviceIdentity,
   insertStoredDeviceIdentityIfAbsent,
@@ -21,7 +24,7 @@ import {
   signEd25519Payload,
   verifyEd25519Signature,
 } from "./ed25519-signature.js";
-import { pruneMapToMaxSize } from "./map-size.js";
+import { pathMayExistSync } from "./path-existence.js";
 import { createSqliteLifecycleAggregateError } from "./sqlite-coordinator.js";
 
 export type { DeviceIdentity } from "./device-identity-store.js";
@@ -38,15 +41,6 @@ function toDeviceIdentity(stored: StoredDeviceIdentity): DeviceIdentity {
   };
 }
 
-function pathMayExist(filePath: string): boolean {
-  try {
-    fs.lstatSync(filePath);
-    return true;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code !== "ENOENT";
-  }
-}
-
 /** Exact retired file owned by Doctor migration code. */
 function resolveLegacyDeviceIdentityPath(options: DeviceIdentityStoreOptions = {}): string {
   const { databasePath } = resolveDeviceIdentityStore(options);
@@ -56,7 +50,7 @@ function resolveLegacyDeviceIdentityPath(options: DeviceIdentityStoreOptions = {
   );
 }
 
-function assertNoPendingLegacyIdentity(options: DeviceIdentityStoreOptions): void {
+export function assertNoPendingLegacyIdentity(options: DeviceIdentityStoreOptions): void {
   const { identityKey } = resolveDeviceIdentityStore(options);
   if (identityKey !== PRIMARY_DEVICE_IDENTITY_KEY) {
     return;
@@ -64,9 +58,9 @@ function assertNoPendingLegacyIdentity(options: DeviceIdentityStoreOptions): voi
   const legacyPath = resolveLegacyDeviceIdentityPath(options);
   if (
     // Claims first, source last: both migration owners restore claim -> source atomically.
-    pathMayExist(`${legacyPath}${DOCTOR_CLAIM_SUFFIX}`) ||
-    pathMayExist(`${legacyPath}${NATIVE_CLAIM_SUFFIX}`) ||
-    pathMayExist(legacyPath)
+    pathMayExistSync(`${legacyPath}${DOCTOR_CLAIM_SUFFIX}`) ||
+    pathMayExistSync(`${legacyPath}${NATIVE_CLAIM_SUFFIX}`) ||
+    pathMayExistSync(legacyPath)
   ) {
     throw new Error(
       `Legacy device identity exists at ${legacyPath}. Run "openclaw doctor --fix" before starting the gateway or connecting this client.`,
@@ -120,7 +114,7 @@ function loadOrCreateDeviceIdentityOwned(options: DeviceIdentityStoreOptions): D
   const { databasePath } = resolveDeviceIdentityStore(options);
   // A downgrade can recreate retired JSON after SQLite migration. Once this profile has
   // a canonical row, keep it authoritative and leave the retired source for Doctor.
-  const existing = pathMayExist(databasePath) ? readStoredDeviceIdentity(options) : null;
+  const existing = pathMayExistSync(databasePath) ? readStoredDeviceIdentity(options) : null;
   if (existing) {
     return toDeviceIdentity(existing);
   }
@@ -141,23 +135,18 @@ export function loadOrCreateDeviceIdentity(
   );
 }
 
-const processDeviceIdentities = new Map<string, DeviceIdentity>();
-const MAX_PROCESS_DEVICE_IDENTITIES = 32;
-
 /** Keep one authoritative identity stable for the lifetime of a state-dir process. */
 export function loadOrCreateProcessDeviceIdentity(
   options: DeviceIdentityStoreOptions = {},
 ): DeviceIdentity {
   return withDeviceIdentityCoordinator(options, (resolved, resolvedOptions) => {
     const cacheKey = `${resolved.databasePath}\0${resolved.identityKey}`;
-    const cached = processDeviceIdentities.get(cacheKey);
+    const cached = readProcessDeviceIdentity(cacheKey);
     if (cached) {
       return cached;
     }
     const identity = loadOrCreateDeviceIdentityOwned(resolvedOptions);
-    pruneMapToMaxSize(processDeviceIdentities, MAX_PROCESS_DEVICE_IDENTITIES - 1);
-    processDeviceIdentities.set(cacheKey, identity);
-    return identity;
+    return cacheProcessDeviceIdentity(cacheKey, identity);
   });
 }
 

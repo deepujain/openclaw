@@ -1,34 +1,20 @@
 // Openai plugin module implements shared behavior.
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
-import { findCatalogTemplate } from "openclaw/plugin-sdk/provider-catalog-shared";
 import {
-  cloneFirstTemplateModel,
+  createLazyRuntimeModule,
+  createLazyRuntimeSurface,
+} from "openclaw/plugin-sdk/lazy-runtime";
+import {
+  buildFirstTemplateModel,
+  findCatalogTemplate,
   matchesExactOrPrefix,
-  type ProviderPlugin,
-} from "openclaw/plugin-sdk/provider-model-shared";
-import { buildProviderStreamFamilyHooks } from "openclaw/plugin-sdk/provider-stream-family";
+  normalizeProviderId,
+} from "openclaw/plugin-sdk/provider-model-metadata";
+import type { ProviderPlugin } from "openclaw/plugin-sdk/provider-model-shared";
 import { normalizeOptionalString } from "openclaw/plugin-sdk/string-coerce-runtime";
-import { createOpenAINativeWebSearchWrapper } from "./native-web-search.js";
+import { classifyOpenAIBaseUrl, isOpenAICodexBaseUrl } from "./base-url.js";
 import { buildOpenAIReplayPolicy } from "./replay-policy.js";
 import { resolveOpenAITransportTurnState } from "./transport-policy.js";
-
-type SyntheticOpenAIModelCatalogCost = {
-  input: number;
-  output: number;
-  cacheRead: number;
-  cacheWrite: number;
-};
-
-type SyntheticOpenAIModelCatalogEntry = {
-  provider: string;
-  id: string;
-  name: string;
-  reasoning?: boolean;
-  input?: ("text" | "image")[];
-  contextWindow?: number;
-  contextTokens?: number;
-  cost?: SyntheticOpenAIModelCatalogCost;
-};
 
 const OPENAI_API_BASE_URL = "https://api.openai.com/v1";
 
@@ -67,60 +53,39 @@ function defaultOpenAIResponsesExtraParams(
 
 type OpenAIResponsesProviderHooks = Pick<
   ProviderPlugin,
-  "buildReplayPolicy" | "prepareExtraParams" | "wrapStreamFn" | "resolveTransportTurnState"
+  | "buildReplayPolicy"
+  | "prepareExtraParams"
+  | "wrapStreamFn"
+  | "resolveTransportTurnState"
+  | "isCacheTtlEligible"
 >;
 
-const resolveOpenAIResponsesTransportTurnState: NonNullable<
-  OpenAIResponsesProviderHooks["resolveTransportTurnState"]
-> = (ctx) => resolveOpenAITransportTurnState(ctx);
-
-const openAIResponsesStreamHooks = buildProviderStreamFamilyHooks("openai-responses-defaults");
-const wrapOpenAIResponsesStreamFn = openAIResponsesStreamHooks.wrapStreamFn;
+const loadResponsesStream = createLazyRuntimeModule(() => import("./responses-stream.runtime.js"));
 const wrapOpenAIResponsesProviderStreamFn: NonNullable<
   OpenAIResponsesProviderHooks["wrapStreamFn"]
-> = (ctx) =>
-  createOpenAINativeWebSearchWrapper(wrapOpenAIResponsesStreamFn?.(ctx) ?? ctx.streamFn, {
-    config: ctx.config,
-    agentId: ctx.agentId,
-    nativeWebSearchAllowedByToolPolicy: ctx.nativeWebSearchAllowedByToolPolicy,
-  });
+> = (ctx) => {
+  // Catalog registration keeps synchronous hooks; StreamFn already permits async
+  // startup, so transport and tool execution load only when the stream is invoked.
+  const loadStream = createLazyRuntimeSurface(loadResponsesStream, (runtime) =>
+    runtime.wrapOpenAIResponsesStream(ctx),
+  );
+  return async (...args) => (await loadStream())(...args);
+};
 
 export function buildOpenAIResponsesProviderHooks(options?: {
   transport?: "auto" | "sse" | "websocket" | "websocket-cached";
 }): OpenAIResponsesProviderHooks {
   return {
+    // Native OpenAI caching is automatic; custom routes must explicitly opt in.
+    isCacheTtlEligible: ({ provider, baseUrl, supportsPromptCacheKey }) =>
+      normalizeProviderId(provider) === "openai" &&
+      (supportsPromptCacheKey ??
+        (classifyOpenAIBaseUrl(baseUrl) === "platform" || isOpenAICodexBaseUrl(baseUrl))),
     buildReplayPolicy: buildOpenAIReplayPolicy,
     prepareExtraParams: (ctx) => defaultOpenAIResponsesExtraParams(ctx.extraParams, options),
-    ...openAIResponsesStreamHooks,
     wrapStreamFn: wrapOpenAIResponsesProviderStreamFn,
-    resolveTransportTurnState: resolveOpenAIResponsesTransportTurnState,
+    resolveTransportTurnState: resolveOpenAITransportTurnState,
   };
 }
 
-export function buildOpenAISyntheticCatalogEntry(
-  template: ReturnType<typeof findCatalogTemplate>,
-  entry: {
-    id: string;
-    reasoning: boolean;
-    input: readonly ("text" | "image")[];
-    contextWindow: number;
-    contextTokens?: number;
-    cost?: SyntheticOpenAIModelCatalogCost;
-  },
-): SyntheticOpenAIModelCatalogEntry | undefined {
-  if (!template) {
-    return undefined;
-  }
-  return {
-    ...template,
-    id: entry.id,
-    name: entry.id,
-    reasoning: entry.reasoning,
-    input: [...entry.input],
-    contextWindow: entry.contextWindow,
-    ...(entry.contextTokens === undefined ? {} : { contextTokens: entry.contextTokens }),
-    ...(entry.cost === undefined ? {} : { cost: entry.cost }),
-  };
-}
-
-export { cloneFirstTemplateModel, findCatalogTemplate, matchesExactOrPrefix };
+export { buildFirstTemplateModel, findCatalogTemplate, matchesExactOrPrefix };

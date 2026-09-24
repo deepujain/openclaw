@@ -14,6 +14,8 @@ type PluginRuntimeChannel = import("./types-channel.js").PluginRuntimeChannel;
 // ── Subagent runtime types ──────────────────────────────────────────
 
 type SubagentRunParams = {
+  /** Revalidate command authority at the host's run admission boundary. */
+  assertCurrent?: () => void;
   sessionKey: string;
   message: string;
   /** Run with an exact empty tool surface. */
@@ -23,6 +25,8 @@ type SubagentRunParams = {
   provider?: string;
   model?: string;
   extraSystemPrompt?: string;
+  /** Use the bounded subagent prompt instead of the full conversation prompt. */
+  promptMode?: "minimal";
   lane?: string;
   lightContext?: boolean;
   deliver?: boolean;
@@ -30,6 +34,15 @@ type SubagentRunParams = {
   completionDelivery?: "current-requester";
   idempotencyKey?: string;
   cwd?: string;
+};
+
+type SubagentCompleteParams = {
+  agentId: string;
+  message: string;
+  extraSystemPrompt?: string;
+  model?: string;
+  timeoutMs?: number;
+  signal?: AbortSignal;
 };
 
 type PluginManagedWorktree = {
@@ -132,6 +145,8 @@ export type PluginRuntime = PluginRuntimeCore & {
     ) => Promise<T>;
   };
   subagent: {
+    /** Fresh, tool-free background inference under the existing subagent model policy. */
+    complete: (params: SubagentCompleteParams) => Promise<{ text: string }>;
     run: (params: SubagentRunParams) => Promise<SubagentRunResult>;
     waitForRun: (params: SubagentWaitParams) => Promise<AgentWaitResult>;
     getSessionMessages: (
@@ -188,6 +203,7 @@ export type PluginRuntime = PluginRuntimeCore & {
       baseRef?: string;
       ownerKind: "workboard";
       ownerId: string;
+      commitGuard?: () => void;
     }) => Promise<PluginManagedWorktree>;
     release: (params: { path: string }) => Promise<void>;
     removeIfLossless: (params: {
@@ -202,7 +218,17 @@ export type PluginRuntime = PluginRuntimeCore & {
 export type CreatePluginRuntimeOptions = {
   dispatchReplyFromConfig?: PluginRuntime["channel"]["reply"]["dispatchReplyFromConfig"];
   gateway?: PluginRuntime["gateway"];
+  hooks?: PluginRuntime["hooks"];
   subagent?: PluginRuntime["subagent"];
   nodes?: PluginRuntime["nodes"];
+  /** Native policy facades avoid re-evaluating SDK dependencies during registration. */
+  modelAuth?: PluginRuntime["modelAuth"];
+  modelConfig?: PluginRuntime["modelConfig"];
   allowGatewaySubagentBinding?: boolean;
 };
+
+/** Checked contract for both the path-loaded factory and its implementation. */
+export type PluginRuntimeFactory = (
+  options?: CreatePluginRuntimeOptions,
+  base?: Pick<PluginRuntime, "config" | "state" | "system">,
+) => PluginRuntime;

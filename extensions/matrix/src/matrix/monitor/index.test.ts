@@ -1,4 +1,5 @@
 // Matrix tests cover index plugin behavior.
+import { setImmediate } from "node:timers/promises";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { MatrixConfig, MatrixStreamingMode } from "../../types.js";
 import {
@@ -102,7 +103,6 @@ describe("monitorMatrixProvider", () => {
     hoisted.accountConfig.dm = {};
     delete (hoisted.accountConfig as { streaming?: unknown }).streaming;
     delete (hoisted.accountConfig as { rooms?: Record<string, unknown> }).rooms;
-    hoisted.resolveTextChunkLimit.mockReset().mockReturnValue(4000);
     hoisted.acquireSharedMatrixClient
       .mockReset()
       .mockImplementation(hoisted.acquireSharedMatrixClientImpl);
@@ -157,7 +157,8 @@ describe("monitorMatrixProvider", () => {
     [{ mode: "off" }, "off", false],
     [{ mode: "partial" }, "partial", true],
     [{ mode: "quiet" }, "quiet", true],
-    [{ mode: "progress" }, "progress", true],
+    [{ mode: "progress" }, "progress", false],
+    [{ mode: "progress", progress: { toolProgress: true } }, "progress", true],
     [{ mode: "partial", preview: { toolProgress: false } }, "partial", false],
     [{ mode: "quiet", preview: { toolProgress: false } }, "quiet", false],
     [{ mode: "partial", progress: { toolProgress: false } }, "partial", true],
@@ -192,7 +193,6 @@ describe("monitorMatrixProvider", () => {
     await monitorMatrixProvider({ abortSignal: abortController.signal });
 
     expect(hoisted.callOrder).toStrictEqual([]);
-    expect(hoisted.resolveTextChunkLimit).not.toHaveBeenCalled();
     expect(hoisted.createMatrixRoomMessageHandler).not.toHaveBeenCalled();
     expect(hoisted.acquireSharedMatrixClient).not.toHaveBeenCalled();
   });
@@ -496,26 +496,13 @@ describe("monitorMatrixProvider", () => {
     expect(hoisted.stopThreadBindingManager).toHaveBeenCalledTimes(1);
   });
 
-  it("resolves text chunk limit for the effective Matrix account", async () => {
-    await startMonitorAndAbortAfterStartup();
-
-    expect(mockCallArg(hoisted.resolveTextChunkLimit, 0, 0)).toEqual({
-      channels: {
-        matrix: {
-          dm: {
-            allowFrom: [],
-          },
-          groupAllowFrom: [],
-        },
-      },
-    });
-    expect(mockCallArg(hoisted.resolveTextChunkLimit, 0, 1)).toBe("matrix");
-    expect(mockCallArg(hoisted.resolveTextChunkLimit, 0, 2)).toBe("default");
-  });
-
-  it("starts monitoring without waiting for best-effort deviceId backfill", async () => {
+  it("starts monitoring without waiting for backfill but joins it during retirement", async () => {
+    let finishBackfill: (() => void) | undefined;
     hoisted.backfillMatrixAuthDeviceIdAfterStartup.mockImplementation(
-      () => new Promise<undefined>(() => {}),
+      () =>
+        new Promise<undefined>((resolve) => {
+          finishBackfill = () => resolve(undefined);
+        }),
     );
 
     const abortController = new AbortController();
@@ -529,8 +516,16 @@ describe("monitorMatrixProvider", () => {
     expect(backfillParams.abortSignal).not.toBe(abortController.signal);
     expect(backfillParams.abortSignal?.aborted).toBe(false);
 
+    let retired = false;
+    void monitorPromise.then(() => {
+      retired = true;
+    });
     abortController.abort();
     expect(backfillParams.abortSignal?.aborted).toBe(true);
+    await setImmediate();
+    expect(retired).toBe(false);
+    expect(hoisted.stopThreadBindingManager).not.toHaveBeenCalled();
+    finishBackfill?.();
     await expect(monitorPromise).resolves.toBeUndefined();
   });
 
@@ -554,12 +549,13 @@ describe("monitorMatrixProvider", () => {
       abortSignal?: AbortSignal;
     };
     expect(startSignal).toBe(hoisted.state.leaseAbortController.signal);
-    expect(backfillParams.abortSignal).toBe(startSignal);
+    expect(backfillParams.abortSignal?.aborted).toBe(false);
     expect(runtimeContextParams.abortSignal).toBe(startSignal);
     expect(maintenanceParams.abortSignal).toBe(startSignal);
     expect(startSignal.aborted).toBe(false);
 
     hoisted.state.leaseAbortController.abort();
+    expect(backfillParams.abortSignal?.aborted).toBe(true);
     await hoisted.runRegisteredMonitorRetirement();
     await expect(monitorPromise).resolves.toBeUndefined();
 

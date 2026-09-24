@@ -1,4 +1,3 @@
-// Feishu plugin module implements comment shared behavior.
 import { retryAsync } from "openclaw/plugin-sdk/retry-runtime";
 import {
   isRecord,
@@ -7,10 +6,33 @@ import {
   readStringValue as readString,
 } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { FEISHU_COMMENT_FILE_TYPES, type CommentFileType } from "./comment-target.js";
+import { captureFeishuSendAuthority } from "./send-context.js";
 import {
   getFeishuSendRateLimitCode,
   getFeishuSendRateLimitCodeFromResponse,
 } from "./send-rate-limit.js";
+
+export class FeishuReplyCommentError extends Error {
+  httpStatus?: number;
+  feishuCode?: number | string;
+  feishuMsg?: string;
+  feishuLogId?: string;
+
+  constructor(params: {
+    message: string;
+    httpStatus?: number;
+    feishuCode?: number | string;
+    feishuMsg?: string;
+    feishuLogId?: string;
+  }) {
+    super(params.message);
+    this.name = "FeishuReplyCommentError";
+    this.httpStatus = params.httpStatus;
+    this.feishuCode = params.feishuCode;
+    this.feishuMsg = params.feishuMsg;
+    this.feishuLogId = params.feishuLogId;
+  }
+}
 
 export function encodeQuery(params: Record<string, string | undefined>): string {
   const query = new URLSearchParams();
@@ -65,29 +87,6 @@ export function formatFeishuApiError(
   });
 }
 
-function formatFeishuApiFailure(
-  error: unknown,
-  errorPrefix: string,
-  options: {
-    includeConfigParams?: boolean;
-    includeNestedErrorLogId?: boolean;
-  } = {},
-): string {
-  const details = formatFeishuApiError(error, options);
-  return `${errorPrefix}: ${details || "unknown error"}`;
-}
-
-function createFeishuApiError(
-  error: unknown,
-  errorPrefix: string,
-  options: {
-    includeConfigParams?: boolean;
-    includeNestedErrorLogId?: boolean;
-  } = {},
-): Error {
-  return new Error(formatFeishuApiFailure(error, errorPrefix, options), { cause: error });
-}
-
 const FEISHU_SEND_MAX_RETRIES = 2;
 const FEISHU_SEND_RETRY_BASE_MS = 500;
 
@@ -97,13 +96,13 @@ export async function requestFeishuApi<T>(
   options: {
     includeConfigParams?: boolean;
     includeNestedErrorLogId?: boolean;
-    /** Base retry delay in ms; doubles on the second retry. @internal */
-    retryDelayMs?: number;
   } = {},
 ): Promise<T> {
+  const assertSendAuthority = captureFeishuSendAuthority();
   try {
     return await retryAsync(
       async () => {
+        assertSendAuthority?.();
         const result = await request();
         // Feishu SDK may fulfill with a rate-limit body (e.g. { code: 11232, ... })
         // instead of throwing. Rethrow it in the AxiosError response shape so
@@ -123,12 +122,13 @@ export async function requestFeishuApi<T>(
         // With a 2-retry budget the core exponential schedule (1x, 2x base)
         // matches the previous linear attempt*base backoff exactly; revisit
         // the delay curve if FEISHU_SEND_MAX_RETRIES grows.
-        minDelayMs: options.retryDelayMs ?? FEISHU_SEND_RETRY_BASE_MS,
+        minDelayMs: FEISHU_SEND_RETRY_BASE_MS,
         shouldRetry: (error) => getFeishuSendRateLimitCode(error) !== undefined,
       },
     );
   } catch (error) {
-    throw createFeishuApiError(error, errorPrefix, options);
+    const details = formatFeishuApiError(error, options);
+    throw new Error(`${errorPrefix}: ${details || "unknown error"}`, { cause: error });
   }
 }
 
@@ -300,26 +300,15 @@ function resolveCommentLinkedDocumentFromUrl(params: {
     const { urlKind, token } = parsedPath;
     link.urlKind = urlKind;
     if (urlKind === "wiki") {
-      link.urlKind = "wiki";
       link.wikiNodeToken = token;
     } else {
       link.resolvedObjType = urlKind;
       link.resolvedObjToken = token;
     }
-    if (
-      link.resolvedObjType &&
-      link.resolvedObjToken &&
-      isCommentFileType(link.resolvedObjType) &&
-      params.currentDocument?.fileType === link.resolvedObjType &&
-      params.currentDocument.fileToken === link.resolvedObjToken
-    ) {
-      link.isCurrentDocument = true;
-    } else if (
-      link.resolvedObjType &&
-      link.resolvedObjToken &&
-      isCommentFileType(link.resolvedObjType)
-    ) {
-      link.isCurrentDocument = false;
+    if (link.resolvedObjType && link.resolvedObjToken && isCommentFileType(link.resolvedObjType)) {
+      link.isCurrentDocument =
+        params.currentDocument?.fileType === link.resolvedObjType &&
+        params.currentDocument.fileToken === link.resolvedObjToken;
     }
   } catch {
     return link;
@@ -351,19 +340,6 @@ export function parseCommentContentElements(params: {
     }
     const element = rawElement;
     const type = normalizeString(element.type);
-    const text =
-      (type === "text_run" ? readElementTextPreservingWhitespace(element) : undefined) ||
-      (type === "text" ? readElementTextPreservingWhitespace(element) : undefined) ||
-      (type === "docs_link" || type === "link" ? readDocsLinkUrl(element) : undefined) ||
-      (type === "mention" || type === "mention_user" || type === "person"
-        ? (() => {
-            const userId = readMentionUserId(element);
-            return userId ? readMentionDisplayText(element, userId) : undefined;
-          })()
-        : undefined) ||
-      readElementTextPreservingWhitespace(element) ||
-      undefined;
-
     if (type === "mention" || type === "mention_user" || type === "person") {
       const userId = readMentionUserId(element);
       if (userId) {
@@ -406,6 +382,7 @@ export function parseCommentContentElements(params: {
       }
     }
 
+    const text = readElementTextPreservingWhitespace(element);
     if (text) {
       plainTextParts.push(text);
       semanticTextParts.push(text);

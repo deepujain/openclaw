@@ -8,6 +8,7 @@ import type { CronListPageOptions } from "./service/list-page-types.js";
 import * as lifecycleOps from "./service/ops-lifecycle.js";
 import * as mutationOps from "./service/ops-mutations.js";
 import * as readOps from "./service/ops-read.js";
+import type { OnExitRunOptions } from "./service/ops-run-preparation.js";
 import * as runOps from "./service/ops-run.js";
 import {
   type CronAddOptions,
@@ -28,14 +29,13 @@ export class CronService implements CronServiceContract {
   private readonly state;
   private startInProgress = 0;
   private startState: { generation: number; promise: Promise<void> } | null = null;
-  private lifecycleGeneration = 0;
 
   constructor(deps: CronServiceDeps) {
     this.state = createCronServiceState(deps);
   }
 
   async start() {
-    const generation = this.lifecycleGeneration;
+    const generation = this.state.lifecycleGeneration;
     const pending = this.startState;
     if (pending) {
       try {
@@ -66,8 +66,11 @@ export class CronService implements CronServiceContract {
     this.startInProgress += 1;
     this.state.schedulerStarted = false;
     try {
-      await lifecycleOps.start(this.state);
-      if (generation !== this.lifecycleGeneration) {
+      const start = () => lifecycleOps.start(this.state);
+      await (this.state.deps.runSchedulerOwned
+        ? this.state.deps.runSchedulerOwned(start)
+        : start());
+      if (generation !== this.state.lifecycleGeneration) {
         lifecycleOps.stop(this.state);
         return;
       }
@@ -78,7 +81,6 @@ export class CronService implements CronServiceContract {
   }
 
   stop() {
-    this.lifecycleGeneration += 1;
     lifecycleOps.stop(this.state);
   }
 
@@ -102,20 +104,19 @@ export class CronService implements CronServiceContract {
     return await readOps.list(this.state, opts);
   }
 
-  async listPage(opts?: CronListPageOptions) {
-    return await readOps.listPage(this.state, opts);
+  async listPage(opts?: CronListPageOptions, matchesJob?: (job: CronJob) => boolean) {
+    return await readOps.listPage(this.state, opts, matchesJob);
   }
 
   async add(input: CronJobCreate, opts?: CronAddOptions) {
     return await mutationOps.add(this.state, input, opts);
   }
 
-  async removeStaleJobFamily(family: {
-    declarationKey: string;
-    name: string;
-    ownerPluginTag: string;
-  }) {
-    return await mutationOps.removeStaleJobFamily(this.state, family);
+  async removeStaleJobFamily(
+    family: { declarationKey: string; name: string; ownerPluginTag: string },
+    opts?: { commitGuard?: () => void },
+  ) {
+    return await mutationOps.removeStaleJobFamily(this.state, family, opts);
   }
 
   async update(id: string, patch: CronJobPatch, opts?: CronUpdateOptions) {
@@ -139,12 +140,20 @@ export class CronService implements CronServiceContract {
     return await mutationOps.removeAgentJobsTransactional(this.state, agentId, commit);
   }
 
+  async quiesceJobs(jobs: readonly { id: string; revision: string }[], commitGuard: () => void) {
+    await mutationOps.quiesceJobs(this.state, jobs, commitGuard);
+  }
+
   async run(
     id: string,
     mode?: CronRunMode,
     opts?: CronServiceRunOptions,
   ): Promise<CronServiceRunResult> {
     return await runOps.run(this.state, id, mode, opts);
+  }
+
+  async runOnExit(id: string, opts: OnExitRunOptions): Promise<CronServiceRunResult> {
+    return await runOps.runOnExit(this.state, id, opts);
   }
 
   async enqueueRun(
@@ -235,7 +244,9 @@ export class CronService implements CronServiceContract {
   }
 
   getDefaultAgentId(): string | undefined {
-    return this.state.deps.defaultAgentId;
+    return this.state.deps.resolveDefaultAgentId
+      ? this.state.deps.resolveDefaultAgentId()
+      : this.state.deps.defaultAgentId;
   }
 
   wake(opts: { mode: CronWakeMode; text: string; sessionKey?: string; agentId?: string }) {

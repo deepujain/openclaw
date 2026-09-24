@@ -1,5 +1,8 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
+import { sessionChanges } from "../../sessions/session-row-changes.js";
+import { withOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
 import type { WorkerSessionPlacementRecord } from "../worker-environments/placement-store.js";
+import { flushPendingSessionsChangedEvents } from "./session-change-event.js";
 import {
   dispatchTestSessionId,
   dispatchTestSessionKey,
@@ -71,14 +74,15 @@ describe("sessions.reclaim", () => {
   it("returns an already reclaimed placement as idempotent success", async () => {
     const reclaimed = makeReclaimedPlacement();
     const reclaim = vi.fn().mockResolvedValue(reclaimed);
-    const respond = await invokeSessionReclaim(
-      makeDispatchTestContext({
-        workerPlacementDispatchService: { dispatch: vi.fn(), reclaim },
-        workerSessionPlacementService: {
-          getMany: () => new Map([[dispatchTestSessionId, reclaimed]]),
-        },
-      }),
-    );
+    const context = makeDispatchTestContext({
+      workerPlacementDispatchService: { dispatch: vi.fn(), reclaim },
+      workerSessionPlacementService: {
+        getMany: () => new Map([[dispatchTestSessionId, reclaimed]]),
+      },
+    });
+    const changes = vi.fn();
+    onTestFinished(sessionChanges.subscribe(changes));
+    const respond = await invokeSessionReclaim(context);
 
     expect(reclaim).toHaveBeenCalledWith(
       {
@@ -96,48 +100,65 @@ describe("sessions.reclaim", () => {
       }),
       undefined,
     );
+    expect(changes).not.toHaveBeenCalled();
   });
 
-  it("delegates a failed placement to the reclaim owner", async () => {
-    const failed = {
-      ...makeReclaimedPlacement(),
-      state: "failed",
-      environmentId: null,
-      activeOwnerEpoch: null,
-      workspaceBaseManifestRef: null,
-      remoteWorkspaceDir: null,
-      workerBundleHash: null,
-      recoveryError: "device worker is offline",
-      terminalReason: "device worker is offline",
-    } as WorkerSessionPlacementRecord;
-    const local = {
-      ...failed,
-      state: "local",
-      generation: failed.generation + 1,
-      recoveryError: null,
-      terminalReason: null,
-      terminalAtMs: null,
-    } as WorkerSessionPlacementRecord;
-    const reclaim = vi.fn().mockResolvedValue(local);
-    const respond = await invokeSessionReclaim(
-      makeDispatchTestContext({
-        workerPlacementDispatchService: { dispatch: vi.fn(), reclaim },
-        workerSessionPlacementService: {
-          getMany: () => new Map([[dispatchTestSessionId, failed]]),
+  it.each([false, true])(
+    "delegates a failed placement to the reclaim owner (recover=%s)",
+    async (recover) => {
+      const failed = {
+        ...makeReclaimedPlacement(),
+        state: "failed",
+        environmentId: null,
+        activeOwnerEpoch: null,
+        workspaceBaseManifestRef: null,
+        remoteWorkspaceDir: null,
+        workerBundleHash: null,
+        recoveryError: "device worker is offline",
+        terminalReason: "device worker is offline",
+      } as WorkerSessionPlacementRecord;
+      const local = {
+        ...failed,
+        state: "local",
+        generation: failed.generation + 1,
+        recoveryError: null,
+        terminalReason: null,
+        terminalAtMs: null,
+      } as WorkerSessionPlacementRecord;
+      const reclaim = vi.fn().mockResolvedValue(local);
+      const recovery = recover
+        ? { recoverToGateway: { expectedGeneration: failed.generation } }
+        : {};
+      const respond = await invokeSessionReclaim(
+        makeDispatchTestContext({
+          workerPlacementDispatchService: { dispatch: vi.fn(), reclaim },
+          workerSessionPlacementService: {
+            getMany: () => new Map([[dispatchTestSessionId, failed]]),
+          },
+        }),
+        undefined,
+        recovery,
+      );
+
+      expect(reclaim).toHaveBeenCalledExactlyOnceWith(
+        {
+          sessionId: dispatchTestSessionId,
+          sessionKey: dispatchTestSessionKey,
+          agentId: "main",
+          ...recovery,
         },
-      }),
-    );
-
-    expect(reclaim).toHaveBeenCalledOnce();
-    expect(respond).toHaveBeenCalledWith(
-      true,
-      expect.objectContaining({
-        ok: true,
-        placement: expect.objectContaining({ state: "local" }),
-      }),
-      undefined,
-    );
-  });
+        undefined,
+      );
+      expect(respond).toHaveBeenCalledWith(
+        true,
+        expect.objectContaining({
+          ok: true,
+          placement: expect.objectContaining({ state: "local" }),
+        }),
+        undefined,
+      );
+    },
+  );
 
   it("delegates placement visibility races to the reclaim owner", async () => {
     const reclaim = vi.fn().mockResolvedValue(makeReclaimedPlacement());
@@ -167,4 +188,106 @@ describe("sessions.reclaim", () => {
       undefined,
     );
   });
+
+  it("does not let session change reporting failure replace a committed reclaim", async () => {
+    const active = {
+      ...makeReclaimedPlacement(),
+      state: "active",
+      generation: 3,
+      updatedAtMs: 1,
+      recoveryError: null,
+    } as WorkerSessionPlacementRecord;
+    const reclaimed = makeReclaimedPlacement();
+    const context = makeDispatchTestContext({
+      getSessionEventSubscriberConnIds: () => {
+        throw new Error("session subscribers unavailable");
+      },
+      workerPlacementDispatchService: {
+        dispatch: vi.fn(),
+        reclaim: vi.fn().mockResolvedValue(reclaimed),
+      },
+      workerSessionPlacementService: {
+        getMany: () => new Map([[dispatchTestSessionId, active]]),
+      },
+    });
+
+    const changes = vi.fn();
+    onTestFinished(sessionChanges.subscribe(changes));
+    const respond = await invokeSessionReclaim(context);
+
+    expect(respond).toHaveBeenCalledWith(
+      true,
+      expect.objectContaining({
+        ok: true,
+        placement: expect.objectContaining({ state: "reclaimed" }),
+      }),
+      undefined,
+    );
+    expect(changes).toHaveBeenCalledExactlyOnceWith({ sessionKey: dispatchTestSessionKey });
+  });
+
+  it.each(["success", "persisted failure"] as const)(
+    "publishes a %s placement change to another session subscriber",
+    async (outcome) => {
+      await withOpenClawTestState({ scenario: "minimal" }, async () => {
+        let placement: WorkerSessionPlacementRecord = {
+          ...makeReclaimedPlacement(),
+          state: "active",
+          generation: 3,
+          updatedAtMs: 1,
+          recoveryError: null,
+          terminalReason: null,
+          terminalAtMs: null,
+        };
+        const reclaimError = new Error("worker teardown failed after committing placement");
+        const reclaim = vi.fn(async () => {
+          if (outcome === "persisted failure") {
+            placement = {
+              ...placement,
+              state: "failed",
+              generation: placement.generation + 1,
+              updatedAtMs: placement.updatedAtMs + 1,
+              recoveryError: reclaimError.message,
+            } as WorkerSessionPlacementRecord;
+            throw reclaimError;
+          }
+          placement = makeReclaimedPlacement();
+          return placement;
+        });
+        const context = makeDispatchTestContext({
+          broadcastToConnIds: vi.fn(),
+          chatAbortControllers: new Map(),
+          getSessionEventSubscriberConnIds: () => new Set(["another-client"]),
+          workerPlacementDispatchService: { dispatch: vi.fn(), reclaim },
+          workerSessionPlacementService: {
+            getMany: () => new Map([[dispatchTestSessionId, placement]]),
+          },
+        });
+
+        try {
+          const changes = vi.fn();
+          onTestFinished(sessionChanges.subscribe(changes));
+          const respond = await invokeSessionReclaim(context);
+
+          expect(respond).toHaveBeenCalledWith(
+            outcome === "success",
+            outcome === "success" ? expect.objectContaining({ ok: true }) : undefined,
+            outcome === "success"
+              ? undefined
+              : expect.objectContaining({ message: reclaimError.message }),
+          );
+          await flushPendingSessionsChangedEvents(context);
+          expect(context.broadcastToConnIds).toHaveBeenCalledExactlyOnceWith(
+            "sessions.changed",
+            expect.objectContaining({ reason: "reclaim", sessionKey: dispatchTestSessionKey }),
+            new Set(["another-client"]),
+            expect.objectContaining({ agentId: "main", dropIfSlow: true }),
+          );
+          expect(changes).toHaveBeenCalledExactlyOnceWith({ sessionKey: dispatchTestSessionKey });
+        } finally {
+          await flushPendingSessionsChangedEvents(context);
+        }
+      });
+    },
+  );
 });

@@ -5,8 +5,8 @@
 
 import { readFile } from "node:fs/promises";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
+import type { saveMediaBuffer as SaveMediaBufferFn } from "openclaw/plugin-sdk/media-runtime";
 import type { describeImageFile as DescribeImageFileFn } from "openclaw/plugin-sdk/media-understanding-runtime";
-import type { saveMediaBuffer as SaveMediaBufferFn } from "../sdk-setup-tools.js";
 import type { normalizeBrowserScreenshot as NormalizeBrowserScreenshotFn } from "./screenshot.js";
 
 /** Default prompt for turning browser screenshots into text-only page context. */
@@ -90,10 +90,18 @@ export async function describeBrowserScreenshot(
   deps: BrowserScreenshotDescriptionDeps,
 ): Promise<BrowserScreenshotDescriptionResult | null> {
   const filePath = await resolveImageUnderstandingFilePath(ctx, deps);
+  const agentId = ctx.agentDir
+    ? undefined
+    : (await import("openclaw/plugin-sdk/agent-scope-runtime")).resolveSessionAgentIdStrict({
+        agentId: ctx.agentId,
+        sessionKey: ctx.mediaScope?.sessionKey,
+        config: ctx.cfg,
+      });
   const described = await deps.describeImageFile({
     filePath,
     cfg: ctx.cfg,
     prompt: DEFAULT_BROWSER_SCREENSHOT_DESCRIPTION_PROMPT,
+    ...(agentId ? { agentId } : {}),
     agentDir: ctx.agentDir,
     workspaceDir: ctx.workspaceDir,
     activeModel: normalizeActiveModel(ctx.activeModel),

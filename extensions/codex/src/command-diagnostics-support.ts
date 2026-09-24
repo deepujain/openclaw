@@ -8,6 +8,12 @@ import {
   type CodexDiagnosticsTarget,
   type PendingCodexDiagnosticsConfirmation,
 } from "./command-diagnostics-state.js";
+import {
+  CODEX_RESUME_SAFE_THREAD_ID_PATTERN,
+  escapeCodexChatText,
+  formatCodexDisplayText,
+  formatCodexTextForDisplay,
+} from "./command-formatters.js";
 import { splitArgs } from "./command-handler-args.js";
 
 type ParsedDiagnosticsArgs =
@@ -26,8 +32,6 @@ const CODEX_DIAGNOSTICS_CONFIRMATION_TTL_MS = 5 * 60_000;
 const CODEX_DIAGNOSTICS_CONFIRMATION_MAX_REQUESTS_PER_SCOPE = 100;
 const CODEX_DIAGNOSTICS_CONFIRMATION_MAX_SCOPES = 100;
 const CODEX_DIAGNOSTICS_SCOPE_FIELD_MAX_CHARS = 128;
-const CODEX_RESUME_SAFE_THREAD_ID_PATTERN = /^[A-Za-z0-9._:-]+$/;
-
 const {
   lastUploadByThread: lastCodexDiagnosticsUploadByThread,
   lastUploadByScope: lastCodexDiagnosticsUploadByScope,
@@ -42,28 +46,9 @@ export function normalizeDiagnosticsReason(note: string): string | undefined {
 
 export function parseDiagnosticsArgs(args: string): ParsedDiagnosticsArgs {
   const [action, token, ...extra] = splitArgs(args);
-  const normalizedAction = action?.toLowerCase();
-  if (
-    (normalizedAction === "confirm" || normalizedAction === "--confirm") &&
-    token &&
-    extra.length === 0
-  ) {
-    return { action: "confirm", token };
-  }
-  if (
-    (normalizedAction === "cancel" || normalizedAction === "--cancel") &&
-    token &&
-    extra.length === 0
-  ) {
-    return { action: "cancel", token };
-  }
-  if (
-    normalizedAction === "confirm" ||
-    normalizedAction === "--confirm" ||
-    normalizedAction === "cancel" ||
-    normalizedAction === "--cancel"
-  ) {
-    return { action: "usage" };
+  const normalizedAction = action?.toLowerCase().replace(/^--/, "");
+  if (normalizedAction === "confirm" || normalizedAction === "cancel") {
+    return token && extra.length === 0 ? { action: normalizedAction, token } : { action: "usage" };
   }
   return { action: "request", note: args };
 }
@@ -152,46 +137,24 @@ export function readCodexDiagnosticsConfirmationScope(ctx: PluginCommandContext)
 export function readCodexDiagnosticsScopeMismatch(
   pending: PendingCodexDiagnosticsConfirmation,
   ctx: PluginCommandContext,
-):
-  | {
-      confirmMessage: string;
-      cancelMessage: string;
-    }
-  | undefined {
+): string | undefined {
   const current = readCodexDiagnosticsConfirmationScope(ctx);
   if (pending.accountId !== current.accountId) {
-    return {
-      confirmMessage: "This Codex diagnostics confirmation belongs to a different account.",
-      cancelMessage: "This Codex diagnostics confirmation belongs to a different account.",
-    };
+    return "This Codex diagnostics confirmation belongs to a different account.";
   }
   if (pending.privateRouted) {
     return undefined;
   }
-  if (pending.channelId !== current.channelId) {
-    return {
-      confirmMessage:
-        "This Codex diagnostics confirmation belongs to a different channel instance.",
-      cancelMessage: "This Codex diagnostics confirmation belongs to a different channel instance.",
-    };
-  }
-  if (pending.messageThreadId !== current.messageThreadId) {
-    return {
-      confirmMessage: "This Codex diagnostics confirmation belongs to a different thread.",
-      cancelMessage: "This Codex diagnostics confirmation belongs to a different thread.",
-    };
-  }
-  if (pending.threadParentId !== current.threadParentId) {
-    return {
-      confirmMessage: "This Codex diagnostics confirmation belongs to a different parent thread.",
-      cancelMessage: "This Codex diagnostics confirmation belongs to a different parent thread.",
-    };
-  }
-  if (pending.sessionKey !== current.sessionKey) {
-    return {
-      confirmMessage: "This Codex diagnostics confirmation belongs to a different session.",
-      cancelMessage: "This Codex diagnostics confirmation belongs to a different session.",
-    };
+  const fields = [
+    ["channelId", "channel instance"],
+    ["messageThreadId", "thread"],
+    ["threadParentId", "parent thread"],
+    ["sessionKey", "session"],
+  ] as const;
+  for (const [field, label] of fields) {
+    if (pending[field] !== current[field]) {
+      return `This Codex diagnostics confirmation belongs to a different ${label}.`;
+    }
   }
   return undefined;
 }
@@ -305,7 +268,7 @@ function formatCodexDiagnosticsTargetBlock(
 ): string[] {
   const lines = [`Session ${index + 1}`];
   if (target.channel) {
-    lines.push(`Channel: ${formatCodexValueForDisplay(target.channel)}`);
+    lines.push(`Channel: ${formatCodexDisplayText(target.channel)}`);
   }
   if (target.sessionKey) {
     lines.push(`OpenClaw session key: ${formatCodexCopyableValueForDisplay(target.sessionKey)}`);
@@ -321,41 +284,14 @@ function formatCodexDiagnosticsTargetBlock(
 function formatCodexDiagnosticsTargetLine(target: CodexDiagnosticsTarget): string {
   const parts: string[] = [];
   if (target.channel) {
-    parts.push(`channel ${formatCodexValueForDisplay(target.channel)}`);
+    parts.push(`channel ${formatCodexDisplayText(target.channel)}`);
   }
   const sessionLabel = target.sessionId || target.sessionKey;
   if (sessionLabel) {
-    parts.push(`OpenClaw session ${formatCodexValueForDisplay(sessionLabel)}`);
+    parts.push(`OpenClaw session ${formatCodexDisplayText(sessionLabel)}`);
   }
-  parts.push(`Codex thread ${formatCodexThreadIdForDisplay(target.threadId)}`);
+  parts.push(`Codex thread ${formatCodexDisplayText(target.threadId)}`);
   return `- ${parts.join(", ")}`;
-}
-
-export function escapeCodexChatText(value: string): string {
-  return value
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll("@", "\uff20")
-    .replaceAll("`", "\uff40")
-    .replaceAll("[", "\uff3b")
-    .replaceAll("]", "\uff3d")
-    .replaceAll("(", "\uff08")
-    .replaceAll(")", "\uff09")
-    .replaceAll("*", "\u2217")
-    .replaceAll("_", "\uff3f")
-    .replaceAll("~", "\uff5e")
-    .replaceAll("|", "\uff5c");
-}
-
-export function formatCodexTextForDisplay(value: string): string {
-  let safe = "";
-  for (const character of value) {
-    const codePoint = character.codePointAt(0);
-    safe += codePoint != null && isUnsafeDisplayCodePoint(codePoint) ? "?" : character;
-  }
-  safe = safe.trim();
-  return safe || "<unknown>";
 }
 
 export function readCodexDiagnosticsTargetsCooldownMessage(
@@ -365,20 +301,25 @@ export function readCodexDiagnosticsTargetsCooldownMessage(
   options: { includeThreadId?: boolean; cooldownScope?: string } = {},
 ): string | undefined {
   for (const target of targets) {
-    const cooldownMs = readCodexDiagnosticsCooldownMs(target.threadId, now);
+    const cooldownMs = readCodexDiagnosticsCooldownMs(
+      lastCodexDiagnosticsUploadByThread,
+      target.threadId,
+      now,
+    );
     if (cooldownMs > 0) {
       if (options.includeThreadId === false) {
         return `Codex diagnostics were already sent for one of these Codex threads recently. Try again in ${Math.ceil(
           cooldownMs / 1000,
         )}s.`;
       }
-      const displayThreadId = formatCodexThreadIdForDisplay(target.threadId);
+      const displayThreadId = formatCodexDisplayText(target.threadId);
       return `Codex diagnostics were already sent for thread ${displayThreadId} recently. Try again in ${Math.ceil(
         cooldownMs / 1000,
       )}s.`;
     }
   }
-  const scopeCooldownMs = readCodexDiagnosticsScopeCooldownMs(
+  const scopeCooldownMs = readCodexDiagnosticsCooldownMs(
+    lastCodexDiagnosticsUploadByScope,
     options.cooldownScope ?? readCodexDiagnosticsCooldownScope(ctx),
     now,
   );
@@ -426,25 +367,8 @@ export function readCodexDiagnosticsCooldownScope(ctx: PluginCommandContext): st
 }
 
 export function buildDiagnosticsTags(ctx: PluginCommandContext): Record<string, string> {
-  const tags: Record<string, string> = {
-    source: CODEX_DIAGNOSTICS_SOURCE,
-  };
-  addTag(tags, "channel", ctx.channel);
-  return tags;
-}
-
-function addTag(tags: Record<string, string>, key: string, value: unknown): void {
-  if (typeof value === "string" && value.trim()) {
-    tags[key] = value.trim();
-  }
-}
-
-function formatCodexThreadIdForDisplay(threadId: string): string {
-  return escapeCodexChatText(formatCodexTextForDisplay(threadId));
-}
-
-function formatCodexValueForDisplay(value: string): string {
-  return escapeCodexChatText(formatCodexTextForDisplay(value));
+  const channel = normalizeOptionalString(ctx.channel);
+  return { source: CODEX_DIAGNOSTICS_SOURCE, ...(channel ? { channel } : {}) };
 }
 
 function formatCodexCopyableValueForDisplay(value: string): string {
@@ -455,26 +379,18 @@ function formatCodexCopyableValueForDisplay(value: string): string {
   return escapeCodexChatText(safe);
 }
 
-function readCodexDiagnosticsCooldownMs(threadId: string, now: number): number {
-  const lastSentAt = lastCodexDiagnosticsUploadByThread.get(threadId);
+function readCodexDiagnosticsCooldownMs(
+  map: Map<string, number>,
+  key: string,
+  now: number,
+): number {
+  const lastSentAt = map.get(key);
   if (!lastSentAt) {
     return 0;
   }
   const remainingMs = Math.max(0, CODEX_DIAGNOSTICS_COOLDOWN_MS - (now - lastSentAt));
   if (remainingMs === 0) {
-    lastCodexDiagnosticsUploadByThread.delete(threadId);
-  }
-  return remainingMs;
-}
-
-function readCodexDiagnosticsScopeCooldownMs(scope: string, now: number): number {
-  const lastSentAt = lastCodexDiagnosticsUploadByScope.get(scope);
-  if (!lastSentAt) {
-    return 0;
-  }
-  const remainingMs = Math.max(0, CODEX_DIAGNOSTICS_COOLDOWN_MS - (now - lastSentAt));
-  if (remainingMs === 0) {
-    lastCodexDiagnosticsUploadByScope.delete(scope);
+    map.delete(key);
   }
   return remainingMs;
 }
@@ -524,22 +440,6 @@ function formatCodexResumeCommandForDisplay(threadId: string): string {
     return "run codex resume and paste the thread id shown above";
   }
   return `\`codex resume ${safeThreadId}\``;
-}
-
-function isUnsafeDisplayCodePoint(codePoint: number): boolean {
-  return (
-    codePoint <= 0x001f ||
-    (codePoint >= 0x007f && codePoint <= 0x009f) ||
-    codePoint === 0x00ad ||
-    codePoint === 0x061c ||
-    codePoint === 0x180e ||
-    (codePoint >= 0x200b && codePoint <= 0x200f) ||
-    (codePoint >= 0x202a && codePoint <= 0x202e) ||
-    (codePoint >= 0x2060 && codePoint <= 0x206f) ||
-    codePoint === 0xfeff ||
-    (codePoint >= 0xfff9 && codePoint <= 0xfffb) ||
-    (codePoint >= 0xe0000 && codePoint <= 0xe007f)
-  );
 }
 
 function normalizeCodexDiagnosticsScopeField(value: string | undefined): string | undefined {

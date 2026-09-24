@@ -1,3 +1,7 @@
+import type { TemplateResult } from "lit";
+import type { ToolCard } from "../../../lib/chat/chat-types.ts";
+import type { ChatMediaPlaybackMode } from "./chat-media-playback.ts";
+import type { ArtifactDownloadResolver } from "./chat-message-media.ts";
 import type { SessionDiffFileTextLoader, SessionDiffLoader } from "./session-diff-panel.ts";
 
 type DetailUnavailableReason = "not_found" | "oversized" | "not_visible";
@@ -11,7 +15,7 @@ type SidebarFullMessageRequest = {
   sessionKey: string;
   agentId?: string;
   messageId: string;
-  kind: "assistant_message" | "tool_output";
+  maxChars?: number;
 };
 
 export type SidebarFullMessageLoader = (
@@ -22,8 +26,6 @@ type MarkdownSidebarContent = {
   kind: "markdown";
   content: string;
   rawText?: string | null;
-  fullMessageRequest?: SidebarFullMessageRequest;
-  unavailableReason?: DetailUnavailableReason | null;
 };
 
 type CanvasSidebarContent = {
@@ -35,8 +37,6 @@ type CanvasSidebarContent = {
   /** Per-preview sandbox ceiling; keeps widget iframes below the global embed mode. */
   sandbox?: "strict" | "scripts";
   rawText?: string | null;
-  fullMessageRequest?: SidebarFullMessageRequest;
-  unavailableReason?: DetailUnavailableReason | null;
 };
 
 type ImageSidebarContent = {
@@ -45,8 +45,58 @@ type ImageSidebarContent = {
   src: string;
   mimeType?: string | null;
   rawText?: string | null;
-  fullMessageRequest?: SidebarFullMessageRequest;
-  unavailableReason?: DetailUnavailableReason | null;
+};
+
+type AttachmentSidebarSource = {
+  src: string;
+  playback?: ChatMediaPlaybackMode;
+  authToken?: string | null;
+  sizeBytes?: number;
+  durationMs?: number;
+  width?: number;
+  height?: number;
+};
+
+export type AttachmentSidebarState =
+  | { status: "pending" }
+  | ({ status: "ready" } & AttachmentSidebarSource)
+  | { status: "unavailable"; onRetry?: () => void }
+  | { status: "error"; reason: string; onRetry?: () => void };
+
+export type AttachmentSidebarRuntime = {
+  sessionKey?: string;
+  agentId?: string;
+  policyKey?: string;
+  connectionEpoch?: number;
+  authToken?: string | null;
+  resourceBasePath?: string;
+  resolveArtifactDownload?: ArtifactDownloadResolver;
+};
+
+type AttachmentSidebarContent = {
+  kind: "attachment";
+  attachmentKind?: "audio" | "video" | "document" | "image";
+  title: string;
+  /** Static sources only; expiring sources are resolved live through resolveSource. */
+  src?: string;
+  mimeType?: string | null;
+  sourceIdentity?: string;
+  playback?: ChatMediaPlaybackMode;
+  authToken?: string | null;
+  sizeBytes?: number;
+  durationMs?: number;
+  width?: number;
+  height?: number;
+  voiceNote?: boolean;
+  plainText?: boolean;
+  renderActions?: () => TemplateResult;
+  /** Authorize and read fresh bytes for each explicit download. */
+  download?: (signal: AbortSignal) => Promise<Blob | null>;
+  resolveSource?: (
+    onRequestUpdate: () => void,
+    runtime: AttachmentSidebarRuntime,
+  ) => AttachmentSidebarState;
+  rawText?: string | null;
 };
 
 type SessionDiffSidebarContent = {
@@ -55,10 +105,7 @@ type SessionDiffSidebarContent = {
   load: SessionDiffLoader;
   loadFileText?: SessionDiffFileTextLoader;
   openFile?: (path: string) => void;
-  revealFile?: (path: string) => void;
   rawText?: string | null;
-  fullMessageRequest?: SidebarFullMessageRequest;
-  unavailableReason?: DetailUnavailableReason | null;
 };
 
 type FileSaveOutcome =
@@ -73,6 +120,8 @@ type FileSidebarEdit = {
   fetchLatest: () => Promise<{ content: string; hash: string; editable: boolean } | null>;
 };
 
+export type FileSidebarNavigation = { line: number };
+
 type FileSidebarContent = {
   kind: "file";
   path: string;
@@ -81,18 +130,37 @@ type FileSidebarContent = {
   /** Stable per-session identity used to retain an unsaved in-memory draft. */
   draftKey?: string;
   root?: string | null;
+  mimeType?: string;
   language?: string;
   line?: number | null;
+  /** New identity for an explicit line request; ordinary tab selection retains it. */
+  navigation?: FileSidebarNavigation;
   rawText?: string | null;
-  fullMessageRequest?: SidebarFullMessageRequest;
-  unavailableReason?: DetailUnavailableReason | null;
   edit?: FileSidebarEdit;
 };
 
+export type ToolOutputSidebarContent = {
+  kind: "tool-output";
+  card: ToolCard;
+  sessionKey?: string;
+  agentId?: string;
+};
+
 export type SidebarContent =
+  | ToolOutputSidebarContent
   | MarkdownSidebarContent
   | CanvasSidebarContent
   | ImageSidebarContent
+  | AttachmentSidebarContent
   | FileSidebarContent
-  | SessionDiffSidebarContent
-  | { kind: "task"; taskId: string };
+  | SessionDiffSidebarContent;
+
+export type ChatDetailPanelContent = Exclude<SidebarContent, { kind: "tool-output" }>;
+
+export type SidebarSelection = (
+  | SidebarContent
+  | { kind: "loading" }
+  // Keep failed opens attached to their selected surface instead of falling back
+  // to unrelated content.
+  | { kind: "unavailable"; message: string }
+) & { fileTab?: { id: string; label: string } };

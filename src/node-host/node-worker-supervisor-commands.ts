@@ -1,14 +1,18 @@
 import type { CloudflareAccessCredentials } from "../../packages/gateway-client/src/cloudflare-access.js";
 import { WORKER_PUBLIC_INGRESS_PATH } from "../../packages/gateway-protocol/src/schema/worker-admission.js";
+import { boundedWorkerErrorWithCode } from "../gateway/worker-environments/worker-error.js";
 import {
   NODE_WORKER_BUNDLE_INSTALL_COMMAND,
   NODE_WORKER_CAPACITY_EXHAUSTED_ERROR_CODE,
   NODE_WORKER_DESKTOP_LAUNCH_COMMAND,
   NODE_WORKER_DESKTOP_STREAM_COMMAND,
+  NODE_WORKER_ENVIRONMENT_STOP_COMMAND,
+  NODE_WORKER_PORTAL_STREAM_COMMAND,
   NODE_WORKER_SUPERVISOR_CANCEL_COMMAND,
   NODE_WORKER_SUPERVISOR_LAUNCH_COMMAND,
   NODE_WORKER_SUPERVISOR_STATUS_COMMAND,
   NODE_WORKER_WORKSPACE_EXEC_COMMAND,
+  NODE_WORKER_WORKSPACE_PREPARE_COMMAND,
   NODE_WORKER_WORKSPACE_RETAIN_COMMAND,
 } from "../infra/node-commands.js";
 import {
@@ -17,6 +21,10 @@ import {
   parseNodeWorkerBundleInstallInput,
   type NodeWorkerBundleInstallResult,
 } from "../worker/node-bundle-install-protocol.js";
+import {
+  parseNodeWorkerPreparedWorkspaceInput,
+  type NodeWorkerPreparedWorkspaceResult,
+} from "../worker/node-workspace-prepared-protocol.js";
 import {
   parseNodeWorkerWorkspaceExecInput,
   type NodeWorkerWorkspaceExecResult,
@@ -39,6 +47,7 @@ import type { NodeWorkerBundleInstallerControl } from "./node-worker-bundle-inst
 import { NodeWorkerCapacityExhaustedError } from "./node-worker-capacity.js";
 import {
   parseNodeWorkerCancelInput,
+  parseNodeWorkerEnvironmentStopInput,
   parseNodeWorkerLaunchInput,
   parseNodeWorkerLookupInput,
   projectNodeWorkerSupervisorReceipt,
@@ -46,19 +55,25 @@ import {
   type NodeWorkerSupervisorReceipt,
 } from "./node-worker-supervisor-contract.js";
 import type { NodeWorkerWorkspaceRuntime } from "./node-worker-workspace.js";
+import { invokeNodeWorkerPortalStream } from "./portal-stream-command.js";
+
+const WORKSPACE_TRANSFER_DIAGNOSTIC_MAX_CHARS = 1_024;
+
+type NodeWorkerSupervisorCommandPayload =
+  | NodeWorkerBundleInstallResult
+  | NodeWorkerSupervisorReceipt
+  | NodeWorkerWorkspaceExecResult
+  | NodeWorkerPreparedWorkspaceResult
+  | NodeWorkerWorkspaceRetainResult
+  | { status: "ready" }
+  | null;
 
 type NodeWorkerSupervisorCommandResult =
   | { handled: false }
   | {
       handled: true;
       ok: true;
-      payload:
-        | NodeWorkerBundleInstallResult
-        | NodeWorkerSupervisorReceipt
-        | NodeWorkerWorkspaceExecResult
-        | NodeWorkerWorkspaceRetainResult
-        | { status: "ready" }
-        | null;
+      payload: NodeWorkerSupervisorCommandPayload;
     }
   | {
       handled: true;
@@ -72,6 +87,17 @@ type NodeWorkerSupervisorCommandResult =
       message: string;
     };
 
+function workspaceTransferDiagnostic(error: NodeWorkerWorkspaceTransferError): string {
+  if (!error.operation || !error.stage) {
+    return error.message;
+  }
+  const prefix = `workspace-transfer-failed: operation=${error.operation} stage=${error.stage}: `;
+  return `${prefix}${boundedWorkerErrorWithCode(
+    error.cause ?? error,
+    WORKSPACE_TRANSFER_DIAGNOSTIC_MAX_CHARS - prefix.length,
+  )}`;
+}
+
 function resolveWorkerConnectionEndpoint(params: {
   gatewayUrl?: string;
   gatewayTlsFingerprint?: string;
@@ -80,22 +106,18 @@ function resolveWorkerConnectionEndpoint(params: {
   if (!params.gatewayUrl) {
     throw new Error("node worker gateway connection unavailable");
   }
-  const gateway = new URL(params.gatewayUrl);
-  if (gateway.protocol !== "ws:" && gateway.protocol !== "wss:") {
+  const endpointUrl = new URL(params.gatewayUrl);
+  if (endpointUrl.protocol !== "ws:" && endpointUrl.protocol !== "wss:") {
     throw new Error("node worker gateway connection must use WebSocket transport");
   }
-  const endpointUrl = new URL(gateway.toString());
-  const basePath = gateway.pathname.replace(/\/$/u, "");
+  const basePath = endpointUrl.pathname.replace(/\/$/u, "");
   endpointUrl.pathname = `${basePath}${WORKER_PUBLIC_INGRESS_PATH}`;
   endpointUrl.search = "";
   endpointUrl.hash = "";
-  if (endpointUrl.host !== gateway.host) {
-    throw new Error("node worker endpoint must stay on the connected gateway host");
-  }
   const endpoint = parseWorkerConnectionEndpoint({
     kind: "websocket",
     url: endpointUrl.toString(),
-    ...(gateway.protocol === "wss:" && params.gatewayTlsFingerprint
+    ...(endpointUrl.protocol === "wss:" && params.gatewayTlsFingerprint
       ? { tlsFingerprint: params.gatewayTlsFingerprint }
       : {}),
     ...(params.gatewayCloudflareAccess ? { cloudflareAccess: params.gatewayCloudflareAccess } : {}),
@@ -123,22 +145,24 @@ export async function invokeNodeWorkerSupervisorCommand(params: {
     params.command === NODE_WORKER_SUPERVISOR_LAUNCH_COMMAND ||
     params.command === NODE_WORKER_SUPERVISOR_STATUS_COMMAND ||
     params.command === NODE_WORKER_SUPERVISOR_CANCEL_COMMAND ||
+    params.command === NODE_WORKER_ENVIRONMENT_STOP_COMMAND ||
     params.command === NODE_WORKER_WORKSPACE_EXEC_COMMAND ||
+    params.command === NODE_WORKER_WORKSPACE_PREPARE_COMMAND ||
     params.command === NODE_WORKER_WORKSPACE_RETAIN_COMMAND ||
     params.command === NODE_WORKER_DESKTOP_STREAM_COMMAND ||
-    params.command === NODE_WORKER_DESKTOP_LAUNCH_COMMAND;
+    params.command === NODE_WORKER_DESKTOP_LAUNCH_COMMAND ||
+    params.command === NODE_WORKER_PORTAL_STREAM_COMMAND;
   if (!recognized) {
     return { handled: false };
   }
-  if (
-    (params.command === NODE_WORKER_BUNDLE_INSTALL_COMMAND && !params.bundleInstaller) ||
-    (params.command === NODE_WORKER_WORKSPACE_EXEC_COMMAND && !params.workspace) ||
-    (params.command === NODE_WORKER_WORKSPACE_RETAIN_COMMAND && !params.supervisor) ||
-    (params.command !== NODE_WORKER_BUNDLE_INSTALL_COMMAND &&
-      params.command !== NODE_WORKER_WORKSPACE_EXEC_COMMAND &&
-      params.command !== NODE_WORKER_WORKSPACE_RETAIN_COMMAND &&
-      !params.supervisor)
-  ) {
+  const runtime =
+    params.command === NODE_WORKER_BUNDLE_INSTALL_COMMAND
+      ? params.bundleInstaller
+      : params.command === NODE_WORKER_WORKSPACE_EXEC_COMMAND ||
+          params.command === NODE_WORKER_WORKSPACE_PREPARE_COMMAND
+        ? params.workspace
+        : params.supervisor;
+  if (!runtime) {
     return {
       handled: true,
       ok: false,
@@ -147,48 +171,44 @@ export async function invokeNodeWorkerSupervisorCommand(params: {
     };
   }
   try {
-    if (params.command === NODE_WORKER_BUNDLE_INSTALL_COMMAND) {
+    let payload: NodeWorkerSupervisorCommandPayload;
+    if (params.command === NODE_WORKER_WORKSPACE_PREPARE_COMMAND) {
+      payload = await params.workspace!.prepare(
+        parseNodeWorkerPreparedWorkspaceInput(params.paramsJSON),
+        params.signal,
+      );
+    } else if (params.command === NODE_WORKER_BUNDLE_INSTALL_COMMAND) {
       if (!params.gatewayUrl) {
         throw new Error("node worker gateway connection unavailable");
       }
-      return {
-        handled: true,
-        ok: true,
-        payload: await params.bundleInstaller!.ensure({
-          input: parseNodeWorkerBundleInstallInput(params.paramsJSON),
-          gatewayUrl: params.gatewayUrl,
-          ...(params.gatewayTlsFingerprint
-            ? { gatewayTlsFingerprint: params.gatewayTlsFingerprint }
-            : {}),
-          ...(params.gatewayCloudflareAccess
-            ? { gatewayCloudflareAccess: params.gatewayCloudflareAccess }
-            : {}),
-          signal: params.signal,
-        }),
-      };
-    }
-    if (params.command === NODE_WORKER_WORKSPACE_EXEC_COMMAND) {
-      return {
-        handled: true,
-        ok: true,
-        payload: await params.workspace!.exec(
-          parseNodeWorkerWorkspaceExecInput(params.paramsJSON),
-          params.signal,
-          params.gatewayUrl
-            ? {
-                url: params.gatewayUrl,
-                ...(params.gatewayTlsFingerprint
-                  ? { tlsFingerprint: params.gatewayTlsFingerprint }
-                  : {}),
-                ...(params.gatewayCloudflareAccess
-                  ? { cloudflareAccess: params.gatewayCloudflareAccess }
-                  : {}),
-              }
-            : undefined,
-        ),
-      };
-    }
-    if (params.command === NODE_WORKER_WORKSPACE_RETAIN_COMMAND) {
+      payload = await params.bundleInstaller!.ensure({
+        input: parseNodeWorkerBundleInstallInput(params.paramsJSON),
+        gatewayUrl: params.gatewayUrl,
+        ...(params.gatewayTlsFingerprint
+          ? { gatewayTlsFingerprint: params.gatewayTlsFingerprint }
+          : {}),
+        ...(params.gatewayCloudflareAccess
+          ? { gatewayCloudflareAccess: params.gatewayCloudflareAccess }
+          : {}),
+        signal: params.signal,
+      });
+    } else if (params.command === NODE_WORKER_WORKSPACE_EXEC_COMMAND) {
+      payload = await params.workspace!.exec(
+        parseNodeWorkerWorkspaceExecInput(params.paramsJSON),
+        params.signal,
+        params.gatewayUrl
+          ? {
+              url: params.gatewayUrl,
+              ...(params.gatewayTlsFingerprint
+                ? { tlsFingerprint: params.gatewayTlsFingerprint }
+                : {}),
+              ...(params.gatewayCloudflareAccess
+                ? { cloudflareAccess: params.gatewayCloudflareAccess }
+                : {}),
+            }
+          : undefined,
+      );
+    } else if (params.command === NODE_WORKER_WORKSPACE_RETAIN_COMMAND) {
       const input = parseNodeWorkerWorkspaceRetainInput(params.paramsJSON);
       const workspace = await params.supervisor!.retainWorkspaces(input, params.signal);
       let bundles: { deleted: number; hasMore: boolean; generation: number } | undefined;
@@ -216,60 +236,56 @@ export async function invokeNodeWorkerSupervisorCommand(params: {
               bundleHash: input.bundleStatusHash,
             })
           : undefined;
-      return {
-        handled: true,
-        ok: true,
-        payload:
-          bundles || bundleStatus
-            ? {
-                ...workspace,
-                ...(bundles
-                  ? {
-                      bundleDeleted: bundles.deleted,
-                      bundleGeneration: bundles.generation,
-                      hasMore,
-                    }
-                  : {}),
-                ...(bundleStatus ? { bundleStatus } : {}),
-              }
-            : workspace,
-      };
-    }
-    if (params.command === NODE_WORKER_DESKTOP_STREAM_COMMAND) {
-      await invokeNodeWorkerDesktopStream({
+      payload =
+        bundles || bundleStatus
+          ? {
+              ...workspace,
+              ...(bundles
+                ? {
+                    bundleDeleted: bundles.deleted,
+                    bundleGeneration: bundles.generation,
+                    hasMore,
+                  }
+                : {}),
+              ...(bundleStatus ? { bundleStatus } : {}),
+            }
+          : workspace;
+    } else if (
+      params.command === NODE_WORKER_DESKTOP_STREAM_COMMAND ||
+      params.command === NODE_WORKER_PORTAL_STREAM_COMMAND
+    ) {
+      const stream =
+        params.command === NODE_WORKER_DESKTOP_STREAM_COMMAND
+          ? invokeNodeWorkerDesktopStream
+          : invokeNodeWorkerPortalStream;
+      await stream(params);
+      payload = null;
+    } else if (params.command === NODE_WORKER_DESKTOP_LAUNCH_COMMAND) {
+      payload = await invokeNodeWorkerDesktopLaunch({
         paramsJSON: params.paramsJSON,
-        gatewayUrl: params.gatewayUrl,
-        gatewayTlsFingerprint: params.gatewayTlsFingerprint,
-        gatewayCloudflareAccess: params.gatewayCloudflareAccess,
         signal: params.signal,
       });
-      return { handled: true, ok: true, payload: null };
+    } else if (params.command === NODE_WORKER_ENVIRONMENT_STOP_COMMAND) {
+      await params.supervisor!.stopEnvironment(
+        parseNodeWorkerEnvironmentStopInput(params.paramsJSON),
+      );
+      payload = null;
+    } else {
+      const receipt =
+        params.command === NODE_WORKER_SUPERVISOR_LAUNCH_COMMAND
+          ? await params.supervisor!.launch(
+              parseNodeWorkerLaunchInput(params.paramsJSON),
+              resolveWorkerConnectionEndpoint(params),
+              params.signal,
+            )
+          : params.command === NODE_WORKER_SUPERVISOR_STATUS_COMMAND
+            ? await params.supervisor!.status(
+                parseNodeWorkerLookupInput(params.paramsJSON).launchId,
+              )
+            : await params.supervisor!.cancel(parseNodeWorkerCancelInput(params.paramsJSON));
+      payload = receipt ? projectNodeWorkerSupervisorReceipt(receipt) : null;
     }
-    if (params.command === NODE_WORKER_DESKTOP_LAUNCH_COMMAND) {
-      return {
-        handled: true,
-        ok: true,
-        payload: await invokeNodeWorkerDesktopLaunch({
-          paramsJSON: params.paramsJSON,
-          signal: params.signal,
-        }),
-      };
-    }
-    const receipt =
-      params.command === NODE_WORKER_SUPERVISOR_LAUNCH_COMMAND
-        ? await params.supervisor!.launch(
-            parseNodeWorkerLaunchInput(params.paramsJSON),
-            resolveWorkerConnectionEndpoint(params),
-            params.signal,
-          )
-        : params.command === NODE_WORKER_SUPERVISOR_STATUS_COMMAND
-          ? await params.supervisor!.status(parseNodeWorkerLookupInput(params.paramsJSON).launchId)
-          : await params.supervisor!.cancel(parseNodeWorkerCancelInput(params.paramsJSON));
-    return {
-      handled: true,
-      ok: true,
-      payload: receipt ? projectNodeWorkerSupervisorReceipt(receipt) : null,
-    };
+    return { handled: true, ok: true, payload };
   } catch (error) {
     const invalid = error instanceof Error && error.message.startsWith("INVALID_REQUEST:");
     const bundleInstallFailure = error instanceof NodeWorkerBundleInstallError;
@@ -287,8 +303,9 @@ export async function invokeNodeWorkerSupervisorCommand(params: {
             : transferFailure
               ? NODE_WORKSPACE_TRANSFER_ERROR_CODE
               : "UNAVAILABLE",
-      message:
-        invalid || bundleInstallFailure || capacityFailure || transferFailure
+      message: transferFailure
+        ? workspaceTransferDiagnostic(error)
+        : invalid || bundleInstallFailure || capacityFailure
           ? error.message
           : "node worker supervisor command failed",
     };

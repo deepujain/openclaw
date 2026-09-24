@@ -101,16 +101,13 @@ function formatYyyyMmDd(date: Date): string {
 }
 
 function nextSerial(existingSerial: number | null, now: Date): number {
-  const today = formatYyyyMmDd(now);
-  const base = Number.parseInt(`${today}01`, 10);
-  if (!existingSerial || !Number.isFinite(existingSerial)) {
+  const base = Number.parseInt(`${formatYyyyMmDd(now)}01`, 10);
+  if (existingSerial === null || !Number.isFinite(existingSerial)) {
     return base;
   }
-  const existing = String(existingSerial);
-  if (existing.startsWith(today)) {
-    return existingSerial + 1;
-  }
-  return base;
+  // RFC 1982 accepts only advances smaller than half the unsigned serial space.
+  const distance = (base - existingSerial) >>> 0;
+  return distance > 0 && distance < 0x80000000 ? base : (existingSerial + 1) >>> 0;
 }
 
 function extractSerial(zoneText: string): number | null {
@@ -153,7 +150,9 @@ export type WideAreaGatewayZoneOpts = {
   cliPath?: string;
 };
 
-function renderZone(opts: WideAreaGatewayZoneOpts & { serial: number }): string {
+export function renderWideAreaGatewayZoneText(
+  opts: WideAreaGatewayZoneOpts & { serial: number },
+): string {
   const hostname = os.hostname().split(".")[0] ?? "openclaw";
   const hostLabel = dnsLabel(opts.hostLabel ?? hostname, "openclaw");
   const instanceLabel = dnsLabel(opts.instanceLabel ?? `${hostname}-gateway`, "openclaw-gw");
@@ -210,12 +209,6 @@ function renderZone(opts: WideAreaGatewayZoneOpts & { serial: number }): string 
   const contentHash = computeContentHash(hashBody);
 
   return `; openclaw-content-hash: ${contentHash}\n${contentBody}`;
-}
-
-export function renderWideAreaGatewayZoneText(
-  opts: WideAreaGatewayZoneOpts & { serial: number },
-): string {
-  return renderZone(opts);
 }
 
 export async function writeWideAreaGatewayZone(

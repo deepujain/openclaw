@@ -11,6 +11,10 @@ import type {
   ApprovalTerminalReason,
   TerminalApprovalSnapshot,
 } from "../../../../packages/gateway-protocol/src/schema/approvals.js";
+import type {
+  ExecApprovalGrantsListResult,
+  ExecApprovalStandingGrant,
+} from "../../../../packages/gateway-protocol/src/schema/exec-approvals.js";
 import type { GatewayBrowserClient } from "../../api/gateway.ts";
 import { titleForRoute } from "../../app-navigation.ts";
 import {
@@ -20,7 +24,13 @@ import {
 } from "../../app/context.ts";
 import { parseApprovalResolvedEvent } from "../../app/exec-approval.ts";
 import { readGatewayOperatorAccess } from "../../app/operator-access.ts";
-import { renderDocsLink, renderSettingsPage } from "../../components/settings-ui.ts";
+import {
+  renderLearnMoreLink,
+  renderSettingsLoadingSkeleton,
+  renderSettingsPage,
+  renderSettingsPageHeader,
+  renderSettingsSection,
+} from "../../components/settings-ui.ts";
 import { renderSettingsWorkspace } from "../../components/settings-workspace.ts";
 import { i18n, t } from "../../i18n/index.ts";
 import { formatUiError } from "../../lib/format-error.ts";
@@ -28,6 +38,24 @@ import { OpenClawLightDomElement } from "../../lit/openclaw-element.ts";
 import { SubscriptionsController } from "../../lit/subscriptions-controller.ts";
 
 const APPROVAL_HISTORY_PAGE_SIZE = 50;
+
+function grantStateLabel(grant: ExecApprovalStandingGrant, nowMs: number): string {
+  if (grant.revokedAtMs !== null) {
+    return t("standingGrants.stateRevoked");
+  }
+  if (grant.expiresAtMs !== null && grant.expiresAtMs <= nowMs) {
+    return t("standingGrants.stateExpired");
+  }
+  if (grant.expiresAtMs !== null) {
+    const days = Math.max(1, Math.ceil((grant.expiresAtMs - nowMs) / 86_400_000));
+    return t("standingGrants.stateExpiresIn", { count: String(days) });
+  }
+  return t("standingGrants.stateUntilRevoked");
+}
+
+function grantIsActive(grant: ExecApprovalStandingGrant, nowMs: number): boolean {
+  return grant.revokedAtMs === null && (grant.expiresAtMs === null || grant.expiresAtMs > nowMs);
+}
 const APPROVAL_HISTORY_REQUIRED_SCOPE = "operator.approvals";
 const APPROVALS_DOCS_URL = "https://docs.openclaw.ai/tools/exec-approvals";
 
@@ -38,65 +66,34 @@ function formatResolvedAt(timestampMs: number): string {
   }).format(new Date(timestampMs));
 }
 
-function kindLabel(kind: ApprovalKind): string {
-  switch (kind) {
-    case "exec":
-      return t("approvalHistory.kinds.exec");
-    case "plugin":
-      return t("approvalHistory.kinds.plugin");
-    case "system-agent":
-      return t("approvalHistory.kinds.systemAgent");
-  }
-  return kind satisfies never;
-}
+const APPROVAL_KIND_LABELS = {
+  exec: "approvalHistory.kinds.exec",
+  plugin: "approvalHistory.kinds.plugin",
+  "system-agent": "approvalHistory.kinds.systemAgent",
+} satisfies Record<ApprovalKind, string>;
 
-function statusLabel(status: TerminalApprovalSnapshot["status"]): string {
-  switch (status) {
-    case "allowed":
-      return t("approvalHistory.statuses.allowed");
-    case "denied":
-      return t("approvalHistory.statuses.denied");
-    case "expired":
-      return t("approvalHistory.statuses.expired");
-    case "cancelled":
-      return t("approvalHistory.statuses.cancelled");
-  }
-  return status satisfies never;
-}
+const APPROVAL_STATUS_LABELS = {
+  allowed: "approvalHistory.statuses.allowed",
+  denied: "approvalHistory.statuses.denied",
+  expired: "approvalHistory.statuses.expired",
+  cancelled: "approvalHistory.statuses.cancelled",
+} satisfies Record<TerminalApprovalSnapshot["status"], string>;
 
-function decisionLabel(decision: ApprovalDecision | undefined): string {
-  switch (decision) {
-    case "allow-once":
-      return t("approvalHistory.decisions.allowOnce");
-    case "allow-always":
-      return t("approvalHistory.decisions.allowAlways");
-    case "deny":
-      return t("approvalHistory.decisions.deny");
-    case undefined:
-      return t("approvalHistory.notApplicable");
-  }
-  return decision satisfies never;
-}
+const APPROVAL_DECISION_LABELS = {
+  "allow-once": "approvalHistory.decisions.allowOnce",
+  "allow-always": "approvalHistory.decisions.allowAlways",
+  deny: "approvalHistory.decisions.deny",
+} satisfies Record<ApprovalDecision, string>;
 
-function reasonLabel(reason: ApprovalTerminalReason): string {
-  switch (reason) {
-    case "user":
-      return t("approvalHistory.reasons.user");
-    case "timeout":
-      return t("approvalHistory.reasons.timeout");
-    case "malformed-verdict":
-      return t("approvalHistory.reasons.malformedVerdict");
-    case "no-route":
-      return t("approvalHistory.reasons.noRoute");
-    case "run-aborted":
-      return t("approvalHistory.reasons.runAborted");
-    case "gateway-restart":
-      return t("approvalHistory.reasons.gatewayRestart");
-    case "storage-corrupt":
-      return t("approvalHistory.reasons.storageCorrupt");
-  }
-  return reason satisfies never;
-}
+const APPROVAL_REASON_LABELS = {
+  user: "approvalHistory.reasons.user",
+  timeout: "approvalHistory.reasons.timeout",
+  "malformed-verdict": "approvalHistory.reasons.malformedVerdict",
+  "no-route": "approvalHistory.reasons.noRoute",
+  "run-aborted": "approvalHistory.reasons.runAborted",
+  "gateway-restart": "approvalHistory.reasons.gatewayRestart",
+  "storage-corrupt": "approvalHistory.reasons.storageCorrupt",
+} satisfies Record<ApprovalTerminalReason, string>;
 
 function requestLabel(item: TerminalApprovalSnapshot): string {
   const presentation = item.presentation;
@@ -123,6 +120,9 @@ class ApprovalsPage extends OpenClawLightDomElement {
   private context!: ApplicationContext;
 
   @state() private items: TerminalApprovalSnapshot[] = [];
+  @state() private grants: ExecApprovalStandingGrant[] = [];
+  @state() private grantsError: string | null = null;
+  @state() private revokingGrantId: string | null = null;
   @state() private nextCursor: string | null = null;
   @state() private loading = false;
   @state() private loadingMore = false;
@@ -271,6 +271,9 @@ class ApprovalsPage extends OpenClawLightDomElement {
       this.items = reset ? result.items : [...this.items, ...result.items];
       this.nextCursor = result.nextCursor ?? null;
       this.hasLoaded = true;
+      if (reset) {
+        void this.loadGrants(client, isCurrent);
+      }
     } catch (error) {
       if (isCurrent()) {
         this.error = formatUiError(error);
@@ -287,67 +290,217 @@ class ApprovalsPage extends OpenClawLightDomElement {
     }
   }
 
+  private async loadGrants(client: GatewayBrowserClient, isCurrent: () => boolean): Promise<void> {
+    try {
+      const result = await client.request<ExecApprovalGrantsListResult>(
+        "exec.approval.grants.list",
+        {},
+      );
+      if (!isCurrent()) {
+        return;
+      }
+      this.grants = Array.isArray(result.grants) ? result.grants : [];
+      this.grantsError = null;
+    } catch (error) {
+      if (isCurrent()) {
+        this.grantsError = formatUiError(error);
+      }
+    }
+  }
+
+  private async revokeGrant(grantId: string): Promise<void> {
+    const client = this.client;
+    if (!client || this.revokingGrantId !== null) {
+      return;
+    }
+    this.revokingGrantId = grantId;
+    try {
+      await client.request("exec.approval.grants.revoke", { grantId });
+      const nowMs = Date.now();
+      this.grants = this.grants.map((grant) =>
+        grant.grantId === grantId ? { ...grant, revokedAtMs: nowMs } : grant,
+      );
+      this.grantsError = null;
+    } catch (error) {
+      this.grantsError = formatUiError(error);
+    } finally {
+      this.revokingGrantId = null;
+    }
+  }
+
+  private renderGrants() {
+    const nowMs = Date.now();
+    return renderSettingsSection(
+      {
+        title: html`<span id="standing-grants-title">${t("standingGrants.title")}</span>`,
+        description: t("standingGrants.description"),
+        notice: this.grantsError
+          ? html`<div class="callout danger" role="alert">${this.grantsError}</div>`
+          : nothing,
+      },
+      html`
+        <div class="data-table-container">
+          <table
+            class="data-table standing-grants-table settings-table--stacked"
+            role="table"
+            aria-labelledby="standing-grants-title"
+          >
+            <thead>
+              <tr>
+                <th scope="col">${t("standingGrants.columns.automation")}</th>
+                <th scope="col">${t("standingGrants.columns.command")}</th>
+                <th scope="col">${t("standingGrants.columns.uses")}</th>
+                <th scope="col">${t("standingGrants.columns.state")}</th>
+                <th scope="col"><span class="sr-only">${t("standingGrants.revoke")}</span></th>
+              </tr>
+            </thead>
+            <tbody>
+              ${
+                this.grants.length === 0
+                  ? html`
+                      <tr>
+                        <td colspan="5" class="data-table-empty-cell">
+                          <div class="data-table-empty-state" role="status" aria-live="polite">
+                            ${t("standingGrants.empty")}
+                          </div>
+                        </td>
+                      </tr>
+                    `
+                  : this.grants.map(
+                      (grant) => html`
+                        <tr>
+                          <td data-label=${t("standingGrants.columns.automation")}>
+                            ${grant.cronJobName ?? grant.cronJobId}
+                          </td>
+                          <td class="mono" data-label=${t("standingGrants.columns.command")}>
+                            ${grant.command}
+                          </td>
+                          <td data-label=${t("standingGrants.columns.uses")}>${grant.useCount}</td>
+                          <td data-label=${t("standingGrants.columns.state")} aria-live="polite">
+                            ${grantStateLabel(grant, nowMs)}
+                          </td>
+                          <td>
+                            ${
+                              grantIsActive(grant, nowMs)
+                                ? html`
+                                    <button
+                                      class="btn btn--sm"
+                                      aria-label=${`${
+                                        this.revokingGrantId === grant.grantId
+                                          ? t("standingGrants.revoking")
+                                          : t("standingGrants.revoke")
+                                      }: ${grant.cronJobName ?? grant.cronJobId} — ${grant.command}`}
+                                      ?disabled=${this.revokingGrantId !== null}
+                                      @click=${() => void this.revokeGrant(grant.grantId)}
+                                    >
+                                      ${
+                                        this.revokingGrantId === grant.grantId
+                                          ? t("standingGrants.revoking")
+                                          : t("standingGrants.revoke")
+                                      }
+                                    </button>
+                                  `
+                                : nothing
+                            }
+                          </td>
+                        </tr>
+                      `,
+                    )
+              }
+            </tbody>
+          </table>
+        </div>
+      `,
+    );
+  }
+
   private renderTable() {
+    if (this.loading && this.items.length === 0) {
+      return renderSettingsLoadingSkeleton({ label: t("approvalHistory.loading") });
+    }
     return html`
       <div class="data-table-container">
-        <table class="data-table approval-history-table">
+        <table
+          class="data-table approval-history-table settings-table--stacked"
+          role="table"
+          aria-labelledby="approval-history-title"
+          aria-busy=${this.loading || this.loadingMore ? "true" : "false"}
+        >
           <thead>
             <tr>
-              <th>${t("approvalHistory.columns.resolved")}</th>
-              <th>${t("approvalHistory.columns.kind")}</th>
-              <th>${t("approvalHistory.columns.request")}</th>
-              <th>${t("approvalHistory.columns.decision")}</th>
-              <th>${t("approvalHistory.columns.reason")}</th>
-              <th>${t("approvalHistory.columns.source")}</th>
-              <th>${t("approvalHistory.columns.resolver")}</th>
+              <th scope="col">${t("approvalHistory.columns.resolved")}</th>
+              <th scope="col">${t("approvalHistory.columns.kind")}</th>
+              <th scope="col">${t("approvalHistory.columns.request")}</th>
+              <th scope="col">${t("approvalHistory.columns.decision")}</th>
+              <th scope="col">${t("approvalHistory.columns.reason")}</th>
+              <th scope="col">${t("approvalHistory.columns.source")}</th>
+              <th scope="col">${t("approvalHistory.columns.resolver")}</th>
             </tr>
           </thead>
           <tbody>
-            ${this.items.length === 0
-              ? html`
-                  <tr>
-                    <td colspan="7" class="data-table-empty-cell">
-                      <div class="data-table-empty-state" role="status" aria-live="polite">
-                        ${this.loading
-                          ? t("approvalHistory.loading")
-                          : this.error || !this.hasLoaded
-                            ? t("approvalHistory.unknown")
-                            : t("approvalHistory.empty")}
-                      </div>
-                    </td>
-                  </tr>
-                `
-              : this.items.map(
-                  (item) => html`
+            ${
+              this.items.length === 0
+                ? html`
                     <tr>
-                      <td>${formatResolvedAt(item.resolvedAtMs)}</td>
-                      <td>${kindLabel(item.presentation.kind)}</td>
-                      <td class="mono">${requestLabel(item)}</td>
-                      <td>
-                        ${statusLabel(item.status)} ·
-                        ${decisionLabel("decision" in item ? item.decision : undefined)}
+                      <td colspan="7" class="data-table-empty-cell">
+                        <div class="data-table-empty-state" role="status" aria-live="polite">
+                          ${
+                            this.error || !this.hasLoaded
+                              ? t("approvalHistory.unknown")
+                              : t("approvalHistory.empty")
+                          }
+                        </div>
                       </td>
-                      <td>${reasonLabel(item.reason)}</td>
-                      <td class="mono">${sourceLabel(item)}</td>
-                      <td class="mono">${resolverLabel(item)}</td>
                     </tr>
-                  `,
-                )}
+                  `
+                : this.items.map(
+                    (item) => html`
+                      <tr>
+                        <td data-label=${t("approvalHistory.columns.resolved")}>
+                          ${formatResolvedAt(item.resolvedAtMs)}
+                        </td>
+                        <td data-label=${t("approvalHistory.columns.kind")}>
+                          ${t(APPROVAL_KIND_LABELS[item.presentation.kind])}
+                        </td>
+                        <td class="mono" data-label=${t("approvalHistory.columns.request")}>
+                          ${requestLabel(item)}
+                        </td>
+                        <td data-label=${t("approvalHistory.columns.decision")}>
+                          ${t(APPROVAL_STATUS_LABELS[item.status])} ·
+                          ${t("decision" in item && item.decision ? APPROVAL_DECISION_LABELS[item.decision] : "approvalHistory.notApplicable")}
+                        </td>
+                        <td data-label=${t("approvalHistory.columns.reason")}>
+                          ${t(APPROVAL_REASON_LABELS[item.reason])}
+                        </td>
+                        <td class="mono" data-label=${t("approvalHistory.columns.source")}>
+                          ${sourceLabel(item)}
+                        </td>
+                        <td class="mono" data-label=${t("approvalHistory.columns.resolver")}>
+                          ${resolverLabel(item)}
+                        </td>
+                      </tr>
+                    `,
+                  )
+            }
           </tbody>
         </table>
       </div>
       <div class="data-table-pagination">
         <div class="data-table-pagination__info">${t("approvalHistory.retention")}</div>
         <div class="data-table-pagination__controls">
-          ${this.nextCursor
-            ? html`
-                <button ?disabled=${this.loadingMore} @click=${() => void this.loadPage(false)}>
-                  ${this.loadingMore
-                    ? t("approvalHistory.loadingMore")
-                    : t("approvalHistory.loadMore")}
-                </button>
-              `
-            : nothing}
+          ${
+            this.nextCursor
+              ? html`
+                  <button ?disabled=${this.loadingMore} @click=${() => void this.loadPage(false)}>
+                    ${
+                      this.loadingMore
+                        ? t("approvalHistory.loadingMore")
+                        : t("approvalHistory.loadMore")
+                    }
+                  </button>
+                `
+              : nothing
+          }
         </div>
       </div>
     `;
@@ -356,38 +509,54 @@ class ApprovalsPage extends OpenClawLightDomElement {
   override render() {
     const body = renderSettingsPage(
       html`
-        <p class="settings-page__intro">
-          ${t("approvalHistory.description")}
-          ${renderDocsLink(APPROVALS_DOCS_URL, t("common.learnMore"))}
-        </p>
-        ${!this.connected
-          ? html`<div class="callout warn">${t("approvalHistory.offline")}</div>`
-          : nothing}
-        ${this.connected && !this.approvalsAccess
-          ? html`
-              <div class="callout warn" role="status">
-                ${t("common.disabled")} · <code>${APPROVAL_HISTORY_REQUIRED_SCOPE}</code>
-              </div>
-            `
-          : nothing}
-        ${this.approvalsAccess && this.error
-          ? html`
-              <div class="callout danger">
-                ${this.error}
-                <button class="btn btn--sm" @click=${() => void this.loadPage(true)}>
-                  ${t("common.retry")}
-                </button>
-              </div>
-            `
-          : nothing}
-        ${this.approvalsAccess ? this.renderTable() : nothing}
+        ${
+          !this.connected
+            ? html`<div class="callout warn" role="status">${t("approvalHistory.offline")}</div>`
+            : nothing
+        }
+        ${
+          this.connected && !this.approvalsAccess
+            ? html`
+                <div class="callout warn" role="status">
+                  ${t("common.disabled")} · <code>${APPROVAL_HISTORY_REQUIRED_SCOPE}</code>
+                </div>
+              `
+            : nothing
+        }
+        ${
+          this.approvalsAccess && this.error
+            ? html`
+                <div class="callout danger" role="alert">
+                  ${this.error}
+                  <button class="btn btn--sm" @click=${() => void this.loadPage(true)}>
+                    ${t("common.retry")}
+                  </button>
+                </div>
+              `
+            : nothing
+        }
+        ${this.approvalsAccess ? this.renderGrants() : nothing}
+        ${
+          this.approvalsAccess
+            ? renderSettingsSection(
+                {
+                  title: html`<span id="approval-history-title">
+                    ${t("standingGrants.historyTitle")}
+                  </span>`,
+                },
+                this.renderTable(),
+              )
+            : nothing
+        }
       `,
       { wide: true },
     );
     return html`
-      <section class="content-header">
-        <div><div class="page-title">${titleForRoute("approvals")}</div></div>
-      </section>
+      ${renderSettingsPageHeader({
+        title: titleForRoute("approvals"),
+        subtitle: html`${t("approvalHistory.description")}
+        ${renderLearnMoreLink(APPROVALS_DOCS_URL)}`,
+      })}
       ${renderSettingsWorkspace(body)}
     `;
   }

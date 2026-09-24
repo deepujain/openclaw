@@ -2,23 +2,22 @@
 import type { PluginRegistry } from "../../plugins/registry-types.js";
 import { normalizePluginGatewayMethodScope } from "../../shared/gateway-method-policy.js";
 import { ADMIN_SCOPE, type OperatorScope } from "../operator-scopes.js";
-import {
-  createCoreGatewayMethodDescriptors,
-  isCoreGatewayMethodClassified,
-} from "./core-descriptors.js";
+import "./core-method-policy.js";
 import {
   DYNAMIC_GATEWAY_METHOD_SCOPE,
   type GatewayMethodDescriptor,
   type GatewayMethodHandler,
   type GatewayMethodDescriptorInput,
   type GatewayMethodOwner,
-  type GatewayMethodProfileAccess,
   type GatewayMethodRegistryView,
   NODE_GATEWAY_METHOD_SCOPE,
 } from "./descriptor.js";
+export {
+  createCoreGatewayMethodDescriptors,
+  isCoreGatewayMethodClassified,
+} from "./core-method-policy.js";
 
 export type GatewayMethodRegistry = GatewayMethodRegistryView;
-export { createCoreGatewayMethodDescriptors, isCoreGatewayMethodClassified };
 
 function normalizeMethodName(name: string): string {
   return name.trim();
@@ -40,12 +39,22 @@ function normalizeDescriptor(input: GatewayMethodDescriptorInput): GatewayMethod
   if (!normalizedScope) {
     throw new Error(`gateway method descriptor is missing a scope: ${name}`);
   }
+  const profileAccess =
+    input.profileAccess ??
+    (input.sessionAccess || input.owner.kind !== "core" ? "required" : "independent");
+  if (
+    input.sessionAccess &&
+    (normalizedScope !== "operator.write" || profileAccess === "independent")
+  ) {
+    throw new Error(
+      `session-scoped gateway methods require operator.write and an authenticated profile: ${name}`,
+    );
+  }
   return {
     ...input,
     name,
     scope: normalizedScope,
-    profileAccess:
-      input.profileAccess ?? (input.owner.kind === "core" ? "independent" : "required"),
+    profileAccess,
     ...(input.startup === "unavailable-until-sidecars"
       ? { startup: "unavailable-until-sidecars" }
       : {}),
@@ -78,6 +87,7 @@ export function createGatewayMethodRegistry(
         .filter((descriptor) => descriptor.advertise !== false)
         .map((descriptor) => descriptor.name),
     getScope: (name) => byName.get(name)?.scope,
+    getSessionAccess: (name) => byName.get(name)?.sessionAccess,
     isStartupUnavailable: (name) => byName.get(name)?.startup === "unavailable-until-sidecars",
     isControlPlaneWrite: (name) => byName.get(name)?.controlPlaneWrite === true,
     requiresAuthenticatedProfile: (name) => byName.get(name)?.profileAccess === "required",
@@ -105,24 +115,6 @@ export function createGatewayMethodDescriptorsFromHandlers(params: {
     };
     return descriptor;
   });
-}
-
-/** Creates a plugin-owned method descriptor with plugin namespace scope normalization. */
-export function createPluginGatewayMethodDescriptor(params: {
-  pluginId: string;
-  name: string;
-  handler: GatewayMethodHandler;
-  scope?: OperatorScope;
-  profileAccess?: GatewayMethodProfileAccess;
-}): GatewayMethodDescriptor {
-  const normalizedScope = normalizePluginGatewayMethodScope(params.name, params.scope).scope;
-  return {
-    name: params.name,
-    handler: params.handler,
-    owner: { kind: "plugin", pluginId: params.pluginId },
-    profileAccess: params.profileAccess ?? "required",
-    scope: normalizedScope ?? ADMIN_SCOPE,
-  };
 }
 
 /** Resolves plugin method descriptors, including the legacy handler-only registry shape. */

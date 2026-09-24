@@ -1,5 +1,7 @@
 // @vitest-environment node
+import { DEFAULT_GATEWAY_REQUEST_TIMEOUT_MS } from "@openclaw/gateway-client/browser";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { createDeferred as deferred } from "../../../test/helpers/promise.js";
 import {
   closeDevicePairSetup,
   completeDevicePairSetup,
@@ -18,14 +20,6 @@ import {
 type DevicePairSetupState = ReturnType<typeof createDevicePairSetupState>;
 type DevicePairSetup = Extract<DevicePairSetupLifecycle, { phase: "waiting" }>["setup"];
 type DevicePairSetupCompletion = NonNullable<ReturnType<typeof parseDevicePairSetupCompletion>>;
-
-function deferred<T>() {
-  let resolve!: (value: T) => void;
-  const promise = new Promise<T>((resolvePromise) => {
-    resolve = resolvePromise;
-  });
-  return { promise, resolve };
-}
 
 function setupResult(
   setupId: string,
@@ -77,10 +71,11 @@ describe("device pairing setup state", () => {
     await expect(requestDevicePairJoinSetup({ request })).resolves.toMatchObject({
       joinUrl: "https://gateway.example.com/j/fresh-code",
     });
-    expect(request).toHaveBeenCalledWith("device.pair.setupCode", {
-      includeQr: false,
-      joinUrl: true,
-    });
+    expect(request).toHaveBeenCalledWith(
+      "device.pair.setupCode",
+      { includeQr: false, joinUrl: true },
+      { timeoutMs: DEFAULT_GATEWAY_REQUEST_TIMEOUT_MS },
+    );
   });
 
   it("opens in access selection without minting a setup credential", async () => {
@@ -182,9 +177,10 @@ describe("device pairing setup state", () => {
     expect(request).not.toHaveBeenCalled();
     await refreshDevicePairSetup(state);
 
-    expect(request).toHaveBeenCalledWith("device.pair.setupCode", {
-      bootstrapProfile: "limited",
-    });
+    expect(request.mock.calls.at(-1)?.slice(0, 2)).toEqual([
+      "device.pair.setupCode",
+      { bootstrapProfile: "limited" },
+    ]);
     expect(state.devicePairSetupLifecycle).toMatchObject({
       phase: "waiting",
       access: "limited",
@@ -195,7 +191,7 @@ describe("device pairing setup state", () => {
     state.devicePairSetupOpen = true;
     request.mockResolvedValueOnce(setupResult("full-setup", "FULL"));
     await refreshDevicePairSetup(state);
-    expect(request).toHaveBeenLastCalledWith("device.pair.setupCode", {});
+    expect(request.mock.calls.at(-1)?.slice(0, 2)).toEqual(["device.pair.setupCode", {}]);
     closeDevicePairSetup(state);
   });
 
@@ -208,10 +204,10 @@ describe("device pairing setup state", () => {
     await setDevicePairSetupAccess(state, "node");
     await refreshDevicePairSetup(state);
 
-    expect(request).toHaveBeenCalledWith("device.pair.setupCode", {
-      bootstrapProfile: "node",
-      includeQr: false,
-    });
+    expect(request.mock.calls.at(-1)?.slice(0, 2)).toEqual([
+      "device.pair.setupCode",
+      { bootstrapProfile: "node", includeQr: false },
+    ]);
     expect(state.devicePairSetupLifecycle).toMatchObject({ phase: "waiting", access: "node" });
     closeDevicePairSetup(state);
   });

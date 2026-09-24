@@ -65,6 +65,11 @@ type RecoveryRunOwner = {
   sessionId: string;
 };
 
+type AdmittedRecoveryAttempt = RecoveryRunOwner & {
+  cycleId: string;
+  attempt: number;
+};
+
 export type MainSessionRecoveryCommand =
   | {
       kind: "mark_interrupted";
@@ -99,15 +104,24 @@ export type MainSessionRecoveryCommand =
       cycleId: string;
       token: MainSessionRecoveryExecutionIdentity;
     } & RecoveryRunOwner)
+  | ({
+      kind: "register_recovery_turn";
+      attempt: number;
+      cycleId: string;
+    } & RecoveryRunOwner)
   | {
       kind: "cancel_reservation" | "abandon_reservation";
       reservation: MainSessionRecoveryReservation;
     }
   | ({ kind: "validate_recovery" } & RecoveryRunOwner)
   | ({
-      kind: "admit_recovery" | "mark_admitted_recovery_interrupted";
+      kind: "admit_recovery";
       now: number;
     } & RecoveryRunOwner)
+  | ({
+      kind: "mark_admitted_recovery_interrupted";
+      now: number;
+    } & AdmittedRecoveryAttempt)
   | {
       kind: "claim_foreground";
       cycleId: string;
@@ -132,7 +146,6 @@ export type MainSessionRecoveryCommand =
 export type MainSessionRecoveryTransitionResult =
   | {
       kind:
-        | "admitted_recovery"
         | "applied"
         | "doctor_repaired"
         | "foreground_validated"
@@ -140,6 +153,7 @@ export type MainSessionRecoveryTransitionResult =
         | "recovery_validated"
         | "tombstoned";
     }
+  | { kind: "admitted_recovery"; admission: AdmittedRecoveryAttempt }
   | { kind: "foreground_claimed"; claim: MainSessionRecoveryOwnerClaim }
   | { kind: "observed"; view: MainSessionRecoveryView }
   | { kind: "rejected"; reason: MainSessionRecoveryConflict }

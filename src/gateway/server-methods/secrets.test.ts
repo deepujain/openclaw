@@ -4,18 +4,19 @@
 
 import { expectDefined } from "@openclaw/normalization-core";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { createDeferred } from "../../../test/helpers/promise.js";
 
 const storeMocks = vi.hoisted(() => ({
   deleteEntry: vi.fn(),
   listEntries: vi.fn(() => [] as Array<Record<string, unknown>>),
-  purgeEntries: vi.fn(() => 0),
+  purgeEntries: vi.fn(async () => 0),
   writeEntry: vi.fn(),
   getSnapshot: vi.fn(() => ({ sourceConfig: {} })),
   collectRefKeys: vi.fn((_config: unknown, _name: string) => new Set<string>()),
 }));
 
 vi.mock("../../secrets/runtime-state.js", () => ({
-  collectSecretStoreRefKeysInConfig: storeMocks.collectRefKeys,
+  collectSecretStoreRefKeysInSnapshot: storeMocks.collectRefKeys,
   getActiveSecretsRuntimeSnapshotState: storeMocks.getSnapshot,
 }));
 
@@ -45,11 +46,12 @@ vi.mock("../../secrets/target-registry.js", () => ({
   isKnownSecretTargetId: () => false,
 }));
 
+import { isSecretValueRegisteredForRedaction } from "../../logging/secret-redaction-registry.js";
 import {
   TALK_TEST_PROVIDER_API_KEY_PATH,
   TALK_TEST_PROVIDER_API_KEY_PATH_SEGMENTS,
 } from "../../test-utils/talk-test-provider.js";
-import { createSecretsHandlers } from "./secrets.js";
+import { createSecretsHandlers, createSecretStoreWriteService } from "./secrets.js";
 
 async function invokeSecretsReload(params: {
   handlers: ReturnType<typeof createSecretsHandlers>;
@@ -178,7 +180,7 @@ describe("secrets handlers", () => {
   beforeEach(() => {
     storeMocks.deleteEntry.mockReset();
     storeMocks.listEntries.mockReset().mockReturnValue([]);
-    storeMocks.purgeEntries.mockReset().mockReturnValue(0);
+    storeMocks.purgeEntries.mockReset().mockResolvedValue(0);
     storeMocks.writeEntry.mockReset();
     storeMocks.getSnapshot.mockReset().mockReturnValue({ sourceConfig: {} });
     storeMocks.collectRefKeys.mockReset().mockReturnValue(new Set());
@@ -211,6 +213,7 @@ describe("secrets handlers", () => {
       }));
     return createSecretsHandlers({
       reloadSecrets,
+      storeWriteService: createSecretStoreWriteService({ reloadSecrets, log: overrides?.log }),
       resolveSecrets,
       log: overrides?.log,
     });
@@ -412,10 +415,13 @@ describe("secrets handlers", () => {
         },
       },
     });
-    const handlers = createHandlers({ reloadSecrets });
+    const warn = vi.fn();
+    const handlers = createHandlers({ reloadSecrets, log: { warn } });
+    const expiry = createDeferred<number>();
+    storeMocks.purgeEntries.mockReturnValueOnce(expiry.promise);
 
     const setRespond = vi.fn();
-    await invokeStoreMethod({
+    const mutation = invokeStoreMethod({
       handlers,
       method: "secrets.store.set",
       requestParams: {
@@ -426,6 +432,12 @@ describe("secrets handlers", () => {
       },
       respond: setRespond,
     });
+    expect(storeMocks.purgeEntries).toHaveBeenCalledOnce();
+    expect(reloadSecrets).not.toHaveBeenCalled();
+    expect(setRespond).not.toHaveBeenCalled();
+    expiry.reject(new Error("synthetic expiry failure"));
+    await mutation;
+    expectWarnMessageWith(warn, "secrets.store retention purge failed: synthetic expiry failure");
     expect(storeMocks.writeEntry).toHaveBeenCalledWith({
       scope: { kind: "team" },
       name: "SERVICE_API_KEY",
@@ -453,6 +465,25 @@ describe("secrets handlers", () => {
       forceColdRefKeys: new Set(["store:default:SERVICE_API_KEY"]),
       joinInFlight: false,
     });
+  });
+
+  it("registers submitted store values for redaction before a failing write", async () => {
+    const value = "test-secret-value-redaction-before-write-123";
+    storeMocks.writeEntry.mockImplementationOnce(() => {
+      expect(isSecretValueRegisteredForRedaction(value)).toBe(true);
+      throw new Error("database unavailable");
+    });
+    const respond = vi.fn();
+
+    await invokeStoreMethod({
+      handlers: createHandlers(),
+      method: "secrets.store.set",
+      requestParams: { name: "SERVICE_API_KEY", value, kind: "secret" },
+      respond,
+    });
+
+    expectRespondError(respond, { code: "UNAVAILABLE", message: "secrets.store.set failed" });
+    expect(isSecretValueRegisteredForRedaction(value)).toBe(true);
   });
 
   it("rejects invalid store params before writing", async () => {

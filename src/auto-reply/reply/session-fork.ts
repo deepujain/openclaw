@@ -3,29 +3,19 @@ import {
   forkSessionEntryFromParentTarget,
   forkSessionFromParentTranscript,
   resolveSessionParentForkDecision,
+  type ForkSessionEntryFromParentTargetParams,
+  type ForkSessionEntryFromParentTargetResult,
   type SessionParentForkDecision,
-  type ParentForkedSessionTranscript,
   type ForkSessionFromParentTranscriptResult,
 } from "../../config/sessions/session-accessor.js";
 import type { SessionEntry } from "../../config/sessions/types.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import {
-  isModelSelectionLocked,
-  ModelSelectionLockedError,
+  assertModelSelectionUnlocked,
+  MODEL_SELECTION_LOCKED_PARENT_FORK_MESSAGE,
 } from "../../sessions/model-overrides.js";
 
-export const MODEL_SELECTION_LOCKED_PARENT_FORK_MESSAGE =
-  "Model-selection-locked sessions cannot create child sessions from parent context.";
-
-function assertParentSessionForkAllowed(parentEntry: SessionEntry): void {
-  // A locked harness owns both the model and transcript lineage. Copying that
-  // context into an ordinary child would let the child continue it elsewhere.
-  if (isModelSelectionLocked(parentEntry)) {
-    throw new ModelSelectionLockedError(MODEL_SELECTION_LOCKED_PARENT_FORK_MESSAGE);
-  }
-}
-
-type ParentForkDecision = SessionParentForkDecision;
+export { MODEL_SELECTION_LOCKED_PARENT_FORK_MESSAGE } from "../../sessions/model-overrides.js";
 
 type ParentForkDecisionParams = {
   parentEntry: SessionEntry;
@@ -35,6 +25,7 @@ type ParentForkDecisionParams = {
 };
 
 type ForkSessionFromParentParams = {
+  maxTokens?: number;
   parentSessionKey: string;
   parentEntry: SessionEntry;
   agentId: string;
@@ -48,48 +39,14 @@ type ForkSessionFromParentParams = {
   targetStorePath?: string;
 };
 
-type ForkedParentSessionEntry = ParentForkedSessionTranscript;
-
-type ForkSessionEntryFromParentResult =
-  | {
-      status: "forked";
-      fork: ForkedParentSessionEntry;
-      parentEntry: SessionEntry;
-      sessionEntry: SessionEntry;
-      decision: Extract<ParentForkDecision, { status: "fork" }>;
-    }
-  | {
-      status: "skipped";
-      reason: "existing-entry" | "decision-skip";
-      parentEntry?: SessionEntry;
-      sessionEntry: SessionEntry;
-      decision?: ParentForkDecision;
-    }
-  | { status: "missing-entry" }
-  | { status: "missing-parent" }
-  | { status: "failed" };
-
-type ForkSessionEntryFromParentParams = Omit<ForkSessionFromParentParams, "parentEntry"> & {
-  parentSessionKey: string;
-  parentStoreKeys?: readonly string[];
-  sessionKey: string;
-  sessionStoreKeys?: readonly string[];
-  storePath?: string;
-  fallbackEntry?: SessionEntry;
-  patch?: (params: {
-    entry: SessionEntry;
-    parentEntry: SessionEntry;
-    fork: ForkedParentSessionEntry;
-    decision: Extract<ParentForkDecision, { status: "fork" }>;
-  }) => Partial<SessionEntry>;
-  skipForkWhen?: (entry: SessionEntry) => boolean;
-  skipPatch?: (entry: SessionEntry) => Partial<SessionEntry> | null;
-  decisionSkipPatch?: (params: {
-    decision: Extract<ParentForkDecision, { status: "skip" }>;
-    entry: SessionEntry;
-    parentEntry: SessionEntry;
-  }) => Partial<SessionEntry> | null;
-};
+type ForkSessionEntryFromParentParams = Omit<ForkSessionFromParentParams, "parentEntry"> &
+  Pick<
+    ForkSessionEntryFromParentTargetParams,
+    "fallbackEntry" | "patch" | "skipForkWhen" | "skipPatch" | "decisionSkipPatch"
+  > & {
+    parentStoreKeys?: readonly string[];
+    sessionStoreKeys?: readonly string[];
+  };
 
 function resolveParentForkStorePath(params: {
   agentId?: string;
@@ -104,8 +61,8 @@ function resolveParentForkStorePath(params: {
 
 export async function resolveParentForkDecision(
   params: ParentForkDecisionParams,
-): Promise<ParentForkDecision> {
-  assertParentSessionForkAllowed(params.parentEntry);
+): Promise<SessionParentForkDecision> {
+  assertModelSelectionUnlocked(params.parentEntry, MODEL_SELECTION_LOCKED_PARENT_FORK_MESSAGE);
   return await resolveSessionParentForkDecision({
     parentEntry: params.parentEntry,
     storePath: resolveParentForkStorePath(params),
@@ -116,7 +73,7 @@ export async function forkSessionFromParent(
   params: ForkSessionFromParentParams,
 ): Promise<{ sessionId: string; sessionFile: string } | null> {
   // Keep direct callers fail-closed even if they skipped the normal decision step.
-  assertParentSessionForkAllowed(params.parentEntry);
+  assertModelSelectionUnlocked(params.parentEntry, MODEL_SELECTION_LOCKED_PARENT_FORK_MESSAGE);
   const storePath = resolveParentForkStorePath(params);
   const fork = await forkSessionFromParentTranscript({
     agentId: params.agentId,
@@ -134,11 +91,12 @@ export async function forkSessionFromParent(
 export async function forkSessionFromParentWithDecision(
   params: ForkSessionFromParentParams,
 ): Promise<ForkSessionFromParentTranscriptResult> {
-  assertParentSessionForkAllowed(params.parentEntry);
+  assertModelSelectionUnlocked(params.parentEntry, MODEL_SELECTION_LOCKED_PARENT_FORK_MESSAGE);
   return await forkSessionFromParentTranscript({
     agentId: params.agentId,
     ...(params.commitGuard ? { commitGuard: params.commitGuard } : {}),
     enforceTokenLimit: true,
+    ...(params.maxTokens ? { maxTokens: params.maxTokens } : {}),
     parentEntry: params.parentEntry,
     parentSessionKey: params.parentSessionKey,
     sessionKey: params.sessionKey,
@@ -172,10 +130,11 @@ function normalizeForkTarget(params: { canonicalKey: string; storeKeys?: readonl
  */
 export async function forkSessionEntryFromParent(
   params: ForkSessionEntryFromParentParams,
-): Promise<ForkSessionEntryFromParentResult> {
+): Promise<ForkSessionEntryFromParentTargetResult> {
   const storePath = resolveParentForkStorePath(params);
   return await forkSessionEntryFromParentTarget({
     agentId: params.agentId,
+    commitGuard: params.commitGuard,
     decisionSkipPatch: params.decisionSkipPatch,
     fallbackEntry: params.fallbackEntry,
     parentTarget: normalizeForkTarget({

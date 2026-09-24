@@ -8,6 +8,7 @@ import {
   resetCommandLane,
   setCommandLaneConcurrency,
 } from "./command-queue.js";
+import { createLaneQueue, type LaneState } from "./command-queue.state.js";
 import { resetCommandQueueStateForTest } from "./command-queue.test-support.js";
 import { CommandLane } from "./lanes.js";
 
@@ -109,6 +110,56 @@ describe("scoped command lane lifecycle", () => {
     expect(lanes.has(lane)).toBe(false);
   });
 
+  it("updates each session's subagent capacity and retires the queues after completion", async () => {
+    const lanes = getCommandLaneRegistryForTest();
+    const parents = ["subagent:agent:main:parent-a", "subagent:agent:main:parent-b"];
+    const gate = createDeferred();
+    setCommandLaneConcurrency(CommandLane.Subagent, 2);
+    const runs = parents.flatMap((lane) =>
+      Array.from({ length: 3 }, () =>
+        enqueueCommandInLane(lane, async () => {
+          await gate.promise;
+        }),
+      ),
+    );
+
+    try {
+      for (const lane of parents) {
+        expect(getCommandLaneSnapshot(lane)).toMatchObject({
+          maxConcurrent: 2,
+          activeCount: 2,
+          queuedCount: 1,
+        });
+      }
+
+      setCommandLaneConcurrency(CommandLane.Subagent, 1);
+      for (const lane of parents) {
+        expect(getCommandLaneSnapshot(lane)).toMatchObject({
+          maxConcurrent: 1,
+          activeCount: 2,
+          queuedCount: 1,
+        });
+      }
+
+      setCommandLaneConcurrency(CommandLane.Subagent, 3);
+      for (const lane of parents) {
+        expect(getCommandLaneSnapshot(lane)).toMatchObject({
+          maxConcurrent: 3,
+          activeCount: 3,
+          queuedCount: 0,
+        });
+      }
+    } finally {
+      gate.resolve();
+      await Promise.all(runs);
+    }
+    for (const lane of parents) {
+      expect(lanes.has(lane)).toBe(false);
+      expect(getCommandLaneSnapshot(lane).maxConcurrent).toBe(3);
+      expect(lanes.has(lane)).toBe(false);
+    }
+  });
+
   it("preserves explicitly configured and paused dynamic lanes", async () => {
     const lanes = getCommandLaneRegistryForTest();
     const configuredLane = "session:agent:main:autoqa-configured";
@@ -182,7 +233,6 @@ describe("scoped command lane lifecycle", () => {
       CommandLane.SystemAgent,
       CommandLane.Cron,
       CommandLane.CronNested,
-      CommandLane.SkillWorkshopReview,
       CommandLane.Subagent,
       CommandLane.Nested,
     ];
@@ -244,12 +294,12 @@ describe("scoped command lane lifecycle", () => {
     });
     const replacementState = {
       lane,
-      queue: [],
+      queue: createLaneQueue(),
       activeTaskIds: new Set<number>(),
       maxConcurrent: 1,
       draining: false,
       generation: 0,
-    };
+    } satisfies LaneState;
 
     lanes.set(lane, replacementState);
     staleGate.resolve();

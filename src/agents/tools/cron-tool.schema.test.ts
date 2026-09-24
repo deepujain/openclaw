@@ -1,7 +1,7 @@
 import {
   findLlamacppGbnfSchemaViolations,
   normalizeToolParameterSchema,
-} from "@openclaw/ai/internal/openai";
+} from "@openclaw/ai/internal/tool-schema";
 import { MAX_DATE_TIMESTAMP_MS } from "@openclaw/normalization-core/number-coercion";
 // Cron tool schema tests cover the provider-facing parameter shape and runtime
 // validation compatibility for cron jobs.
@@ -60,6 +60,25 @@ describe("createCronToolSchema", () => {
   // Regression: models like GPT-5.4 rely on these fields to populate job/patch.
   // If a field is removed from this list the test must be updated intentionally.
 
+  it("advertises timeout clears while retaining numeric bounds", () => {
+    for (const [timeoutSeconds, accepted] of [
+      [null, true],
+      [0, true],
+      [0.03, true],
+      [30, true],
+      [-1, false],
+      ["30", false],
+    ] as const) {
+      expect(
+        Value.Check(schema, {
+          action: "update",
+          id: "timeout-job",
+          job: { payload: { timeoutSeconds } },
+        }),
+      ).toBe(accepted);
+    }
+  });
+
   it("job exposes the expected top-level fields", () => {
     expect(keysAt(schemaRecord, "job")).toEqual(
       [
@@ -109,6 +128,26 @@ describe("createCronToolSchema", () => {
   it("does not ship a separate patch object schema (#121606)", () => {
     expect(schemaRecord.properties).not.toHaveProperty("patch");
   });
+
+  it.each([undefined, "", " \t ", "agent:main:telegram:direct:alice", " agent:main:main "])(
+    "advertises job retargeting only without session scope (%j)",
+    (agentSessionKey) => {
+      const toolSchema = createCronTool({ agentSessionKey, agentId: "main" }).parameters;
+      for (const projected of [
+        toolSchema,
+        normalizeToolParameterSchema(toolSchema, { modelProvider: "gemini" }),
+        normalizeToolParameterSchema(toolSchema, {
+          modelCompat: { toolSchemaProfile: "llamacpp" },
+        }),
+      ]) {
+        const record = projected as unknown as Record<string, unknown>;
+        expect(keysAt(record, "job").includes("agentId")).toBe(!agentSessionKey?.trim());
+        expect(propertyAt(record, "agentId")).toMatchObject({ type: "string" });
+        expect(propertyAt(record, "agentId")?.description).toContain("list");
+        expect(propertyAt(record, "agentId")?.description).toContain("wake");
+      }
+    },
+  );
 
   it("exposes next_check with its relative duration parameter", () => {
     expect(Value.Check(schema, { action: "next_check", in: "15m" })).toBe(true);
@@ -215,8 +254,7 @@ describe("createCronToolSchema", () => {
       minimum: 1,
     });
     expect(propertyAt(schemaRecord, "job.payload.timeoutSeconds")).toMatchObject({
-      type: "number",
-      minimum: 0,
+      anyOf: [{ type: "number", minimum: 0 }, { type: "null" }],
     });
   });
 

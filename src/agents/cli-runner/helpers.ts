@@ -15,9 +15,9 @@ import {
 } from "@openclaw/normalization-core/string-coerce";
 import { isAcpRuntimeSpawnAvailable } from "../../acp/runtime/availability.js";
 import type { SourceReplyDeliveryMode } from "../../auto-reply/get-reply-options.types.js";
-import type { ThinkLevel } from "../../auto-reply/thinking.js";
 import type { ChatType } from "../../channels/chat-type.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
+import { hasErrnoCode } from "../../infra/errno.js";
 import { resolveRuntimeOsLabel } from "../../infra/os-summary.js";
 import { privateFileStore } from "../../infra/private-file-store.js";
 import { tempWorkspace } from "../../infra/private-temp-workspace.js";
@@ -29,6 +29,7 @@ import { KeyedAsyncQueue } from "../../plugin-sdk/keyed-async-queue.js";
 import type { CliBackendConfig } from "../../plugins/cli-backend.types.js";
 import { listRegisteredPluginAgentPromptGuidance } from "../../plugins/command-registry-state.js";
 import type { BootstrapMode } from "../bootstrap-mode.js";
+import { formatCliImageTurnContext } from "../cli-image-turn-correlation.js";
 import type { EmbeddedContextFile } from "../embedded-agent-helpers.js";
 import {
   detectAndLoadPromptImages,
@@ -73,16 +74,15 @@ export function resolveCliRunQueueKey(params: {
   cliSessionId?: string;
   ownerKey?: string;
 }): string {
-  const requiresLiveSessionSerialization =
-    isClaudeCliBackendId(params.backendId) && params.liveSession === "claude-stdio";
+  const requiresLiveSessionSerialization = params.liveSession !== undefined;
   if (params.serialize === false && !requiresLiveSessionSerialization) {
     return `${params.backendId}:${params.runId}`;
   }
+  const ownerKey = params.ownerKey?.trim();
+  if (requiresLiveSessionSerialization && ownerKey) {
+    return `${params.backendId}:owner:${ownerKey}`;
+  }
   if (isClaudeCliBackendId(params.backendId)) {
-    const ownerKey = params.ownerKey?.trim();
-    if (requiresLiveSessionSerialization && ownerKey) {
-      return `${params.backendId}:owner:${ownerKey}`;
-    }
     const sessionId = params.cliSessionId?.trim();
     if (sessionId) {
       return `${params.backendId}:session:${sessionId}`;
@@ -103,7 +103,10 @@ export function buildCliAgentSystemPrompt(params: {
   workspaceDir: string;
   cwd?: string;
   config?: OpenClawConfig;
-  defaultThinkLevel?: ThinkLevel;
+  preparedModelRuntime?: Parameters<
+    typeof buildConfiguredAgentSystemPrompt
+  >[0]["preparedModelRuntime"];
+  preparedGitCoauthorPrompt?: string;
   extraSystemPrompt?: string;
   sourceReplyDeliveryMode?: SourceReplyDeliveryMode;
   requireExplicitMessageTarget?: boolean;
@@ -112,19 +115,19 @@ export function buildCliAgentSystemPrompt(params: {
   runtimeChatType?: ChatType;
   runtimeCapabilities?: string[];
   ownerNumbers?: string[];
-  heartbeatPrompt?: string;
   docsPath?: string;
   sourcePath?: string;
   tools: AgentTool[];
   contextFiles?: EmbeddedContextFile[];
   bootstrapMode?: BootstrapMode;
+  bootstrapTruncationNotice?: string;
   skillsPrompt?: string;
   modelDisplay: string;
   agentId?: string;
   sessionKey?: string;
   sessionId?: string;
 }) {
-  const runtimeWorkspaceDir = params.cwd?.trim() || params.workspaceDir;
+  const runtimeCwd = params.cwd?.trim() || params.workspaceDir;
   const defaultModelRef = resolveDefaultModelForAgent({
     cfg: params.config ?? {},
     agentId: params.agentId,
@@ -133,8 +136,9 @@ export function buildCliAgentSystemPrompt(params: {
   const { runtimeInfo, userTimezone, userDate } = buildSystemPromptParams({
     config: params.config,
     agentId: params.agentId,
-    workspaceDir: runtimeWorkspaceDir,
-    cwd: runtimeWorkspaceDir,
+    workspaceDir: runtimeCwd,
+    cwd: runtimeCwd,
+    preparedGitCoauthorPrompt: params.preparedGitCoauthorPrompt,
     runtime: {
       sessionKey: params.sessionKey,
       sessionId: params.sessionId,
@@ -152,16 +156,16 @@ export function buildCliAgentSystemPrompt(params: {
   });
   return buildConfiguredAgentSystemPrompt({
     config: params.config,
+    preparedModelRuntime: params.preparedModelRuntime,
     agentId: params.agentId,
-    workspaceDir: runtimeWorkspaceDir,
-    defaultThinkLevel: params.defaultThinkLevel,
+    workspaceDir: params.workspaceDir,
+    runtimeCwd,
     extraSystemPrompt: params.extraSystemPrompt,
     sourceReplyDeliveryMode: params.sourceReplyDeliveryMode,
     requireExplicitMessageTarget: params.requireExplicitMessageTarget,
     silentReplyPromptMode: params.silentReplyPromptMode,
     ownerNumbers: params.ownerNumbers,
     reasoningTagHint: false,
-    heartbeatPrompt: params.heartbeatPrompt,
     docsPath: params.docsPath,
     sourcePath: params.sourcePath,
     acpEnabled: isAcpRuntimeSpawnAvailable({ config: params.config }),
@@ -171,11 +175,13 @@ export function buildCliAgentSystemPrompt(params: {
     }),
     runtimeInfo,
     toolNames: params.tools.map((tool) => tool.name),
+    messageTool: params.tools.find((tool) => tool.name.trim().toLowerCase() === "message"),
     skillsPrompt: params.skillsPrompt,
     userTimezone,
     userDate,
     contextFiles: params.contextFiles,
     bootstrapMode: params.bootstrapMode,
+    bootstrapTruncationNotice: params.bootstrapTruncationNotice,
   });
 }
 
@@ -276,15 +282,6 @@ function resolveCliImageRoot(params: { backend: CliBackendConfig; workspaceDir: 
   return path.join(resolvePreferredOpenClawTmpDir(), "openclaw-cli-images");
 }
 
-function isFileNotFoundError(error: unknown): boolean {
-  return Boolean(
-    error &&
-    typeof error === "object" &&
-    "code" in error &&
-    (error as { code?: unknown }).code === "ENOENT",
-  );
-}
-
 async function sweepCliImageRoot(imageRoot: string): Promise<void> {
   if (sweptCliImageRoots.has(imageRoot)) {
     return;
@@ -299,7 +296,7 @@ async function sweepCliImageRoot(imageRoot: string): Promise<void> {
       }
       const entryPath = path.join(imageRoot, entry.name);
       const stat = await fs.stat(entryPath).catch((error: unknown) => {
-        if (isFileNotFoundError(error)) {
+        if (hasErrnoCode(error, "ENOENT")) {
           return undefined;
         }
         throw error;
@@ -313,7 +310,7 @@ async function sweepCliImageRoot(imageRoot: string): Promise<void> {
       try {
         await fs.rm(entryPath, { force: true });
       } catch (error) {
-        if (!isFileNotFoundError(error)) {
+        if (!hasErrnoCode(error, "ENOENT")) {
           throw error;
         }
       }
@@ -394,6 +391,7 @@ export async function prepareCliPromptImagePayload(params: {
   imageOrder?: PromptImageOrderEntry[];
   mediaImageLayout?: MediaImageLayout;
   media?: MediaFact[];
+  imageTurnKey?: string;
 }): Promise<{
   prompt: string;
   imagePaths?: string[];
@@ -439,6 +437,9 @@ export async function prepareCliPromptImagePayload(params: {
     params.backend.input === "stdin" ||
     params.backend.imageArg === "@"
   ) {
+    if (params.imageTurnKey) {
+      prompt = `${prompt.trimEnd()}\n\n${formatCliImageTurnContext(params.imageTurnKey)}`;
+    }
     prompt = appendImagePathsToPrompt(
       prompt,
       imagePaths,

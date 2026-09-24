@@ -1,4 +1,3 @@
-// Telegram plugin module implements token behavior.
 import { resolveNormalizedAccountEntry } from "openclaw/plugin-sdk/account-core";
 import type { BaseTokenResolution } from "openclaw/plugin-sdk/channel-contract";
 import type { OpenClawConfig, TelegramAccountConfig } from "openclaw/plugin-sdk/config-contracts";
@@ -12,7 +11,7 @@ import {
   normalizeSecretInputString,
   resolveSecretInputString,
 } from "openclaw/plugin-sdk/secret-input";
-import { resolveDefaultSecretProviderAlias } from "openclaw/plugin-sdk/secret-provider-alias";
+import { canResolveEnvSecretRefInReadOnlyPath } from "openclaw/plugin-sdk/secret-ref-readonly";
 import { resolveDefaultTelegramAccountId } from "./account-selection.js";
 
 type CredentialUnavailableDiagnostic = Extract<
@@ -36,28 +35,25 @@ function resolveEnvSecretRefValue(params: {
   cfg?: Pick<OpenClawConfig, "secrets">;
   provider: string;
   id: string;
-  env?: NodeJS.ProcessEnv;
 }): string | undefined {
+  // Share admission with inspection while retaining strict diagnostics below.
+  if (canResolveEnvSecretRefInReadOnlyPath(params)) {
+    return normalizeSecretInputString(process.env[params.id]);
+  }
   const providerConfig = params.cfg?.secrets?.providers?.[params.provider];
-  if (providerConfig) {
-    if (providerConfig.source !== "env") {
-      throw new Error(
-        `Secret provider "${params.provider}" has source "${providerConfig.source}" but ref requests "env".`,
-      );
-    }
-    if (providerConfig.allowlist && !providerConfig.allowlist.includes(params.id)) {
-      throw new Error(
-        `Environment variable "${params.id}" is not allowlisted in secrets.providers.${params.provider}.allowlist.`,
-      );
-    }
-  } else if (
-    params.provider !== resolveDefaultSecretProviderAlias({ secrets: params.cfg?.secrets }, "env")
-  ) {
+  if (!providerConfig) {
     throw new Error(
       `Secret provider "${params.provider}" is not configured (ref: env:${params.provider}:${params.id}).`,
     );
   }
-  return normalizeSecretInputString((params.env ?? process.env)[params.id]);
+  if (providerConfig.source !== "env") {
+    throw new Error(
+      `Secret provider "${params.provider}" has source "${providerConfig.source}" but ref requests "env".`,
+    );
+  }
+  throw new Error(
+    `Environment variable "${params.id}" is not allowlisted in secrets.providers.${params.provider}.allowlist.`,
+  );
 }
 
 function resolveRuntimeTokenValue(params: {
@@ -128,9 +124,7 @@ export function resolveTelegramToken(
       : resolveNormalizedAccountEntry(accounts, id, normalizeAccountId);
   };
 
-  const accountCfg = resolveAccountCfg(
-    accountId !== DEFAULT_ACCOUNT_ID ? accountId : DEFAULT_ACCOUNT_ID,
-  );
+  const accountCfg = resolveAccountCfg(accountId);
 
   // When a non-default accountId is explicitly specified but not found in config,
   // decide whether to fall through to channel-level defaults based on whether
@@ -157,73 +151,42 @@ export function resolveTelegramToken(
     }
   }
 
-  const accountTokenFile = accountCfg?.tokenFile?.trim();
-  if (accountTokenFile) {
-    const result = tryReadSecretFileSync(
-      accountTokenFile,
-      "Telegram bot token",
-      { rejectSymlink: true },
-      { configPath: `channels.telegram.accounts.${accountId}.tokenFile` },
-    );
-    if (result.status === "available") {
-      return { token: result.value, source: "tokenFile" };
+  for (const { config, path } of [
+    { config: accountCfg, path: `channels.telegram.accounts.${accountId}` },
+    { config: telegramCfg, path: "channels.telegram" },
+  ]) {
+    const tokenFile = config?.tokenFile?.trim();
+    if (tokenFile) {
+      const result = tryReadSecretFileSync(
+        tokenFile,
+        "Telegram bot token",
+        { rejectSymlink: true },
+        { configPath: `${path}.tokenFile` },
+      );
+      if (result.status === "available") {
+        return { token: result.value, source: "tokenFile" };
+      }
+      opts.logMissingFile?.(`${path}.tokenFile is configured but unavailable`);
+      return {
+        token: "",
+        source: "tokenFile",
+        credentialDiagnostics: [result.diagnostic],
+      };
     }
-    opts.logMissingFile?.(
-      `channels.telegram.accounts.${accountId}.tokenFile is configured but unavailable`,
-    );
-    return {
-      token: "",
-      source: "tokenFile",
-      credentialDiagnostics: [result.diagnostic],
-    };
-  }
-
-  const accountToken = resolveRuntimeTokenValue({
-    cfg,
-    value: accountCfg?.botToken,
-    path: `channels.telegram.accounts.${accountId}.botToken`,
-  });
-  if (accountToken.status === "available") {
-    return { token: accountToken.value, source: "config" };
-  }
-  if (accountToken.status === "configured_unavailable") {
-    return { token: "", source: "none" };
+    const token = resolveRuntimeTokenValue({
+      cfg,
+      value: config?.botToken,
+      path: `${path}.botToken`,
+    });
+    if (token.status === "available") {
+      return { token: token.value, source: "config" };
+    }
+    if (token.status === "configured_unavailable") {
+      return { token: "", source: "none" };
+    }
   }
 
   const allowEnv = accountId === DEFAULT_ACCOUNT_ID;
-  const tokenFile = telegramCfg?.tokenFile?.trim();
-  if (tokenFile) {
-    const result = tryReadSecretFileSync(
-      tokenFile,
-      "Telegram bot token",
-      {
-        rejectSymlink: true,
-      },
-      { configPath: "channels.telegram.tokenFile" },
-    );
-    if (result.status === "available") {
-      return { token: result.value, source: "tokenFile" };
-    }
-    opts.logMissingFile?.("channels.telegram.tokenFile is configured but unavailable");
-    return {
-      token: "",
-      source: "tokenFile",
-      credentialDiagnostics: [result.diagnostic],
-    };
-  }
-
-  const configToken = resolveRuntimeTokenValue({
-    cfg,
-    value: telegramCfg?.botToken,
-    path: "channels.telegram.botToken",
-  });
-  if (configToken.status === "available") {
-    return { token: configToken.value, source: "config" };
-  }
-  if (configToken.status === "configured_unavailable") {
-    return { token: "", source: "none" };
-  }
-
   const envToken = allowEnv ? (opts.envToken ?? process.env.TELEGRAM_BOT_TOKEN)?.trim() : "";
   if (envToken) {
     return { token: envToken, source: "env" };

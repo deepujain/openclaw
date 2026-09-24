@@ -7,6 +7,7 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { makeTempDir } from "../../../test/helpers/temp-dir.js";
+import { ENSURE_REMOTE_REAL_DIRECTORY_SCRIPT } from "./remote-shell-command.js";
 import {
   buildExecRemoteCommand,
   buildRemoteWorkdirValidationCommand,
@@ -14,7 +15,6 @@ import {
   createSshSandboxSessionFromConfigText,
   createSshSandboxSessionFromSettings,
   disposeSshSandboxSession,
-  ENSURE_REMOTE_REAL_DIRECTORY_SCRIPT,
   type SshSandboxSession,
   uploadDirectoryToSshTarget,
 } from "./ssh.js";
@@ -37,7 +37,7 @@ afterEach(async () => {
 });
 
 describe("sandbox ssh helpers", () => {
-  it("materializes inline ssh auth data into a temp config", async () => {
+  it("materializes inline SSH auth data into a temp config", async () => {
     // Inline key/cert/known-host material is written to private temp files and
     // referenced from the generated ssh config.
     const session = await createSshSandboxSessionFromSettings({
@@ -173,27 +173,31 @@ describe("sandbox ssh helpers", () => {
     expect(config).toContain('  UserKnownHostsFile "/tmp/Application Support/lease/known_hosts"');
   });
 
-  it("wraps remote exec commands with env and workdir", () => {
-    const command = buildExecRemoteCommand({
-      command: "pwd && printenv TOKEN",
-      workdir: "/sandbox/project",
-      env: {
-        TOKEN: "abc 123",
-      },
-    });
-    expect(command).toContain(`'env'`);
-    expect(command).toContain(`'TOKEN=abc 123'`);
-    expect(command).toContain(`'cd '"'"'/sandbox/project'"'"' && pwd && printenv TOKEN'`);
+  it.each([
+    ["public", buildExecRemoteCommand],
+    ["validated", buildValidatedExecRemoteCommand],
+  ])("rejects configured environment values in the %s remote command builder", (_name, build) => {
+    const sentinel = "synthetic-ssh-command-value";
+    expect(() =>
+      build({
+        command: "pwd && printenv SYNTHETIC_VALUE",
+        workdir: "/sandbox/project",
+        env: { SYNTHETIC_VALUE: sentinel },
+      }),
+    ).toThrow(/environment.*secure|secure.*environment/i);
   });
 
   it("keeps the public exec command builder quote-only for compatibility", () => {
     const command = buildExecRemoteCommand({
       command: "workflow run <workflow-id> --ref main",
+      workdir: "/sandbox/project",
       env: {},
     });
 
     expect(command).toContain(`'/bin/sh'`);
-    expect(command).toContain(`'workflow run <workflow-id> --ref main'`);
+    expect(command).toContain(
+      `'cd '"'"'/sandbox/project'"'"' && workflow run <workflow-id> --ref main'`,
+    );
   });
 
   it.each([

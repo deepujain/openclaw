@@ -13,6 +13,7 @@ import {
   makeState,
   originalFetch,
 } from "./server-context.remote-tab-ops.harness.js";
+import * as sessionTabStore from "./session-tab-store.js";
 
 afterEach(async () => {
   const { closePlaywrightBrowserConnection } = await import("./pw-session.js");
@@ -148,6 +149,7 @@ describe("browser server-context tab selection state", () => {
       browserInstanceFingerprint: expect.stringMatching(/^sha256:/),
     });
     expect(state.profiles.get("openclaw")?.lastTargetId).toBe("CREATED");
+    expect(fetchCallUrls(fetchMock).some((url) => url.includes("/json/close/"))).toBe(false);
     expect(createTargetViaCdp).toHaveBeenCalledWith({
       cdpUrl: "http://127.0.0.1:18800",
       url: "http://127.0.0.1:8080",
@@ -221,7 +223,9 @@ describe("browser server-context tab selection state", () => {
     expect(profileState?.lastTargetId).not.toBe("BLOCKED");
     expect(profileState?.tabAliases).toEqual(aliasesBefore);
     expect(profileState?.tabAliases?.byTargetId.BLOCKED).toBeUndefined();
-    expect(fetchCallUrls(fetchMock).some((url) => url.includes("/json/close/BLOCKED"))).toBe(false);
+    expect(fetchCallUrls(fetchMock).filter((url) => url.includes("/json/close/"))).toEqual([
+      "http://127.0.0.1:18800/json/close/BLOCKED",
+    ]);
 
     await expect(openclaw.ensureTabAvailable()).resolves.toEqual(
       expect.objectContaining({ targetId: "GOOD" }),
@@ -513,6 +517,45 @@ describe("browser server-context tab selection state", () => {
     const opened = await openManagedTabWithRunningProfile({ fetchMock });
     expect(opened.targetId).toBe("NEW");
     await expectOldManagedTabClose(fetchMock);
+  });
+
+  it("keeps dashboard-owned tabs when the managed page cap evicts older ordinary tabs", async () => {
+    vi.spyOn(sessionTabStore, "readBrowserDashboardTabs").mockReturnValue([
+      {
+        version: 1,
+        sessionKey: "agent:main:main",
+        nativeTargetId: "OLD1",
+        profile: "openclaw",
+        profileFingerprint: "profile",
+        browserInstanceFingerprint: "browser",
+        interactionTargetKind: "native",
+        trackedAt: 1,
+        lastUsedAt: 1,
+        storageKey: "retained-old1",
+        dashboard: {
+          sessionKey: "agent:main:main",
+          agentId: "main",
+          name: "service",
+          instanceId: "widget-one",
+          url: "http://service.example/",
+          state: "active",
+        },
+      },
+    ]);
+    vi.spyOn(cdpModule, "createTargetViaCdp").mockResolvedValue({
+      targetId: "NEW",
+      finalUrl: "http://127.0.0.1:3009",
+    });
+    const fetchMock = createManagedTabListFetchMock({
+      existingTabs: makeManagedTabsWithNew(),
+      onClose: async () => ({ ok: true }) as Response,
+    });
+    await openManagedTabWithRunningProfile({ fetchMock });
+    await vi.waitFor(() =>
+      expect(fetchCallUrls(fetchMock).some((url) => url.includes("/json/close/OLD2"))).toBe(true),
+    );
+    expect(fetchCallUrls(fetchMock).some((url) => url.includes("/json/close/OLD1"))).toBe(false);
+    expect(fetchCallUrls(fetchMock).some((url) => url.includes("/json/close/NEW"))).toBe(false);
   });
 
   it("never closes the just-opened managed tab during cap cleanup", async () => {

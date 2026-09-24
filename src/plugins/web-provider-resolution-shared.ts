@@ -4,7 +4,10 @@ import { getCurrentPluginMetadataSnapshot } from "./current-plugin-metadata-snap
 import type { PluginLoadOptions } from "./loader.js";
 import { loadManifestMetadataSnapshot } from "./manifest-contract-eligibility.js";
 import type { PluginManifestRecord } from "./manifest-registry.js";
+import { sortPluginEntriesById } from "./plugin-entry-order.js";
+import { getPluginInstance } from "./plugin-instance-scope.js";
 import { createPluginIdScopeSet, normalizePluginIdScope } from "./plugin-scope.js";
+import type { PluginRegistry } from "./registry-types.js";
 
 type WebProviderContract = "webSearchProviders" | "webFetchProviders";
 type WebProviderConfigKey = "webSearch" | "webFetch";
@@ -14,39 +17,6 @@ type WebProviderCandidateResolution = {
   pluginIds: string[] | undefined;
   manifestRecords?: readonly PluginManifestRecord[];
 };
-
-type WebProviderSortEntry = {
-  id: string;
-  pluginId: string;
-  autoDetectOrder?: number;
-};
-
-function comparePluginProvidersAlphabetically(
-  left: Pick<WebProviderSortEntry, "id" | "pluginId">,
-  right: Pick<WebProviderSortEntry, "id" | "pluginId">,
-): number {
-  return left.id.localeCompare(right.id) || left.pluginId.localeCompare(right.pluginId);
-}
-
-export function sortPluginProviders<T extends Pick<WebProviderSortEntry, "id" | "pluginId">>(
-  providers: T[],
-): T[] {
-  return providers.toSorted(comparePluginProvidersAlphabetically);
-}
-
-/** Sorts provider candidates for auto-detect while keeping equal priorities deterministic. */
-export function sortPluginProvidersForAutoDetect<T extends WebProviderSortEntry>(
-  providers: T[],
-): T[] {
-  return providers.toSorted((left, right) => {
-    const leftOrder = left.autoDetectOrder ?? Number.MAX_SAFE_INTEGER;
-    const rightOrder = right.autoDetectOrder ?? Number.MAX_SAFE_INTEGER;
-    if (leftOrder !== rightOrder) {
-      return leftOrder - rightOrder;
-    }
-    return comparePluginProvidersAlphabetically(left, right);
-  });
-}
 
 function pluginManifestDeclaresProviderConfig(
   record: PluginManifestRecord,
@@ -216,16 +186,18 @@ export function resolveBundledWebProviderResolutionConfig(params: {
 
 /** Adds plugin ids to registry provider records, applies an optional plugin scope, then sorts. */
 export function mapRegistryProviders<TProvider extends { id: string }>(params: {
+  registry: PluginRegistry;
   entries: readonly { pluginId: string; provider: TProvider }[];
   onlyPluginIds?: readonly string[];
-  sortProviders: (
-    providers: Array<TProvider & { pluginId: string }>,
-  ) => Array<TProvider & { pluginId: string }>;
 }): Array<TProvider & { pluginId: string }> {
   const onlyPluginIdSet = createPluginIdScopeSet(normalizePluginIdScope(params.onlyPluginIds));
-  return params.sortProviders(
+  return sortPluginEntriesById(
     params.entries
       .filter((entry) => !onlyPluginIdSet || onlyPluginIdSet.has(entry.pluginId))
-      .map((entry) => Object.assign({}, entry.provider, { pluginId: entry.pluginId })),
+      .map(({ pluginId, provider }) => {
+        const record = params.registry.plugins.find((entry) => entry.id === pluginId);
+        const instance = record && getPluginInstance(record);
+        return Object.assign({}, instance?.wrap(provider) ?? provider, { pluginId });
+      }),
   );
 }

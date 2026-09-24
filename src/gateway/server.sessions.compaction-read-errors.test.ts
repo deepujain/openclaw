@@ -20,17 +20,20 @@ vi.hoisted(() => {
   vi.resetModules();
 });
 
-type LoadTranscriptEvents =
-  (typeof import("../config/sessions/session-accessor.sqlite-read.js"))["loadTranscriptEvents"];
+type ReadTranscriptStatsSync =
+  (typeof import("../config/sessions/session-accessor.sqlite-read.js"))["readTranscriptStatsSync"];
 
 const transcriptReads = vi.hoisted(() => ({
-  load: vi.fn<LoadTranscriptEvents>(),
+  stats: vi.fn<ReadTranscriptStatsSync>(),
 }));
 
 vi.mock("../config/sessions/session-accessor.sqlite-read.js", async (importOriginal) => {
   const actual =
     await importOriginal<typeof import("../config/sessions/session-accessor.sqlite-read.js")>();
-  return { ...actual, loadTranscriptEvents: transcriptReads.load };
+  return {
+    ...actual,
+    readTranscriptStatsSync: transcriptReads.stats,
+  };
 });
 
 const { createSessionStoreDir, openClient } = setupGatewaySessionsTestHarness();
@@ -39,16 +42,19 @@ const { createSessionStoreDir, openClient } = setupGatewaySessionsTestHarness();
 // factory: Vitest runs that factory on first import of the mocked module, and this
 // project is `isolate: false`, so on a warm module graph the factory can still be
 // unrun when the first `beforeEach` fires.
-async function actualTranscriptReader(): Promise<LoadTranscriptEvents> {
+async function actualTranscriptStatsReader(): Promise<ReadTranscriptStatsSync> {
   const actual = await vi.importActual<
     typeof import("../config/sessions/session-accessor.sqlite-read.js")
   >("../config/sessions/session-accessor.sqlite-read.js");
-  return actual.loadTranscriptEvents;
+  return actual.readTranscriptStatsSync;
 }
 
+let realTranscriptStatsReader: ReadTranscriptStatsSync;
+
 beforeEach(async () => {
-  transcriptReads.load.mockReset();
-  transcriptReads.load.mockImplementation(await actualTranscriptReader());
+  transcriptReads.stats.mockReset();
+  realTranscriptStatsReader = await actualTranscriptStatsReader();
+  transcriptReads.stats.mockImplementation(realTranscriptStatsReader);
 });
 
 async function seedCompactionSession(params: {
@@ -103,16 +109,14 @@ const transcriptReadError = () =>
  * `*Once` mock before the compaction RPC issues its own and the failure silently
  * disappears. Keying on sessionId makes the injection independent of call order.
  */
-function failTranscriptReadsForSession(
+function failTranscriptStatsForSession(
   sessionId: string,
-  options?: { succeedFirstWith: Awaited<ReturnType<LoadTranscriptEvents>> },
+  options?: { succeedFirstWith: ReturnType<ReadTranscriptStatsSync> },
 ): void {
   let sessionReads = 0;
-  transcriptReads.load.mockImplementation(async (scope, ...rest) => {
+  transcriptReads.stats.mockImplementation((scope) => {
     if (scope.sessionId !== sessionId) {
-      return await (
-        await actualTranscriptReader()
-      )(scope, ...rest);
+      return realTranscriptStatsReader(scope);
     }
     sessionReads += 1;
     if (options && sessionReads === 1) {
@@ -122,67 +126,41 @@ function failTranscriptReadsForSession(
   });
 }
 
-test("sessions.compact reports initial transcript read failures as unavailable", async () => {
-  const { storePath } = await createSessionStoreDir();
-  await seedCompactionSession({ sessionId: "sess-read-failure", storePath });
-  failTranscriptReadsForSession("sess-read-failure");
-
-  const { ws } = await openClient();
-  try {
-    const response = await rpcReq(ws, "sessions.compact", { key: "main" });
-
-    expect(response.ok).toBe(false);
-    expect(response.error).toMatchObject({
-      code: "UNAVAILABLE",
-      message: expect.stringContaining("failed to read session transcript storage"),
-    });
-  } finally {
-    ws.close();
-  }
-});
-
-test("sessions.compact reports model compaction transcript re-read failures as unavailable", async () => {
-  const { storePath } = await createSessionStoreDir();
-  const scope = await seedCompactionSession({
+test.each([
+  { stage: "initial", sessionId: "sess-read-failure" },
+  {
+    stage: "model compaction re-read",
     sessionId: "sess-model-read-failure",
-    storePath,
     nativeHarness: true,
-  });
-  const events = await (await actualTranscriptReader())(scope);
-  failTranscriptReadsForSession("sess-model-read-failure", { succeedFirstWith: events });
+  },
+  { stage: "maxLines preflight", sessionId: "sess-max-lines-read-failure", maxLines: 50 },
+])(
+  "sessions.compact reports $stage transcript read failures as unavailable",
+  async ({ sessionId, nativeHarness, maxLines }) => {
+    const { storePath } = await createSessionStoreDir();
+    const scope = await seedCompactionSession({ sessionId, storePath, nativeHarness });
+    failTranscriptStatsForSession(
+      sessionId,
+      nativeHarness ? { succeedFirstWith: realTranscriptStatsReader(scope) } : undefined,
+    );
 
-  const { ws } = await openClient();
-  try {
-    const response = await rpcReq(ws, "sessions.compact", { key: "main" });
+    const { ws } = await openClient();
+    try {
+      const response = await rpcReq(ws, "sessions.compact", {
+        key: "main",
+        ...(maxLines === undefined ? {} : { maxLines }),
+      });
 
-    expect(response.ok).toBe(false);
-    expect(response.error).toMatchObject({
-      code: "UNAVAILABLE",
-      message: expect.stringContaining("failed to read session transcript storage"),
-    });
-  } finally {
-    ws.close();
-  }
-});
-
-test("sessions.compact maxLines reports transcript preflight read failures as unavailable", async () => {
-  const { storePath } = await createSessionStoreDir();
-  await seedCompactionSession({ sessionId: "sess-max-lines-read-failure", storePath });
-  failTranscriptReadsForSession("sess-max-lines-read-failure");
-
-  const { ws } = await openClient();
-  try {
-    const response = await rpcReq(ws, "sessions.compact", { key: "main", maxLines: 50 });
-
-    expect(response.ok).toBe(false);
-    expect(response.error).toMatchObject({
-      code: "UNAVAILABLE",
-      message: expect.stringContaining("failed to read session transcript storage"),
-    });
-  } finally {
-    ws.close();
-  }
-});
+      expect(response.ok).toBe(false);
+      expect(response.error).toMatchObject({
+        code: "UNAVAILABLE",
+        message: expect.stringContaining("failed to read session transcript storage"),
+      });
+    } finally {
+      ws.close();
+    }
+  },
+);
 
 test.each([{ maxLines: undefined }, { maxLines: 50 }])(
   "sessions.compact keeps an empty transcript as a successful no-op (maxLines=$maxLines)",

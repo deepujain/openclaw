@@ -1,4 +1,3 @@
-// Discord plugin module implements reply delivery behavior.
 import { formatReasoningMessage, resolveAgentAvatar } from "openclaw/plugin-sdk/agent-runtime";
 import { createChannelPartialDeliveryError } from "openclaw/plugin-sdk/channel-inbound";
 import {
@@ -230,6 +229,8 @@ export async function deliverDiscordReply(params: {
   allowedMentions?: DiscordAllowedMentions;
   kind: "tool" | "block" | "final";
   bindPendingFinalDelivery?: <T extends ReplyPayload>(payload: T) => T;
+  onPlatformSendDispatch?: () => Promise<void>;
+  assertPlatformSendAuthorized?: () => void;
 }) {
   void params.runtime;
 
@@ -257,6 +258,8 @@ export async function deliverDiscordReply(params: {
     formatting: delivery.formatting,
     threadId: delivery.threadId,
     identity: delivery.identity,
+    onPlatformSendDispatch: params.onPlatformSendDispatch,
+    assertDirectAdapterHandoff: params.assertPlatformSendAuthorized,
     deps: createDiscordDeliveryDeps({
       cfg: params.cfg,
       token: params.token,

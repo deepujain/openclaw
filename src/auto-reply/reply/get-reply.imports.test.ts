@@ -1,10 +1,12 @@
 // Tests get-reply import boundaries for lazy runtime and side-effect control.
 import { readFileSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { dirname, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { expectDefined } from "@openclaw/normalization-core";
-import ts from "typescript";
+import * as ts from "typescript/unstable/ast";
 import { describe, expect, it } from "vitest";
+import { createNativeTypeScriptParser } from "../../../scripts/lib/native-typescript.mts";
+import { createRuntimeImportGraph } from "../../../scripts/lib/runtime-import-closure.mts";
 
 const getReplyPath = resolve(dirname(fileURLToPath(import.meta.url)), "get-reply.ts");
 const lazyRuntimeSpecifiers = [
@@ -12,9 +14,9 @@ const lazyRuntimeSpecifiers = [
   "./stage-sandbox-media.runtime.js",
 ] as const;
 
-function readGetReplyModuleImports() {
-  const sourceText = readFileSync(getReplyPath, "utf8");
-  const sourceFile = ts.createSourceFile(getReplyPath, sourceText, ts.ScriptTarget.Latest, true);
+function readModuleImports(filePath: string) {
+  const sourceText = readFileSync(filePath, "utf8");
+  const parser = createNativeTypeScriptParser();
   const staticImports = new Set<string>();
   const dynamicImports = new Set<string>();
 
@@ -22,7 +24,23 @@ function readGetReplyModuleImports() {
     if (
       ts.isImportDeclaration(node) &&
       ts.isStringLiteral(node.moduleSpecifier) &&
-      !node.importClause?.isTypeOnly
+      node.importClause?.phaseModifier !== ts.SyntaxKind.TypeKeyword &&
+      (!node.importClause?.namedBindings ||
+        node.importClause.name ||
+        ts.isNamespaceImport(node.importClause.namedBindings) ||
+        node.importClause.namedBindings.elements.some((element) => !element.isTypeOnly))
+    ) {
+      staticImports.add(node.moduleSpecifier.text);
+    }
+
+    if (
+      ts.isExportDeclaration(node) &&
+      node.moduleSpecifier &&
+      ts.isStringLiteral(node.moduleSpecifier) &&
+      !node.isTypeOnly &&
+      (!node.exportClause ||
+        ts.isNamespaceExport(node.exportClause) ||
+        node.exportClause.elements.some((element) => !element.isTypeOnly))
     ) {
       staticImports.add(node.moduleSpecifier.text);
     }
@@ -38,16 +56,43 @@ function readGetReplyModuleImports() {
       }
     }
 
-    ts.forEachChild(node, visit);
+    node.forEachChild(visit);
   }
 
-  visit(sourceFile);
-  return { dynamicImports, staticImports };
+  try {
+    const sourceFile = parser.parseSourceFile(filePath, sourceText);
+    visit(sourceFile);
+    return { dynamicImports, staticImports };
+  } finally {
+    parser.close();
+  }
+}
+
+function collectStaticImportPaths(entryPath: string): Set<string> {
+  const paths = new Set([entryPath]);
+  const root = resolve(dirname(getReplyPath), "../../..");
+  const graph = createRuntimeImportGraph(root, [entryPath], { sourceImports: true });
+  try {
+    for (const filePath of paths) {
+      for (const { specifier, resolvedFileName } of graph.dependencies(filePath)) {
+        if (!specifier.startsWith(".")) {
+          continue;
+        }
+        const resolved = expectDefined(resolvedFileName, `${filePath} -> ${specifier}`);
+        if (!/\.d\.[cm]?ts$/.test(resolved)) {
+          paths.add(resolved);
+        }
+      }
+    }
+    return paths;
+  } finally {
+    graph.close();
+  }
 }
 
 describe("get-reply module imports", () => {
   it("keeps heavy runtime boundaries on dynamic imports", () => {
-    const { dynamicImports, staticImports } = readGetReplyModuleImports();
+    const { dynamicImports, staticImports } = readModuleImports(getReplyPath);
 
     for (const specifier of lazyRuntimeSpecifiers) {
       expect(staticImports.has(specifier), `${specifier} should stay lazy`).toBe(false);
@@ -55,5 +100,21 @@ describe("get-reply module imports", () => {
         true,
       );
     }
+  });
+
+  it("keeps skill discovery and dispatch out of the inline-actions static import closure", () => {
+    const skillsRoot = resolve(dirname(getReplyPath), "../../skills");
+    const paths = collectStaticImportPaths(
+      resolve(dirname(getReplyPath), "get-reply-inline-actions.ts"),
+    );
+    const eagerSkillRuntime = [...paths]
+      .map((filePath) => relative(skillsRoot, filePath).replaceAll("\\", "/"))
+      .filter((filePath) =>
+        /^(?:loading\/|library\/|runtime\/|discovery\/(?:chat-commands|command-specs)(?:\.|\/))/.test(
+          filePath,
+        ),
+      );
+
+    expect(eagerSkillRuntime).toEqual([]);
   });
 });

@@ -18,8 +18,27 @@ export const BROWSER_RELAY_AUTH_COMPLETE_PATH = "/_openclaw/relay/auth/v2/comple
 export const BROWSER_RELAY_CHALLENGE_TTL_MS = 10_000;
 
 const MAX_PENDING_AUTH_CONNECTIONS = 128;
+// Match Gateway pre-auth admission: reconnect bursts fit while one source
+// cannot consume the shared Browser relay proof budget.
+const MAX_PENDING_AUTH_CONNECTIONS_PER_SOURCE = 32;
 const MAX_AUTHENTICATED_CONNECTIONS = 128;
 const MAX_REPLAY_ENTRIES = 1_024;
+const MAX_REPLAY_ENTRIES_PER_SOURCE = MAX_PENDING_AUTH_CONNECTIONS_PER_SOURCE * 8;
+const LOOPBACK_AUTH_SOURCE = "loopback";
+
+function normalizeAuthSource(source: string): string {
+  const normalized = source.trim().toLowerCase();
+  // A local process can choose any 127/8 alias. Treat mapped and native
+  // loopback addresses as one principal or the per-source bound is bypassable.
+  if (
+    normalized === "::1" ||
+    /^127(?:\.\d{1,3}){3}$/.test(normalized) ||
+    /^::ffff:127(?:\.\d{1,3}){3}$/.test(normalized)
+  ) {
+    return LOOPBACK_AUTH_SOURCE;
+  }
+  return normalized || "unknown";
+}
 
 type BrowserRelayAuthHello = {
   type: "auth.hello";
@@ -180,98 +199,26 @@ export function parseExtensionRelayResource(rawUrl: string, expectedPath: string
   return profile === null ? expectedPath : `${expectedPath}?profile=${encodeURIComponent(profile)}`;
 }
 
-/** Reject duplicate object keys before JSON.parse can silently keep the last value. */
-function hasDuplicateJsonObjectKeys(text: string): boolean {
-  const stack: Array<Set<string> | null> = [];
-  let expectingKey = false;
-  let index = 0;
-  const skipWhitespace = () => {
-    while (/\s/u.test(text[index] ?? "")) {
-      index += 1;
-    }
-  };
-  while (index < text.length) {
-    const char = text[index];
-    if (char === '"') {
-      const start = index;
-      index += 1;
-      let escaped = false;
-      while (index < text.length) {
-        const next = text[index++];
-        if (escaped) {
-          escaped = false;
-        } else if (next === "\\") {
-          escaped = true;
-        } else if (next === '"') {
-          break;
-        }
-      }
-      if (expectingKey && stack.at(-1)) {
-        let key: unknown;
-        try {
-          key = JSON.parse(text.slice(start, index));
-        } catch {
-          return false;
-        }
-        skipWhitespace();
-        if (text[index] === ":" && typeof key === "string") {
-          const keys = stack.at(-1) as Set<string>;
-          if (keys.has(key)) {
-            return true;
-          }
-          keys.add(key);
-          expectingKey = false;
-        }
-      }
-      continue;
-    }
-    if (char === "{") {
-      stack.push(new Set());
-      expectingKey = true;
-    } else if (char === "[") {
-      stack.push(null);
-      expectingKey = false;
-    } else if (char === "}") {
-      stack.pop();
-      expectingKey = false;
-    } else if (char === "]") {
-      stack.pop();
-      expectingKey = false;
-    } else if (char === ",") {
-      expectingKey = stack.at(-1) instanceof Set;
-    }
-    index += 1;
-  }
-  return false;
-}
-
-export function parseStrictJsonObject(text: string): Record<string, unknown> | null {
-  if (hasDuplicateJsonObjectKeys(text)) {
-    return null;
-  }
-  try {
-    const parsed: unknown = JSON.parse(text);
-    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
-      ? (parsed as Record<string, unknown>)
-      : null;
-  } catch {
-    return null;
-  }
-}
-
 class BoundedReplayCache {
-  private readonly entries = new Map<string, number>();
+  private readonly entries = new Map<string, { expiresAtMs: number; source: string }>();
 
-  reserve(key: string, expiresAtMs: number, nowMs: number): boolean {
-    for (const [candidate, expiry] of this.entries) {
-      if (expiry < nowMs) {
+  reserve(key: string, expiresAtMs: number, nowMs: number, source: string): boolean {
+    let entriesForSource = 0;
+    for (const [candidate, entry] of this.entries) {
+      if (entry.expiresAtMs < nowMs) {
         this.entries.delete(candidate);
+      } else {
+        entriesForSource += entry.source === source ? 1 : 0;
       }
     }
-    if (this.entries.has(key) || this.entries.size >= MAX_REPLAY_ENTRIES) {
+    if (
+      this.entries.has(key) ||
+      entriesForSource >= MAX_REPLAY_ENTRIES_PER_SOURCE ||
+      this.entries.size >= MAX_REPLAY_ENTRIES
+    ) {
       return false;
     }
-    this.entries.set(key, expiresAtMs);
+    this.entries.set(key, { expiresAtMs, source });
     return true;
   }
 
@@ -284,7 +231,10 @@ export class BrowserRelayAuthV2Authority {
   readonly keyId: string;
   readonly instanceId = randomRelayId();
   private readonly challenges = new Map<string, ChallengeState>();
-  private readonly pendingConnections = new Map<object, () => void>();
+  private readonly pendingConnections = new Map<
+    object,
+    { onInvalidate: () => void; source: string }
+  >();
   private readonly authenticatedConnections = new Map<object, () => void>();
   private readonly replay = new BoundedReplayCache();
   private disposed = false;
@@ -293,16 +243,22 @@ export class BrowserRelayAuthV2Authority {
     this.keyId = relayKeyIdFromHex(keyHex);
   }
 
-  registerPendingConnection(binding: object, onInvalidate: () => void): boolean {
+  registerPendingConnection(binding: object, onInvalidate: () => void, source: string): boolean {
+    const normalizedSource = normalizeAuthSource(source);
+    let pendingForSource = 0;
+    for (const pending of this.pendingConnections.values()) {
+      pendingForSource += pending.source === normalizedSource ? 1 : 0;
+    }
     if (
       this.disposed ||
       this.pendingConnections.has(binding) ||
       this.authenticatedConnections.has(binding) ||
+      pendingForSource >= MAX_PENDING_AUTH_CONNECTIONS_PER_SOURCE ||
       this.pendingConnections.size >= MAX_PENDING_AUTH_CONNECTIONS
     ) {
       return false;
     }
-    this.pendingConnections.set(binding, onInvalidate);
+    this.pendingConnections.set(binding, { onInvalidate, source: normalizedSource });
     return true;
   }
 
@@ -335,16 +291,19 @@ export class BrowserRelayAuthV2Authority {
     expected: BrowserRelayBinding,
     nowMs = Date.now(),
   ): BrowserRelayAuthChallenge | null {
+    const pending = this.pendingConnections.get(binding);
     if (
       this.disposed ||
-      !this.pendingConnections.has(binding) ||
+      !pending ||
       hello.keyId !== this.keyId ||
       this.challenges.size >= MAX_PENDING_AUTH_CONNECTIONS
     ) {
       return null;
     }
     const expiresAtMs = nowMs + BROWSER_RELAY_CHALLENGE_TTL_MS;
-    if (!this.replay.reserve(`${this.keyId}:${hello.clientNonce}`, expiresAtMs, nowMs)) {
+    if (
+      !this.replay.reserve(`${this.keyId}:${hello.clientNonce}`, expiresAtMs, nowMs, pending.source)
+    ) {
       return null;
     }
     const fields: BrowserRelayProofFields = {
@@ -384,14 +343,14 @@ export class BrowserRelayAuthV2Authority {
     ) {
       return null;
     }
-    const invalidate = this.pendingConnections.get(binding);
-    if (!invalidate || this.authenticatedConnections.size >= MAX_AUTHENTICATED_CONNECTIONS) {
+    const pending = this.pendingConnections.get(binding);
+    if (!pending || this.authenticatedConnections.size >= MAX_AUTHENTICATED_CONNECTIONS) {
       return null;
     }
     // Promotion is synchronous and moves the exact binding between disjoint
     // registries, so pending admission can never consume active capacity.
     this.pendingConnections.delete(binding);
-    this.authenticatedConnections.set(binding, invalidate);
+    this.authenticatedConnections.set(binding, pending.onInvalidate);
     return {
       fields: challenge.fields,
       ok: {
@@ -414,7 +373,7 @@ export class BrowserRelayAuthV2Authority {
     }
     this.disposed = true;
     const invalidators = [
-      ...this.pendingConnections.values(),
+      ...Array.from(this.pendingConnections.values(), ({ onInvalidate }) => onInvalidate),
       ...this.authenticatedConnections.values(),
     ];
     this.pendingConnections.clear();

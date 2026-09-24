@@ -1,14 +1,13 @@
 // Node location commands: invokes location.get on a paired node and formats the location payload.
 import { normalizeOptionalLowercaseString } from "@openclaw/normalization-core/string-coerce";
 import type { Command } from "commander";
-import { randomIdempotencyKey } from "../../gateway/call.js";
 import { defaultRuntime } from "../../runtime.js";
 import { runNodesCommand } from "./cli-utils.js";
 import {
+  buildNodeInvokeParams,
   callNodesGatewayCli,
   nodesCallOpts,
-  parseOptionalNodeNonNegativeInteger,
-  parseOptionalNodePositiveInteger,
+  parseOptionalNodeInteger,
   resolveCliNodeId,
 } from "./rpc.js";
 import type { NodesRpcOpts } from "./types.js";
@@ -31,8 +30,6 @@ export function registerNodesLocationCommands(nodes: Command) {
       .option("--invoke-timeout <ms>", "Node invoke timeout in ms (default 20000)", "20000")
       .action(async (opts: NodesRpcOpts) => {
         await runNodesCommand("location get", async () => {
-          const nodeId = await resolveCliNodeId(opts, opts.node ?? "");
-          const maxAgeMs = parseOptionalNodeNonNegativeInteger(opts.maxAge, "--max-age");
           const desiredAccuracyRaw = normalizeOptionalLowercaseString(opts.accuracy);
           const desiredAccuracy =
             desiredAccuracyRaw === "coarse" ||
@@ -40,28 +37,24 @@ export function registerNodesLocationCommands(nodes: Command) {
             desiredAccuracyRaw === "precise"
               ? desiredAccuracyRaw
               : undefined;
-          const timeoutMs = parseOptionalNodePositiveInteger(
-            opts.locationTimeout,
-            "--location-timeout",
-          );
-          const invokeTimeoutMs = parseOptionalNodePositiveInteger(
-            opts.invokeTimeout,
-            "--invoke-timeout",
-          );
+          if (opts.accuracy !== undefined && desiredAccuracy === undefined) {
+            throw new Error("invalid --accuracy (use coarse|balanced|precise)");
+          }
+          const maxAgeMs = parseOptionalNodeInteger(opts.maxAge, "--max-age", "non-negative");
+          const timeoutMs = parseOptionalNodeInteger(opts.locationTimeout, "--location-timeout");
+          const invokeTimeoutMs = parseOptionalNodeInteger(opts.invokeTimeout, "--invoke-timeout");
+          const nodeId = await resolveCliNodeId(opts, opts.node ?? "");
 
-          const invokeParams: Record<string, unknown> = {
+          const invokeParams = buildNodeInvokeParams({
             nodeId,
             command: "location.get",
             params: {
-              maxAgeMs: Number.isFinite(maxAgeMs) ? maxAgeMs : undefined,
+              maxAgeMs,
               desiredAccuracy,
-              timeoutMs: Number.isFinite(timeoutMs) ? timeoutMs : undefined,
+              timeoutMs,
             },
-            idempotencyKey: randomIdempotencyKey(),
-          };
-          if (typeof invokeTimeoutMs === "number" && Number.isFinite(invokeTimeoutMs)) {
-            invokeParams.timeoutMs = invokeTimeoutMs;
-          }
+            timeoutMs: invokeTimeoutMs,
+          });
 
           const raw = await callNodesGatewayCli("node.invoke", opts, invokeParams);
           const res = typeof raw === "object" && raw !== null ? (raw as { payload?: unknown }) : {};

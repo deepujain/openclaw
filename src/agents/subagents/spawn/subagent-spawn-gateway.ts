@@ -1,7 +1,17 @@
+import { setTimeout as delay } from "node:timers/promises";
+import {
+  asOptionalObjectRecord,
+  asOptionalRecord,
+  isRecord,
+} from "@openclaw/normalization-core/record-coerce";
+import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import type { AgentRuntimeIdentity } from "../../../gateway/agent-runtime-identity-token.js";
 import { withInProcessAgentRuntimeIdentity } from "../../../gateway/in-process-agent-runtime-identity.js";
+import type { GatewayContextResolver } from "../../../gateway/server-methods/types.js";
+import { isGatewayRpcUnavailableError } from "../../../gateway/transport-error.js";
 import type { WorkerTurnExecutionIdentity } from "../../../gateway/worker-environments/placement-turn-claim-events.js";
 import { getActiveAgentRunDelegatedAuthority } from "../../../infra/agent-run-registry.js";
+import { getPluginRuntimeGatewayRequestScope } from "../../../plugins/runtime/gateway-request-scope.js";
 import { getGatewayToolCallerIdentity } from "../../tools/gateway-caller-context.js";
 import { runWithGatewaySessionSpawnContext } from "../../tools/gateway-session-spawn-context.js";
 import { runWithGatewaySessionSpawnParentExecutionIdentity } from "../../tools/gateway-session-spawn-execution-identity.js";
@@ -9,16 +19,19 @@ import { callGatewayTool } from "../../tools/gateway.js";
 import { resolveSubagentRunTimerDelayMs } from "../registry/subagent-run-timeout.js";
 import type { SubagentLaunchAuthorization } from "./subagent-launch-authorization.js";
 import { applySubagentLaunchAuthorization } from "./subagent-launch-authorization.js";
-import { getSubagentSpawnDeps } from "./subagent-spawn-deps.js";
 import { readSubagentGatewayExecutionIdentity } from "./subagent-spawn-execution-identity.js";
 import {
   ADMIN_SCOPE,
   callGateway,
+  dispatchGatewayMethodInProcess,
+  hasInProcessGatewayContext,
   resolveLeastPrivilegeOperatorScopesForMethod,
 } from "./subagent-spawn.runtime.js";
 
 const DEFAULT_SUBAGENT_AGENT_GATEWAY_TIMEOUT_MS = 60_000;
 const MAX_SUBAGENT_AGENT_GATEWAY_TIMEOUT_MS = 300_000;
+const SUBAGENT_AGENT_RECONCILE_INTERVAL_MS = 800;
+const SUBAGENT_AGENT_RECONCILE_TIMEOUT_MS = 6_400;
 
 type SubagentGatewayResponse = Awaited<ReturnType<typeof callGateway>>;
 type SubagentGatewayDispatchMode = "in_process" | "out_of_process";
@@ -26,7 +39,10 @@ type SubagentGatewayDispatchMode = "in_process" | "out_of_process";
 async function callSubagentGatewayWithDispatchMode(
   params: Parameters<typeof callGateway>[0],
   authorization?: SubagentLaunchAuthorization,
-  options?: { agentRunTracking?: "native_subagent" },
+  options?: {
+    agentRunTracking?: "native_subagent";
+    gatewayContextResolver?: GatewayContextResolver;
+  },
 ): Promise<{ response: SubagentGatewayResponse; dispatchMode: SubagentGatewayDispatchMode }> {
   const { sessionSpawnContext, parentExecutionIdentityToken } =
     readSubagentGatewayExecutionIdentity(params) ?? {};
@@ -40,19 +56,21 @@ async function callSubagentGatewayWithDispatchMode(
   // Only admin-requiring calls are pinned to ADMIN_SCOPE; other methods (e.g.
   // "agent" -> write) keep their least-privilege scope. Apply the trusted
   // launch authorization before resolving the request's required scope.
-  const authorizedParams =
-    params.params != null && typeof params.params === "object" && !Array.isArray(params.params)
-      ? applySubagentLaunchAuthorization(params.params as Record<string, unknown>, authorization)
-      : params.params;
+  const authorizedParams = isRecord(params.params)
+    ? applySubagentLaunchAuthorization(params.params, authorization)
+    : params.params;
   const leastPrivilegeScopes = resolveLeastPrivilegeOperatorScopesForMethod(
     params.method,
     authorizedParams,
   );
   const allowModelOverride = authorization !== undefined;
-  const deps = getSubagentSpawnDeps();
   const gatewayCaller = getGatewayToolCallerIdentity();
-  const hasInProcessGateway =
-    deps.hasInProcessGatewayContext() || Boolean(gatewayCaller?.gatewayContextResolver?.());
+  const gatewayContextResolver =
+    options?.gatewayContextResolver ??
+    gatewayCaller?.gatewayContextResolver ??
+    getPluginRuntimeGatewayRequestScope()?.resolveGatewayContext;
+  // A closed owner still requires in-process rejection, never a new socket route.
+  const hasInProcessGateway = gatewayContextResolver !== undefined || hasInProcessGatewayContext();
   const needsOutOfProcessModelOverrideAuth = allowModelOverride && !hasInProcessGateway;
   const scopes =
     params.scopes ??
@@ -64,12 +82,8 @@ async function callSubagentGatewayWithDispatchMode(
     params: authorizedParams,
     ...(scopes != null ? { scopes } : {}),
   };
-  if (
-    hasInProcessGateway &&
-    request.params != null &&
-    typeof request.params === "object" &&
-    !Array.isArray(request.params)
-  ) {
+  if (hasInProcessGateway && isRecord(request.params)) {
+    const requestParams = request.params;
     // Spawn is already running in the gateway process for channel/tool calls.
     // Direct dispatch avoids self-connecting over WS while the same event loop is busy.
     // Agent launches are host-owned even when the parent request came from CLI/HTTP.
@@ -77,6 +91,14 @@ async function callSubagentGatewayWithDispatchMode(
     const isChildRunLaunch = request.method === "agent";
     const forceSyntheticClient = isChildRunLaunch || scopes != null;
     const dispatch = async (workerIdentity?: WorkerTurnExecutionIdentity) => {
+      // Cleanup can lose its worker claim while awaiting a session lifecycle drain.
+      const assertDispatchCurrent = workerIdentity
+        ? () => {
+            request.assertDispatchCurrent?.();
+            workerIdentity.receiptAuthority();
+          }
+        : request.assertDispatchCurrent;
+      assertDispatchCurrent?.();
       const operationalRunInstance = gatewayCaller?.workerTurnClaim
         ? workerIdentity?.operationalRunInstance
         : gatewayCaller?.operationalRunInstance;
@@ -100,17 +122,16 @@ async function callSubagentGatewayWithDispatchMode(
               sessionSpawnContext,
             }
           : undefined;
-      return await deps.dispatchGatewayMethodInProcess(
+      return await dispatchGatewayMethodInProcess(
         request.method,
-        request.params as Record<string, unknown>,
+        requestParams,
         withInProcessAgentRuntimeIdentity(
           {
             expectFinal: request.expectFinal,
+            sessionMutationCommitGuard: assertDispatchCurrent,
             ...(allowModelOverride ? { allowSyntheticModelOverride: true } : {}),
             ...(options?.agentRunTracking ? { agentRunTracking: options.agentRunTracking } : {}),
-            ...(gatewayCaller?.gatewayContextResolver
-              ? { resolveGatewayContext: gatewayCaller.gatewayContextResolver }
-              : {}),
+            ...(gatewayContextResolver ? { resolveGatewayContext: gatewayContextResolver } : {}),
             ...(forceSyntheticClient ? { forceSyntheticClient: true } : {}),
             ...(typeof request.timeoutMs === "number" ? { timeoutMs: request.timeoutMs } : {}),
             ...(scopes != null ? { syntheticScopes: scopes } : {}),
@@ -128,7 +149,7 @@ async function callSubagentGatewayWithDispatchMode(
             gatewayCaller.operationalRunInstance !== identity.operationalRunInstance ||
             gatewayCaller.executionIdentityToken !== identity.executionIdentityToken ||
             gatewayCaller.workerTurnClaim !== identity.turnClaim ||
-            parentExecutionIdentityToken !== identity.executionIdentityToken
+            (isChildRunLaunch && parentExecutionIdentityToken !== identity.executionIdentityToken)
           ) {
             throw new Error("worker child admission identity changed");
           }
@@ -137,24 +158,82 @@ async function callSubagentGatewayWithDispatchMode(
       : await dispatch();
     return { response, dispatchMode: "in_process" };
   }
-  const response =
-    sessionSpawnContext && gatewayCaller?.operationalRunInstance
-      ? await runWithGatewaySessionSpawnContext(sessionSpawnContext, () =>
+  const dispatchAgentRequest = (timeoutMs?: number | null) => {
+    request.assertDispatchCurrent?.();
+    return sessionSpawnContext && gatewayCaller?.operationalRunInstance
+      ? runWithGatewaySessionSpawnContext(sessionSpawnContext, () =>
           runWithGatewaySessionSpawnParentExecutionIdentity(parentExecutionIdentityToken, () =>
             callGatewayTool(
               request.method,
-              typeof request.timeoutMs === "number" ? { timeoutMs: request.timeoutMs } : {},
+              typeof timeoutMs === "number" ? { timeoutMs } : {},
               request.params,
               {
                 expectFinal: request.expectFinal,
                 scopes,
                 requireAgentRuntimeIdentity: true,
+                ...(request.assertDispatchCurrent
+                  ? {
+                      dispatchAuthority: {
+                        version: 2,
+                        kind: "source-bound",
+                        assertCurrent: request.assertDispatchCurrent,
+                      },
+                    }
+                  : {}),
               },
             ),
           ),
         )
-      : await deps.callGateway(request);
+      : callGateway(typeof timeoutMs === "number" ? { ...request, timeoutMs } : request);
+  };
+  // Only agent launches have an idempotency key backed by authoritative Gateway state.
+  // Other methods must not repeat after a transport-ambiguous failure.
+  const response =
+    request.method === "agent"
+      ? await reconcileSubagentAgentDispatch(dispatchAgentRequest, request.timeoutMs)
+      : await dispatchAgentRequest(request.timeoutMs);
   return { response, dispatchMode: "out_of_process" };
+}
+
+async function reconcileSubagentAgentDispatch(
+  dispatch: (timeoutMs?: number | null) => Promise<SubagentGatewayResponse>,
+  timeoutMs?: number | null,
+): Promise<SubagentGatewayResponse> {
+  try {
+    return await dispatch(timeoutMs);
+  } catch (error) {
+    if (!isGatewayRpcUnavailableError(error)) {
+      throw error;
+    }
+    const deadline = Date.now() + SUBAGENT_AGENT_RECONCILE_TIMEOUT_MS;
+    while (true) {
+      const remainingMs = deadline - Date.now();
+      if (remainingMs <= 0) {
+        throw error;
+      }
+      // Only an explicit provisional replay gets another attempt. Transport failures
+      // and Gateway rejections remain terminal, so an unreachable Gateway pays at
+      // most one short reconciliation call instead of a second launch timeout.
+      const response = await dispatch(Math.min(SUBAGENT_AGENT_RECONCILE_INTERVAL_MS, remainingMs));
+      const replay = asOptionalRecord(response);
+      if (
+        replay?.admissionPending !== true &&
+        (replay?.status === "accepted" || replay?.status === "in_flight") &&
+        readGatewayRunId(response)
+      ) {
+        return response;
+      }
+      if (replay?.admissionPending !== true) {
+        throw new Error(
+          `Gateway found no active subagent run (status: ${String(replay?.status)}). Retry the spawn.`,
+          { cause: error },
+        );
+      }
+      await delay(
+        Math.min(SUBAGENT_AGENT_RECONCILE_INTERVAL_MS, Math.max(0, deadline - Date.now())),
+      );
+    }
+  }
 }
 
 export async function callSubagentGateway(
@@ -167,12 +246,14 @@ export async function callSubagentGateway(
 export async function callNativeSubagentGateway(
   params: Parameters<typeof callGateway>[0],
   authorization?: SubagentLaunchAuthorization,
+  gatewayContextResolver?: GatewayContextResolver,
 ): Promise<{
   response: SubagentGatewayResponse;
   taskRowOwnership: "required" | "gateway_best_effort";
 }> {
   const result = await callSubagentGatewayWithDispatchMode(params, authorization, {
     agentRunTracking: "native_subagent",
+    gatewayContextResolver,
   });
   return {
     response: result.response,
@@ -185,11 +266,7 @@ export async function callNativeSubagentGateway(
 export function readGatewayRunId(
   response: Awaited<ReturnType<typeof callGateway>>,
 ): string | undefined {
-  if (!response || typeof response !== "object") {
-    return undefined;
-  }
-  const { runId } = response as { runId?: unknown };
-  return typeof runId === "string" && runId.trim() ? runId.trim() : undefined;
+  return normalizeOptionalString(asOptionalObjectRecord(response)?.runId);
 }
 
 export function resolveSubagentAgentGatewayTimeoutMs(runTimeoutSeconds: number): number {

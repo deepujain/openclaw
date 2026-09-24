@@ -103,6 +103,15 @@ function createProps(overrides: Partial<MemoryImportProps> = {}): MemoryImportPr
 }
 
 describe("renderMemoryImport", () => {
+  it("renders shared skeletons while the import plan is loading", () => {
+    const container = document.createElement("div");
+    render(renderMemoryImport(createProps({ loading: true, plan: null })), container);
+
+    const blocks = container.querySelectorAll(".memory-import__skeleton");
+    expect(blocks).toHaveLength(2);
+    expect([...blocks].every((block) => block.classList.contains("skeleton"))).toBe(true);
+  });
+
   beforeEach(async () => {
     vi.stubGlobal("localStorage", createStorageMock());
     await i18n.setLocale("en");
@@ -159,9 +168,7 @@ describe("renderMemoryImport", () => {
     >('openclaw-agent-select[name="memory-import-agent"]');
     await picker?.updateComplete;
     expect(picker?.options.map((option) => option.value)).toEqual(["research", "writer"]);
-    expect(picker?.querySelector(".agent-select__avatar--text")?.getAttribute("data-avatar")).toBe(
-      "🔎",
-    );
+    expect(picker?.querySelector(".identity-avatar__text")?.getAttribute("data-avatar")).toBe("🔎");
 
     picker?.onSelect("writer");
     expect(onSelectAgent).toHaveBeenCalledWith("writer");
@@ -192,7 +199,9 @@ describe("renderMemoryImport", () => {
       container,
     );
 
-    expect(container.textContent).toContain("2 candidates across 1 days");
+    expect(
+      container.querySelector('.memory-import__backfill-preview [role="status"]')?.textContent,
+    ).toContain("2 candidates across 1 days");
     expect(container.textContent).toContain("2026-07-01");
     expect(container.textContent).toContain("Remember the release checklist");
     expect(container.textContent).toContain("preview shows the first bounded batch");

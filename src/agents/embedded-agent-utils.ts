@@ -11,131 +11,195 @@ import {
   parseAssistantTextSignature,
   type AssistantPhase,
 } from "../shared/chat-message-content.js";
+import { assistantVisibleTextFilters } from "../shared/text/assistant-visible-text.js";
 import {
-  sanitizeAssistantFinalAnswerText,
-  sanitizeAssistantVisibleText,
-} from "../shared/text/assistant-visible-text.js";
-import { sanitizeUserFacingText } from "./embedded-agent-helpers/sanitize-user-facing-text.js";
+  applyTextFilters,
+  createTextProjection,
+  trimTextFilter,
+  trimTextPreservingCode,
+} from "../shared/text/text-projection.js";
+import {
+  sanitizeUserFacingText,
+  userFacingTextFilters,
+} from "./embedded-agent-helpers/sanitize-user-facing-text.js";
 import { renderUserFacingText } from "./embedded-agent-helpers/user-facing-text.js";
 import type { AgentMessage } from "./runtime/index.js";
 
-export { stripDowngradedToolCallText } from "../shared/text/assistant-visible-text.js";
+export { stripDowngradedToolCallText } from "../shared/text/downgraded-tool-call-text.js";
 
 /** Narrow an agent message to an assistant message. */
 export function isAssistantMessage(msg: AgentMessage | undefined): msg is AssistantMessage {
   return msg?.role === "assistant";
 }
 
-function sanitizeAssistantText(text: string, phase?: AssistantPhase): string {
-  return phase === "final_answer"
-    ? sanitizeAssistantFinalAnswerText(text)
-    : sanitizeAssistantVisibleText(text);
+function sanitizeAssistantText(
+  text: string,
+  phase?: AssistantPhase,
+  streaming = false,
+  options?: { preserveTrailingWhitespace?: boolean },
+): string {
+  return applyTextFilters(
+    text,
+    assistantVisibleTextFilters(
+      phase === "final_answer" ? "final-answer-delivery" : "delivery",
+      streaming && phase === "final_answer",
+      options,
+    ),
+  );
 }
 
 function isAssistantTextContentBlockType(value: unknown): boolean {
   return value === "text" || value === "input_text" || value === "output_text";
 }
 
-export function sanitizeAssistantVisibleStreamText(text: string): string {
-  return sanitizeUserFacingText(sanitizeAssistantText(text), { errorContext: false });
+export function sanitizeAssistantVisibleStreamText(
+  text: string,
+  phase?: AssistantPhase,
+  options?: { preserveTrailingWhitespace?: boolean },
+): string {
+  return sanitizeUserFacingText(sanitizeAssistantText(text, phase, true, options), {
+    errorContext: false,
+  });
 }
 
-function finalizeAssistantExtraction(msg: AssistantMessage, extracted: string): string {
-  const errorContext = msg.stopReason === "error";
+export function createAssistantVisibleStreamText(phase?: AssistantPhase) {
+  return createTextProjection([
+    ...assistantVisibleTextFilters(
+      phase === "final_answer" ? "final-answer-delivery" : "delivery",
+      phase === "final_answer",
+    ),
+    ...userFacingTextFilters(),
+    trimTextFilter("both", { preserveCodeIndentation: true }),
+  ]);
+}
+
+function finalizeAssistantExtraction(errorContext: boolean, extracted: string): string {
   return errorContext
     ? renderUserFacingText(extracted, { errorContext: true })
     : sanitizeUserFacingText(extracted);
 }
 
-type AssistantTextExtractionResult = {
-  text: string;
-  hadRequestedPhase: boolean;
-};
-
-function extractEmbeddedAssistantTextForPhase(
+function prepareEmbeddedAssistantTextForPhase(
   msg: AssistantMessage,
-  phase?: AssistantPhase,
-  options?: { unphasedSignedFinalAnswer?: boolean },
-): AssistantTextExtractionResult {
+  requestedPhase: AssistantPhase,
+  prepareText?: (
+    text: string,
+    final: boolean,
+    phase?: AssistantPhase,
+    contentIndex?: number,
+  ) => string,
+): () => string {
   const messagePhase = normalizeAssistantPhase((msg as { phase?: unknown }).phase);
-  const shouldIncludeContent = (resolvedPhase?: AssistantPhase) => {
-    if (phase) {
-      return resolvedPhase === phase;
-    }
-    return resolvedPhase === undefined;
-  };
-
   if (typeof msg.content === "string") {
-    const hadRequestedPhase = phase ? messagePhase === phase : messagePhase === undefined;
-    return {
-      text: shouldIncludeContent(messagePhase)
-        ? finalizeAssistantExtraction(msg, sanitizeAssistantText(msg.content, messagePhase))
-        : "",
-      hadRequestedPhase,
+    const selectedPhase =
+      requestedPhase === "final_answer" && messagePhase !== "final_answer"
+        ? undefined
+        : requestedPhase;
+    if (messagePhase !== selectedPhase) {
+      return () => "";
+    }
+    const preparedText = prepareText ? prepareText(msg.content, true, messagePhase) : msg.content;
+    const errorContext = msg.stopReason === "error";
+    return () => {
+      const text = finalizeAssistantExtraction(
+        errorContext,
+        sanitizeAssistantText(preparedText, messagePhase),
+      );
+      return selectedPhase === "final_answer" && !text.trim() ? "" : text;
     };
   }
-
   if (!Array.isArray(msg.content)) {
-    return { text: "", hadRequestedPhase: false };
+    return () => "";
   }
 
-  const hasExplicitPhasedTextBlocks = msg.content.some((block) => {
+  let hasExplicitPhasedTextBlocks = false;
+  let hasFinalAnswerText = false;
+  for (const block of msg.content) {
     if (!block || typeof block !== "object") {
-      return false;
+      continue;
     }
-    const record = block as { type?: unknown; textSignature?: unknown };
+    const record = block as { type?: unknown; text?: unknown; textSignature?: unknown };
     if (!isAssistantTextContentBlockType(record.type)) {
-      return false;
+      continue;
     }
-    return Boolean(parseAssistantTextSignature(record)?.phase);
-  });
-
-  let hadRequestedPhase = false;
-  const parts = msg.content
-    .map((block) => {
-      if (!block || typeof block !== "object") {
-        return null;
-      }
-      const record = block as { type?: unknown; text?: unknown; textSignature?: unknown };
-      if (!isAssistantTextContentBlockType(record.type) || typeof record.text !== "string") {
-        return null;
-      }
-      const signature = parseAssistantTextSignature(record);
-      const resolvedPhase =
-        signature?.phase ?? (hasExplicitPhasedTextBlocks ? undefined : messagePhase);
-      if (!shouldIncludeContent(resolvedPhase)) {
-        return null;
-      }
-      hadRequestedPhase = true;
-      const sanitizerPhase =
-        resolvedPhase ??
-        (options?.unphasedSignedFinalAnswer === true && signature?.id ? "final_answer" : undefined);
-      const text = sanitizeAssistantText(record.text, sanitizerPhase);
-      return text.trim() ? text : null;
-    })
-    .filter((value): value is string => typeof value === "string");
-  const extracted = parts.join("\n").trim();
-
-  return {
-    text: finalizeAssistantExtraction(msg, extracted),
-    hadRequestedPhase,
+    const phase = parseAssistantTextSignature(record)?.phase;
+    hasExplicitPhasedTextBlocks ||= Boolean(phase);
+    hasFinalAnswerText ||= phase === "final_answer" && typeof record.text === "string";
+    if (hasExplicitPhasedTextBlocks && (requestedPhase === "commentary" || hasFinalAnswerText)) {
+      break;
+    }
+  }
+  // An empty final text block still owns the answer; only absence allows unphased fallback.
+  const selectedPhase =
+    requestedPhase === "final_answer" &&
+    !hasFinalAnswerText &&
+    (hasExplicitPhasedTextBlocks || messagePhase !== "final_answer")
+      ? undefined
+      : requestedPhase;
+  const parts: { text: string; phase?: AssistantPhase; contentIndex: number }[] = [];
+  for (const [contentIndex, block] of msg.content.entries()) {
+    if (!block || typeof block !== "object") {
+      continue;
+    }
+    const record = block as { type?: unknown; text?: unknown; textSignature?: unknown };
+    if (!isAssistantTextContentBlockType(record.type) || typeof record.text !== "string") {
+      continue;
+    }
+    const signature = parseAssistantTextSignature(record);
+    const resolvedPhase =
+      signature?.phase ?? (hasExplicitPhasedTextBlocks ? undefined : messagePhase);
+    if (resolvedPhase !== selectedPhase) {
+      continue;
+    }
+    const sanitizerPhase =
+      resolvedPhase ??
+      (requestedPhase === "final_answer" && signature?.id ? "final_answer" : undefined);
+    parts.push({ text: record.text, phase: sanitizerPhase, contentIndex });
+  }
+  if (prepareText) {
+    for (const [index, part] of parts.entries()) {
+      part.text = prepareText(part.text, index === parts.length - 1, part.phase, part.contentIndex);
+    }
+  }
+  const errorContext = msg.stopReason === "error";
+  return () => {
+    const extracted = finalizeAssistantExtraction(
+      errorContext,
+      // A native block boundary can divide markup; finalize only the selected snapshot.
+      parts
+        .map(({ text, phase }) => sanitizeAssistantText(text, phase))
+        .filter((text) => text.trim())
+        .join("\n")
+        .trimEnd(),
+    );
+    return selectedPhase === "final_answer" && !extracted.trim() ? "" : extracted;
   };
 }
 
-/** Extract text intended for users, preferring explicit final-answer phase blocks. */
-export function extractAssistantVisibleText(msg: AssistantMessage): string {
-  const finalAnswerExtraction = extractEmbeddedAssistantTextForPhase(msg, "final_answer");
-  if (finalAnswerExtraction.hadRequestedPhase) {
-    return finalAnswerExtraction.text.trim() ? finalAnswerExtraction.text : "";
-  }
+/** Prepare selected source parts now; render their visible text only when requested. */
+export function prepareAssistantVisibleText(
+  msg: AssistantMessage,
+  prepareText?: (
+    text: string,
+    final: boolean,
+    phase?: AssistantPhase,
+    contentIndex?: number,
+  ) => string,
+): () => string {
+  return prepareEmbeddedAssistantTextForPhase(msg, "final_answer", prepareText);
+}
 
-  return extractEmbeddedAssistantTextForPhase(msg, undefined, { unphasedSignedFinalAnswer: true })
-    .text;
+/** Extract text intended for users, preferring explicit final-answer phase blocks. */
+export function extractAssistantVisibleText(
+  msg: AssistantMessage,
+  prepareText?: Parameters<typeof prepareAssistantVisibleText>[1],
+): string {
+  return prepareAssistantVisibleText(msg, prepareText)();
 }
 
 /** Extract the commentary/narration text of a commentary-phase assistant message. */
 export function extractAssistantCommentaryText(msg: AssistantMessage): string {
-  return extractEmbeddedAssistantTextForPhase(msg, "commentary").text;
+  return prepareEmbeddedAssistantTextForPhase(msg, "commentary")();
 }
 
 /** Extract sanitized assistant text across all text content blocks. */
@@ -144,13 +208,13 @@ export function extractEmbeddedAssistantText(msg: AssistantMessage): string {
     extractTextFromChatContent(msg.content, {
       sanitizeText: (text) => sanitizeAssistantText(text),
       joinWith: "\n",
-      normalizeText: (text) => text.trim(),
+      normalizeText: (text) => text.trimEnd(),
     }) ?? "";
   // Only apply keyword-based error rewrites when the assistant message is actually an error.
   // Otherwise normal prose that *mentions* errors (e.g. "context overflow") can get clobbered.
   // Gate on stopReason only — a non-error response with an errorMessage set (e.g. from a
   // background tool failure) should not have its content rewritten (#13935).
-  return finalizeAssistantExtraction(msg, extracted);
+  return finalizeAssistantExtraction(msg.stopReason === "error", extracted);
 }
 
 /** Extract native thinking block text; signature-only blocks (no summary) surface nothing. */
@@ -158,33 +222,22 @@ export function extractAssistantThinking(msg: AssistantMessage): string {
   if (!Array.isArray(msg.content)) {
     return "";
   }
-  const blocks = msg.content
-    .map((block) => {
-      if (!block || typeof block !== "object") {
-        return "";
+  const blocks: string[] = [];
+  for (const block of msg.content) {
+    if (!block || typeof block !== "object") {
+      continue;
+    }
+    const type: unknown = Reflect.get(block, "type");
+    const rawThinking = Reflect.get(block, "thinking");
+    if (type === "thinking" && typeof rawThinking === "string") {
+      const thinking = rawThinking.trim();
+      // Empty signed summaries produce no bubble; the original block still owns API replay.
+      if (thinking) {
+        blocks.push(thinking);
       }
-      const type: unknown = Reflect.get(block, "type");
-      const rawThinking = Reflect.get(block, "thinking");
-      if (type === "thinking" && typeof rawThinking === "string") {
-        const thinking = rawThinking.trim();
-        if (thinking) {
-          return thinking;
-        }
-        // Signature-only thinking blocks carry a valid signature but no summary text
-        // (e.g. Anthropic display:"omitted" on Opus 4.7+/Fable 5, or OpenAI/codex reasoning
-        // items with encrypted_content and an empty summary). Surface nothing so the
-        // .filter(Boolean) below drops the bubble — a diagnostic placeholder is not reasoning
-        // content and must not be shown on any channel. The signed block stays on the message
-        // for API replay; this only governs display.
-        const thinkingSignature = Reflect.get(block, "thinkingSignature");
-        if (typeof thinkingSignature === "string" && thinkingSignature.trim()) {
-          return "";
-        }
-      }
-      return "";
-    })
-    .filter(Boolean);
-  return blocks.join("\n").trim();
+    }
+  }
+  return blocks.join("\n");
 }
 
 /** Format reasoning text for markdown-friendly channel surfaces. */
@@ -341,7 +394,7 @@ export function promoteThinkingTagsToBlocks(message: AssistantMessage): void {
       if (part.type === "thinking") {
         next.push({ type: "thinking", thinking: part.thinking });
       } else if (part.type === "text") {
-        const cleaned = part.text.trimStart();
+        const cleaned = trimTextPreservingCode(part.text, "start");
         if (cleaned) {
           next.push({ type: "text", text: cleaned });
         }
@@ -380,9 +433,15 @@ export function extractThinkingFromTaggedText(text: string): string {
 export function extractThinkingFromTaggedStream(
   text: string,
   state: ThinkingTagStreamState,
+  delta: string,
 ): string {
-  for (let index = state.scannedOffset; index < text.length; index += 1) {
-    const char = text[index];
+  // Indexing the growing rope flattens the entire reply on each token. Scan the
+  // appended chunk directly; a checkpoint reset still needs its unscanned prefix.
+  const unscanned =
+    text.length - state.scannedOffset === delta.length ? delta : text.slice(state.scannedOffset);
+  for (let offset = 0; offset < unscanned.length; offset += 1) {
+    const index = state.scannedOffset + offset;
+    const char = unscanned[offset];
     if (char === "<") {
       state.pendingTagStart = index;
       continue;

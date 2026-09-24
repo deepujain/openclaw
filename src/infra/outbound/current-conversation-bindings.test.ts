@@ -17,6 +17,7 @@ import {
   testing,
   bindGenericCurrentConversation,
   getGenericCurrentConversationBindingCapabilities,
+  inspectGenericCurrentConversationBinding,
   listGenericCurrentConversationBindingsBySession,
   resolveGenericCurrentConversationBinding,
   touchGenericCurrentConversationBinding,
@@ -71,8 +72,6 @@ function seedPersistedBinding(record: SessionBindingRecord): void {
       bindingDb.insertInto("current_conversation_bindings").values({
         binding_key: buildConversationKey(record.conversation),
         binding_id: record.bindingId,
-        target_agent_id: "codex",
-        target_session_id: null,
         target_session_key: record.targetSessionKey,
         channel: record.conversation.channel,
         account_id: record.conversation.accountId,
@@ -230,6 +229,24 @@ describe("generic current-conversation bindings", () => {
     await fs.rm(testStateDir, { recursive: true, force: true });
   });
 
+  it("inspects expired ownership without deleting the durable row", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(1_000_000));
+    const binding = await bindWorkspaceConversation("user:inspection", { ttlMs: 1_000 });
+    expect(binding).not.toBeNull();
+    vi.setSystemTime(new Date(1_002_000));
+    expect(
+      inspectGenericCurrentConversationBinding({
+        channel: "workspace",
+        accountId: "default",
+        conversationId: "user:inspection",
+      }),
+    ).toBeNull();
+    // Rewinding exposes whether inspection pruned the existing SQLite row.
+    vi.setSystemTime(new Date(1_000_500));
+    expect(resolveWorkspaceConversation("user:inspection")).not.toBeNull();
+  });
+
   it("advertises support only for channels that opt into current-conversation binds", () => {
     expect(
       getGenericCurrentConversationBindingCapabilities({
@@ -331,6 +348,38 @@ describe("generic current-conversation bindings", () => {
     });
     expectBindingMetadata(resolved, { label: "workspace-dm" });
   });
+
+  it.each([false, true])(
+    "inherits runtime metadata only when refreshing the same target (replace=%s)",
+    async (replace) => {
+      const originalTarget = "plugin-binding:owner-plugin:original";
+      const metadata = {
+        pluginBindingOwner: "plugin",
+        pluginId: "owner-plugin",
+        pluginRoot: "/plugins/owner-plugin",
+        opaque: { runtimeId: "original" },
+      };
+      await bindWorkspaceConversation("user:replacement-owner", {
+        targetSessionKey: originalTarget,
+        metadata,
+      });
+      const targetSessionKey = replace ? "agent:main:acp:replacement" : originalTarget;
+
+      await bindWorkspaceConversation("user:replacement-owner", {
+        targetSessionKey,
+        metadata: { label: "updated" },
+      });
+      closeOpenClawStateDatabaseForTest();
+
+      const binding = expectSessionBinding(resolveWorkspaceConversation("user:replacement-owner"));
+      expect(binding.targetSessionKey).toBe(targetSessionKey);
+      expect(binding.metadata).toEqual({
+        ...(replace ? {} : metadata),
+        label: "updated",
+        lastActivityAt: expect.any(Number),
+      });
+    },
+  );
 
   describe("independent SQLite owners", () => {
     it.each(["bind", "touch", "expiry cleanup", "unbind"] as const)(
@@ -560,7 +609,7 @@ describe("generic current-conversation bindings", () => {
     });
   });
 
-  it("returns no generic bindings for session keys without an indexable agent owner", async () => {
+  it("does not match partial target keys or request aliases", async () => {
     await bindWorkspaceConversation("user:U123");
 
     expect(listGenericCurrentConversationBindingsBySession("agent:main")).toEqual([]);

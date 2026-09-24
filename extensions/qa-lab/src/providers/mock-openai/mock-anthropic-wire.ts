@@ -9,6 +9,7 @@ import {
   type AnthropicStreamEvent,
   type QaMockProviderFailure,
   countApproxTokens,
+  parseJsonObjectBody,
 } from "./mock-openai-contracts.js";
 
 // Anthropic Messages conversion preserves role and tool ordering while reusing
@@ -17,22 +18,11 @@ import {
 export function normalizeAnthropicSystemToString(
   system: AnthropicMessagesRequest["system"],
 ): string | undefined {
-  if (typeof system === "string") {
-    return system.trim() || undefined;
-  }
-  if (Array.isArray(system)) {
-    const joined = system
-      .map((block) => (block?.type === "text" ? block.text : ""))
-      .filter(Boolean)
-      .join("\n")
-      .trim();
-    return joined || undefined;
-  }
-  return undefined;
+  return stringifyToolResultContent(system).trim() || undefined;
 }
 
 function stringifyToolResultContent(
-  content: Extract<AnthropicMessageContentBlock, { type: "tool_result" }>["content"],
+  content: Extract<AnthropicMessageContentBlock, { type: "tool_result" }>["content"] | undefined,
 ): string {
   if (typeof content === "string") {
     return content;
@@ -108,7 +98,7 @@ export function convertAnthropicMessagesToResponsesInput(params: {
           type: "function_call_output",
           call_id: block.tool_use_id,
           output: stringifyToolResultContent(block.content),
-          ...(block.is_error === true ? { is_error: true } : {}),
+          ...(typeof block.is_error === "boolean" ? { is_error: block.is_error } : {}),
         });
         continue;
       }
@@ -203,39 +193,25 @@ export function adaptAnthropicToolCallIds(events: StreamEvent[]): StreamEvent[] 
   });
 }
 
-export function extractFinalAssistantOutputFromEvents(
-  events: StreamEvent[],
-): ExtractedAssistantOutput {
+export function extractAssistantOutputFromEvents(events: StreamEvent[]): ExtractedAssistantOutput {
   const toolCalls: ExtractedAssistantOutput["toolCalls"] = [];
   let text = "";
   for (const event of events) {
+    // Failed streams may never finish an output item; retain text emitted before failure.
+    if (event.type === "response.output_text.delta") {
+      text += event.delta;
+      continue;
+    }
     if (event.type !== "response.output_item.done") {
       continue;
     }
-    const item = event.item as {
-      type?: unknown;
-      name?: unknown;
-      call_id?: unknown;
-      id?: unknown;
-      arguments?: unknown;
-      content?: unknown;
-    };
+    const item = event.item;
     if (item.type === "function_call" && typeof item.name === "string") {
-      let input: Record<string, unknown> = {};
-      if (typeof item.arguments === "string" && item.arguments.trim()) {
-        try {
-          const parsed = JSON.parse(item.arguments) as unknown;
-          if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-            input = parsed as Record<string, unknown>;
-          }
-        } catch {
-          // keep empty input on malformed args — mock dispatcher owns arg shape
-        }
-      }
       toolCalls.push({
         id: typeof item.call_id === "string" ? item.call_id : `toolu_mock_${toolCalls.length + 1}`,
         name: item.name,
-        input,
+        input:
+          typeof item.arguments === "string" ? (parseJsonObjectBody(item.arguments) ?? {}) : {},
       });
       continue;
     }
@@ -253,8 +229,8 @@ export function extractFinalAssistantOutputFromEvents(
 export function buildAnthropicMessageResponse(params: {
   model: string;
   extracted: ExtractedAssistantOutput;
-}): Record<string, unknown> {
-  const content: Array<Record<string, unknown>> = [];
+}) {
+  const content: Array<Extract<AnthropicMessageContentBlock, { type: "text" | "tool_use" }>> = [];
   if (params.extracted.text) {
     content.push({ type: "text", text: params.extracted.text });
   }
@@ -290,9 +266,7 @@ export function buildAnthropicMessageResponse(params: {
   };
 }
 
-export function buildAnthropicFailureResponse(
-  failure: QaMockProviderFailure,
-): Record<string, unknown> {
+export function buildAnthropicFailureResponse(failure: QaMockProviderFailure) {
   return {
     type: "error",
     error: {
@@ -389,94 +363,59 @@ export function buildAnthropicThinkingErrorStreamEvents(params: {
   ];
 }
 
-export function buildAnthropicMessageStreamEvents(params: {
-  model: string;
-  extracted: ExtractedAssistantOutput;
-}): AnthropicStreamEvent[] {
-  const approxInputTokens = 64;
-  const approxOutputTokens = Math.max(
-    16,
-    countApproxTokens(params.extracted.text) + params.extracted.toolCalls.length * 16,
-  );
-  const messageId = `msg_mock_${Math.floor(Math.random() * 1_000_000).toString(16)}`;
+export function buildAnthropicMessageStreamEvents(
+  message: ReturnType<typeof buildAnthropicMessageResponse>,
+  failure?: QaMockProviderFailure,
+): AnthropicStreamEvent[] {
   const events: AnthropicStreamEvent[] = [
     {
       type: "message_start",
       message: {
-        id: messageId,
-        type: "message",
-        role: "assistant",
-        model: params.model || "claude-opus-4-8",
+        ...message,
         content: [],
         stop_reason: null,
-        stop_sequence: null,
         usage: {
-          input_tokens: approxInputTokens,
+          input_tokens: message.usage.input_tokens,
           output_tokens: 0,
         },
       },
     },
   ];
-  let index = 0;
-  if (params.extracted.text || params.extracted.toolCalls.length === 0) {
+  for (const [index, block] of message.content.entries()) {
     events.push({
       type: "content_block_start",
       index,
       content_block: {
-        type: "text",
-        text: "",
+        ...block,
+        ...(block.type === "text" ? { text: "" } : { input: {} }),
       },
     });
-    if (params.extracted.text) {
+    const delta = block.type === "text" ? block.text : JSON.stringify(block.input);
+    if (delta) {
       events.push({
         type: "content_block_delta",
         index,
-        delta: {
-          type: "text_delta",
-          text: params.extracted.text,
-        },
+        delta:
+          block.type === "text"
+            ? { type: "text_delta", text: delta }
+            : { type: "input_json_delta", partial_json: delta },
       });
     }
     events.push({
       type: "content_block_stop",
       index,
     });
-    index += 1;
   }
-  for (const call of params.extracted.toolCalls) {
-    events.push({
-      type: "content_block_start",
-      index,
-      content_block: {
-        type: "tool_use",
-        id: call.id,
-        name: call.name,
-        input: {},
-      },
-    });
-    events.push({
-      type: "content_block_delta",
-      index,
-      delta: {
-        type: "input_json_delta",
-        partial_json: JSON.stringify(call.input ?? {}),
-      },
-    });
-    events.push({
-      type: "content_block_stop",
-      index,
-    });
-    index += 1;
+  if (failure) {
+    events.push(buildAnthropicFailureResponse(failure));
+    return events;
   }
   events.push({
     type: "message_delta",
     delta: {
-      stop_reason: params.extracted.toolCalls.length > 0 ? "tool_use" : "end_turn",
+      stop_reason: message.stop_reason,
     },
-    usage: {
-      input_tokens: approxInputTokens,
-      output_tokens: approxOutputTokens,
-    },
+    usage: message.usage,
   });
   events.push({
     type: "message_stop",

@@ -5,17 +5,17 @@ export type BackgroundTasksProps = {
   sessionKey: string;
   statusRowId: string;
   collapsed: boolean;
-  /** Pane too narrow for a side rail: presentation moves to a bottom strip
-   * (mirrors the workspace rail's narrow mode). */
+  /** Narrow panes move the rail to a bottom strip. */
   narrowLayout: boolean;
   connected: boolean;
   canCancel: boolean;
   loading: boolean;
   error: string | null;
-  /** null until the first load for this session finished. */
   tasks: TaskSummary[] | null;
+  activeCount: number;
   subagentActivity: SubagentActivityPresentation;
-  openTaskId?: string;
+  /** Projection of the persisted Tasks panel selection, never controller-owned. */
+  selectedTaskId?: string;
   taskDetails: ReadonlyMap<string, TaskSummary>;
   taskDetailErrors: ReadonlyMap<string, string>;
   taskDetailLoadingIds: ReadonlySet<string>;
@@ -25,6 +25,7 @@ export type BackgroundTasksProps = {
   onToggleFinished: () => void;
   onRefresh: () => void;
   onCancel: (taskId: string) => void;
-  onLoadDetail?: (task: TaskSummary) => void;
+  onLoadDetail?: (task: Pick<TaskSummary, "id">) => void;
   onOpenTaskDetail?: (task: TaskSummary) => void;
+  onOpenTaskList?: () => void;
 };

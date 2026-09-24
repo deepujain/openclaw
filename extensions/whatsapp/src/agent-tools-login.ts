@@ -1,9 +1,9 @@
-// Whatsapp plugin module implements agent tools login behavior.
 import {
   optionalPositiveIntegerSchema,
   readPositiveIntegerParam,
 } from "openclaw/plugin-sdk/channel-actions";
 import type { ChannelAgentTool } from "openclaw/plugin-sdk/channel-contract";
+import type { OpenClawPluginApi, OpenClawPluginToolContext } from "openclaw/plugin-sdk/core";
 import { hasNonEmptyString } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { Type } from "typebox";
 import { startWebLoginWithQr, waitForWebLogin } from "../login-qr-api.js";
@@ -14,7 +14,12 @@ function readLoginStringPreservingWhitespace(value: unknown): string | undefined
   return hasNonEmptyString(value) ? value : undefined;
 }
 
-export function createWhatsAppLoginTool(): ChannelAgentTool {
+export function createWhatsAppLoginTool(
+  context: OpenClawPluginToolContext,
+): ChannelAgentTool | null {
+  if (context.senderIsOwner !== true) {
+    return null;
+  }
   return {
     label: "WhatsApp Login",
     name: "whatsapp_login",
@@ -33,7 +38,13 @@ export function createWhatsAppLoginTool(): ChannelAgentTool {
         }),
       ),
     }),
-    execute: async (_toolCallId, args) => {
+    execute: async (_toolCallId, args, signal) => {
+      const beforeCredentialPersistence = async () => {
+        context.assertInvocationCurrent?.();
+        if (!signal || signal.aborted) {
+          throw new Error("WhatsApp login authority is no longer active.");
+        }
+      };
       const renderQrReply = (params: {
         message: string;
         qrDataUrl: string;
@@ -81,9 +92,11 @@ export function createWhatsAppLoginTool(): ChannelAgentTool {
         };
       }
 
+      await beforeCredentialPersistence();
       const result = await startWebLoginWithQr({
         accountId,
         timeoutMs,
+        beforeCredentialPersistence,
         force:
           typeof (args as { force?: unknown }).force === "boolean"
             ? (args as { force?: boolean }).force
@@ -109,4 +122,11 @@ export function createWhatsAppLoginTool(): ChannelAgentTool {
       });
     },
   };
+}
+
+export function registerWhatsAppLoginTool(api: OpenClawPluginApi): void {
+  api.registerTool(
+    { contextVersion: 2, create: (context) => createWhatsAppLoginTool(context) },
+    { name: "whatsapp_login" },
+  );
 }

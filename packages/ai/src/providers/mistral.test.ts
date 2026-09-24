@@ -1,8 +1,13 @@
-import { toolCallFromJSON, type ToolCall } from "@mistralai/mistralai/models/components";
+import {
+  contentChunkFromJSON,
+  toolCallFromJSON,
+  type ToolCall,
+} from "@mistralai/mistralai/models/components";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { configureAiTransportHost } from "../host.js";
 import { withProviderAcceptanceObserver } from "../transports/transport-stream-shared.js";
 import type { Context, Model } from "../types.js";
+import { onLlmRequestActivity } from "../utils/llm-request-activity.js";
 import { SYSTEM_PROMPT_CACHE_BOUNDARY } from "../utils/system-prompt-cache-boundary.js";
 
 const mistralMockState = vi.hoisted(() => ({
@@ -23,12 +28,9 @@ vi.mock("node:crypto", async () => {
   };
 });
 
-vi.mock("@mistralai/mistralai", async () => {
-  const actual =
-    await vi.importActual<typeof import("@mistralai/mistralai")>("@mistralai/mistralai");
+vi.mock("@mistralai/mistralai/sdk/chat", () => {
   return {
-    ...actual,
-    Mistral: class MockMistral {
+    Chat: class MockMistralChat {
       private readonly config: unknown;
 
       constructor(config: unknown) {
@@ -36,29 +38,27 @@ vi.mock("@mistralai/mistralai", async () => {
         mistralMockState.configs.push(config);
       }
 
-      chat = {
-        stream: vi.fn(async (payload: unknown, requestOptions: unknown) => {
-          mistralMockState.payloads.push(payload);
-          mistralMockState.requestOptions.push(requestOptions);
-          if (mistralMockState.requestThroughHttpClient) {
-            const httpClient = (
-              this.config as {
-                httpClient?: { request(request: Request): Promise<Response> };
-              }
-            ).httpClient;
-            const response = await httpClient?.request(new Request("https://api.mistral.ai/chat"));
-            if (response && !response.ok) {
-              throw Object.assign(new Error(`Mistral HTTP ${response.status}`), {
-                statusCode: response.status,
-              });
+      stream = vi.fn(async (payload: unknown, requestOptions: unknown) => {
+        mistralMockState.payloads.push(payload);
+        mistralMockState.requestOptions.push(requestOptions);
+        if (mistralMockState.requestThroughHttpClient) {
+          const httpClient = (
+            this.config as {
+              httpClient?: { request(request: Request): Promise<Response> };
             }
+          ).httpClient;
+          const response = await httpClient?.request(new Request("https://api.mistral.ai/chat"));
+          if (response && !response.ok) {
+            throw Object.assign(new Error(`Mistral HTTP ${response.status}`), {
+              statusCode: response.status,
+            });
           }
-          if (mistralMockState.streamResult !== undefined) {
-            return mistralMockState.streamResult;
-          }
-          throw mistralMockState.streamError;
-        }),
-      };
+        }
+        if (mistralMockState.streamResult !== undefined) {
+          return mistralMockState.streamResult;
+        }
+        throw mistralMockState.streamError;
+      });
     },
   };
 });
@@ -246,6 +246,35 @@ describe("Mistral provider", () => {
     configureAiTransportHost({});
   });
 
+  it("reports every parsed Mistral event as request activity", async () => {
+    const events = [
+      { data: { id: "resp-activity", model: "mistral-large-latest", choices: [], usage: {} } },
+      {
+        data: {
+          id: "resp-activity",
+          model: "mistral-large-latest",
+          choices: [{ finishReason: "stop", delta: { content: "ok" } }],
+        },
+      },
+    ];
+    mistralMockState.streamResult = {
+      async *[Symbol.asyncIterator]() {
+        yield* events;
+      },
+    };
+    const controller = new AbortController();
+    const onActivity = vi.fn();
+    const unsubscribe = onLlmRequestActivity(controller.signal, onActivity);
+
+    try {
+      await runMistralFixture(context, { signal: controller.signal });
+    } finally {
+      unsubscribe();
+    }
+
+    expect(onActivity).toHaveBeenCalledTimes(events.length);
+  });
+
   it("reports the real HTTP response captured by the Mistral HTTPClient hook", async () => {
     mistralMockState.requestThroughHttpClient = true;
     mistralMockState.streamResult = {
@@ -374,7 +403,32 @@ describe("Mistral provider", () => {
     expect((mistralMockState.payloads[0] as { stop?: unknown }).stop).toEqual(["STOP"]);
   });
 
-  it("preserves Mistral messages while keeping error bodies UTF-16 safe and bounded", async () => {
+  it.each([360, undefined])(
+    "preserves requested maxTokens %s when the model output limit is unknown",
+    async (maxTokens) => {
+      const model = makeMistralModel();
+      Reflect.deleteProperty(model, "maxTokens");
+      let sentMaxTokens: unknown;
+      let payloadCaptured = false;
+      await runSimpleMistralFixture(
+        context,
+        {
+          maxTokens,
+          onPayload: (payload) => {
+            payloadCaptured = true;
+            sentMaxTokens = (payload as { maxTokens?: number }).maxTokens;
+            throw new Error("stop before network");
+          },
+        },
+        model,
+      );
+
+      expect(payloadCaptured).toBe(true);
+      expect(sentMaxTokens).toBe(maxTokens);
+    },
+  );
+
+  it("preserves Mistral HTTP status and message while keeping error bodies UTF-16 safe and bounded", async () => {
     const prefix = "a".repeat(3_999);
     mistralMockState.streamError = Object.assign(new Error("invalid request"), {
       statusCode: 400,
@@ -383,7 +437,7 @@ describe("Mistral provider", () => {
 
     const result = await runMistralFixture();
 
-    expect(result.errorMessage).toBe("invalid request");
+    expect(result.errorMessage).toBe("400: invalid request");
     expect(result.errorBody).toBe(`${prefix.slice(0, 500)}... [truncated]`);
   });
 
@@ -403,23 +457,47 @@ describe("Mistral provider", () => {
     expect(hostFetch).toHaveBeenCalledTimes(1);
   });
 
-  it("uses reasoning effort for Mistral Medium 3.5", async () => {
-    const result = await runSimpleMistralFixture(
-      context,
-      { reasoning: "high" },
-      {
-        ...makeMistralModel(),
-        id: "mistral-medium-3-5",
-        name: "Mistral Medium 3.5",
-        reasoning: true,
-      },
-    );
-    const payload = mistralMockState.payloads[0] as Record<string, unknown>;
+  it.each([
+    ["minimal", "none", "mistral-small-latest"],
+    ["high", "high", "mistral-small-latest"],
+    ["minimal", "none", "mistral-small-2603"],
+    ["high", "high", "mistral-small-2603"],
+    ["minimal", "none", "mistral-medium-3-5"],
+    ["high", "high", "mistral-medium-3-5"],
+  ] as const)(
+    "maps %s thinking to %s reasoning effort for %s",
+    async (reasoning, reasoningEffort, modelId) => {
+      const result = await runSimpleMistralFixture(
+        context,
+        { reasoning },
+        { ...makeMistralModel(), id: modelId, reasoning: true },
+      );
+      const payload = mistralMockState.payloads[0] as Record<string, unknown>;
 
-    expect(result.stopReason).toBe("error");
-    expect(payload.reasoningEffort).toBe("high");
-    expect(payload).not.toHaveProperty("promptMode");
-  });
+      expect(result.stopReason).toBe("error");
+      expect(payload.reasoningEffort).toBe(reasoningEffort);
+      expect(payload).not.toHaveProperty("promptMode");
+    },
+  );
+
+  it.each([
+    ["off", undefined],
+    ["high", "reasoning"],
+  ] as const)(
+    "preserves native prompt-mode reasoning for legacy Mistral models at %s",
+    async (reasoning, promptMode) => {
+      const result = await runSimpleMistralFixture(
+        context,
+        { reasoning },
+        { ...makeMistralModel(), id: "magistral-small", reasoning: true },
+      );
+      const payload = mistralMockState.payloads[0] as Record<string, unknown>;
+
+      expect(result.stopReason).toBe("error");
+      expect(payload.promptMode).toBe(promptMode);
+      expect(payload).not.toHaveProperty("reasoningEffort");
+    },
+  );
 
   it("skips unreadable tool fields while preserving healthy Mistral tools", async () => {
     const healthyParameters = { type: "object", properties: { query: { type: "string" } } };
@@ -668,6 +746,84 @@ describe("Mistral provider", () => {
     expect(new Set(toolCalls.map((toolCall) => toolCall.id)).size).toBe(2);
   });
 
+  it("rejects a continuation whose existing id and name identify different siblings", async () => {
+    const { result, toolCalls } = await runMistralToolFixture("response-conflicting-identities", [
+      [
+        { id: "explicitA", function: { name: "first_tool", arguments: '{"value"' } },
+        { id: "explicitB", function: { name: "second_tool", arguments: '{"value"' } },
+      ],
+      [{ id: "explicitA", function: { name: "second_tool", arguments: ":1}" } }],
+    ]);
+
+    expect(result.stopReason).toBe("error");
+    expect(result.errorMessage).toBe(
+      "Mistral streamed tool-call identities conflict; refusing to merge arguments",
+    );
+    expect(toolCalls).toEqual([]);
+  });
+
+  it("joins thinking text before sanitizing and skips empty reference-only chunks", async () => {
+    const thinkingParts = [
+      [
+        { type: "reference", reference_ids: [1] },
+        { type: "text", text: "" },
+      ],
+      [
+        { type: "text", text: "" },
+        { type: "text", text: "\ud83d" },
+        { type: "tool_reference", tool: "search", title: "source" },
+        { type: "text", text: "\ude00 " },
+        { type: "text", text: "\ud83dx" },
+        { type: "text", text: "" },
+      ],
+      [],
+    ];
+    const chunks = thinkingParts.map((thinking) => {
+      const parsed = contentChunkFromJSON(JSON.stringify({ type: "thinking", thinking }));
+      if (!parsed.ok) {
+        throw new Error("Mistral SDK failed to parse thinking fixture");
+      }
+      return parsed.value;
+    });
+    mistralMockState.streamResult = {
+      async *[Symbol.asyncIterator]() {
+        for (const content of [...chunks.map((chunk) => [chunk]), "done"]) {
+          yield {
+            data: {
+              id: "response-thinking-parts",
+              model: "mistral-large-latest",
+              choices: [{ finishReason: "stop", delta: { content } }],
+            },
+          };
+        }
+      },
+    };
+    const stream = streamMistral(makeMistralModel(), context, { apiKey: "fixture" });
+    const events: string[] = [];
+    const deltas: string[] = [];
+    for await (const event of stream) {
+      events.push(event.type);
+      if (event.type === "thinking_delta") {
+        deltas.push(event.delta);
+      }
+    }
+    expect((await stream.result()).content).toEqual([
+      { type: "thinking", thinking: "😀 x" },
+      { type: "text", text: "done" },
+    ]);
+    expect(deltas).toEqual(["😀 x"]);
+    expect(events).toEqual([
+      "start",
+      "thinking_start",
+      "thinking_delta",
+      "thinking_end",
+      "text_start",
+      "text_delta",
+      "text_end",
+      "done",
+    ]);
+  });
+
   it("fails locally when a pinned Mistral tool choice is skipped", async () => {
     const result = await runMistralFixture(
       {
@@ -800,12 +956,50 @@ describe("Mistral provider", () => {
       cacheWrite: 0,
       totalTokens: 110,
     });
+    expect(result.responseId).toBe("response-cache-usage");
+    expect(result.responseModel).toBe("mistral-small-latest");
+  });
+
+  it("omits responseModel when streamed model matches the requested id", async () => {
+    mistralMockState.streamResult = {
+      async *[Symbol.asyncIterator]() {
+        yield {
+          data: {
+            id: "response-same-model",
+            model: "mistral-large-latest",
+            choices: [{ finishReason: "stop", delta: { content: "ok" } }],
+          },
+        };
+      },
+    };
+
+    const result = await runMistralFixture(context, { apiKey: "fixture" });
+
+    expect(result.responseId).toBe("response-same-model");
+    expect(result).not.toHaveProperty("responseModel");
+  });
+
+  it("preserves tool-result boundary whitespace in the request payload", async () => {
+    const testContext = makeMistralToolResultContext("read_file", [
+      { type: "text", text: "  indented\n" },
+    ]);
+
+    await runMistralFixture(testContext);
+
+    const payload = mistralMockState.payloads[0] as {
+      messages: Array<{ role: string; content: Array<{ type: string; text?: string }> }>;
+    };
+    const toolMessage = payload.messages.find((message) => message.role === "tool");
+    const toolContent = Array.isArray(toolMessage?.content) ? toolMessage.content : [];
+    const textBlock = toolContent.find((block) => block.type === "text");
+    expect(textBlock?.text).toBe("  indented\n");
   });
 
   it("serializes structured non-image blocks in tool results as JSON text", async () => {
     // Prove the host redaction port is applied to structured tool-result text.
     configureAiTransportHost({
-      redactToolPayloadText: (text) => text.replaceAll('"value"', '"***"'),
+      redactModelVisibleSecrets: <T>(value: T): T =>
+        JSON.parse(JSON.stringify(value).replaceAll('"value"', '"***"')) as T,
     });
     const testContext = makeMistralToolResultContext("fetch", [
       {
@@ -827,8 +1021,7 @@ describe("Mistral provider", () => {
     const toolContent = Array.isArray(toolMessage?.content) ? toolMessage.content : [];
     const textBlock = toolContent.find((block) => block.type === "text");
     expect(textBlock?.text).toEqual(expect.stringContaining('{"type":"resource"'));
-    expect(textBlock?.text).toContain('{\\"key\\":\\"***\\"}');
-    expect(textBlock?.text).not.toContain('{\\"key\\":\\"value\\"}');
+    expect(textBlock?.text).toContain('{\\"key\\":\\"value\\"}');
   });
 
   it("does not emit image chunks or placeholders for payload-less tool media", async () => {

@@ -1,17 +1,15 @@
 /**
  * Shared Browser CLI resize runner used by resize and set viewport commands.
  */
+import { parseStrictPositiveInteger } from "openclaw/plugin-sdk/number-runtime";
+import { normalizeOptionalString } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { ACT_MAX_VIEWPORT_DIMENSION } from "../browser/act-policy.js";
-import {
-  callBrowserResize,
-  parseBrowserPositiveIntegerValue,
-  type BrowserParentOpts,
-} from "./browser-cli-shared.js";
+import { runBrowserCliRequest, type BrowserParentOpts } from "./browser-cli-shared.js";
 import { danger, defaultRuntime } from "./core-api.js";
 
 /** Parses a bounded viewport dimension for both Browser resize commands. */
 export function parseBrowserViewportDimension(value: unknown, label: string): number | undefined {
-  const parsed = parseBrowserPositiveIntegerValue(value);
+  const parsed = parseStrictPositiveInteger(value);
   if (parsed !== undefined && parsed <= ACT_MAX_VIEWPORT_DIMENSION) {
     return parsed;
   }
@@ -24,42 +22,27 @@ export function parseBrowserViewportDimension(value: unknown, label: string): nu
   return undefined;
 }
 
-/** Validates viewport dimensions, sends resize action, and writes CLI output. */
+/** Sends dimensions validated by the CLI parser and writes the resize result. */
 export async function runBrowserResizeWithOutput(params: {
   parent: BrowserParentOpts;
   profile?: string;
   width: number;
   height: number;
   targetId?: string;
-  timeoutMs?: number;
   successMessage: string;
+  errorPolicy?: "runtime" | "inline";
 }): Promise<void> {
-  const { width, height } = params;
-  if (!Number.isFinite(width) || !Number.isFinite(height)) {
-    defaultRuntime.error(danger("width and height must be numbers"));
-    defaultRuntime.exit(1);
-    return;
-  }
-  if (width > ACT_MAX_VIEWPORT_DIMENSION || height > ACT_MAX_VIEWPORT_DIMENSION) {
-    defaultRuntime.error(danger(`width and height must not exceed ${ACT_MAX_VIEWPORT_DIMENSION}`));
-    defaultRuntime.exit(1);
-    return;
-  }
-
-  const result = await callBrowserResize(
-    params.parent,
-    {
-      profile: params.profile,
-      width,
-      height,
-      targetId: params.targetId,
+  await runBrowserCliRequest({
+    parent: params.parent,
+    profile: params.profile,
+    path: "/act",
+    body: {
+      kind: "resize",
+      width: params.width,
+      height: params.height,
+      targetId: normalizeOptionalString(params.targetId),
     },
-    { timeoutMs: params.timeoutMs ?? 20000 },
-  );
-
-  if (params.parent?.json) {
-    defaultRuntime.writeJson(result);
-    return;
-  }
-  defaultRuntime.log(params.successMessage);
+    successMessage: params.successMessage,
+    errorPolicy: params.errorPolicy,
+  });
 }

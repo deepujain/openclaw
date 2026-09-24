@@ -1,20 +1,11 @@
 // Gateway health route tests cover the machine-readable fast path and its error contract.
 import { describe, expect, it, vi } from "vitest";
+import { createNonExitingRuntimeEnv } from "../../test-utils/plugin-runtime-env.js";
 import { runGatewayHealthJsonRoute } from "./health-route.js";
-
-function createRuntime() {
-  return {
-    log: vi.fn(),
-    error: vi.fn(),
-    writeStdout: vi.fn(),
-    writeJson: vi.fn(),
-    exit: vi.fn(),
-  };
-}
 
 describe("runGatewayHealthJsonRoute", () => {
   it("writes successful JSON without loading error-only dependencies", async () => {
-    const runtime = createRuntime();
+    const runtime = createNonExitingRuntimeEnv();
     const callGateway = vi.fn(async () => ({ ok: true, durationMs: 6 }));
     const readNonObservingHealthConfig = vi.fn(async () => ({}));
     const emitReachableGatewayAuthDiagnostic = vi.fn(async () => false);
@@ -26,7 +17,7 @@ describe("runGatewayHealthJsonRoute", () => {
       {
         rpc: { json: true, timeout: "10000" },
       },
-      runtime as never,
+      runtime,
       {
         callGateway,
         readNonObservingHealthConfig,
@@ -52,7 +43,7 @@ describe("runGatewayHealthJsonRoute", () => {
   });
 
   it("projects a local port into the routed config", async () => {
-    const runtime = createRuntime();
+    const runtime = createNonExitingRuntimeEnv();
     const callGateway = vi.fn(async () => ({ ok: true }));
     const readNonObservingHealthConfig = vi.fn(async () => ({
       gateway: { auth: { mode: "token" as const } },
@@ -63,7 +54,7 @@ describe("runGatewayHealthJsonRoute", () => {
         rpc: { json: true, timeout: "10000" },
         localPortOverride: 19083,
       },
-      runtime as never,
+      runtime,
       { callGateway, readNonObservingHealthConfig },
     );
 
@@ -80,40 +71,42 @@ describe("runGatewayHealthJsonRoute", () => {
     );
   });
 
-  it("formats local config resolution failures", async () => {
-    const runtime = createRuntime();
+  it("leaves local config resolution failures to the root CLI renderer", async () => {
+    const runtime = createNonExitingRuntimeEnv();
     const error = new Error("config unavailable");
     const callGateway = vi.fn();
 
-    await runGatewayHealthJsonRoute(
-      {
-        rpc: { json: true, timeout: "10000" },
-        localPortOverride: 19083,
-      },
-      runtime as never,
-      {
-        callGateway,
-        readNonObservingHealthConfig: vi.fn(async () => {
-          throw error;
-        }),
-      },
-    );
+    await expect(
+      runGatewayHealthJsonRoute(
+        {
+          rpc: { json: true, timeout: "10000" },
+          localPortOverride: 19083,
+        },
+        runtime,
+        {
+          callGateway,
+          readNonObservingHealthConfig: vi.fn(async () => {
+            throw error;
+          }),
+        },
+      ),
+    ).rejects.toBe(error);
 
     expect(callGateway).not.toHaveBeenCalled();
     expect(runtime.writeJson).not.toHaveBeenCalled();
-    expect(runtime.error).toHaveBeenCalledWith(error.message);
-    expect(runtime.exit).toHaveBeenCalledWith(1);
+    expect(runtime.error).not.toHaveBeenCalled();
+    expect(runtime.exit).not.toHaveBeenCalled();
   });
 
   it("preserves structured transport errors", async () => {
-    const runtime = createRuntime();
+    const runtime = createNonExitingRuntimeEnv();
     const error = new Error("gateway unavailable");
     const callGateway = vi.fn(async () => {
       throw error;
     });
     const payload = { ok: false, error: { type: "gateway_transport_error" } };
 
-    await runGatewayHealthJsonRoute({ rpc: { json: true, timeout: "10000" } }, runtime as never, {
+    await runGatewayHealthJsonRoute({ rpc: { json: true, timeout: "10000" } }, runtime, {
       callGateway,
       readNonObservingHealthConfig: async () => ({}),
       emitReachableGatewayAuthDiagnostic: vi.fn(async () => false) as never,
@@ -127,7 +120,7 @@ describe("runGatewayHealthJsonRoute", () => {
   });
 
   it("preserves structured Gateway health request errors", async () => {
-    const runtime = createRuntime();
+    const runtime = createNonExitingRuntimeEnv();
     const error = new Error("health snapshot unavailable");
     const callGateway = vi.fn(async () => {
       throw error;
@@ -143,7 +136,7 @@ describe("runGatewayHealthJsonRoute", () => {
     const formatGatewayClientRequestErrorJson = vi.fn(() => payload);
     const formatGatewayTransportErrorJson = vi.fn();
 
-    await runGatewayHealthJsonRoute({ rpc: { json: true, timeout: "10000" } }, runtime as never, {
+    await runGatewayHealthJsonRoute({ rpc: { json: true, timeout: "10000" } }, runtime, {
       callGateway,
       readNonObservingHealthConfig: async () => ({}),
       emitReachableGatewayAuthDiagnostic: vi.fn(async () => false) as never,
@@ -159,7 +152,7 @@ describe("runGatewayHealthJsonRoute", () => {
   });
 
   it("preserves structured auth errors when reachability is unknown", async () => {
-    const runtime = createRuntime();
+    const runtime = createNonExitingRuntimeEnv();
     const error = new Error("gateway health requires credentials");
     const callGateway = vi.fn(async () => {
       throw error;
@@ -175,7 +168,7 @@ describe("runGatewayHealthJsonRoute", () => {
     const formatGatewayClientRequestErrorJson = vi.fn(() => null);
     const formatGatewayTransportErrorJson = vi.fn(() => null);
 
-    await runGatewayHealthJsonRoute({ rpc: { json: true, timeout: "10000" } }, runtime as never, {
+    await runGatewayHealthJsonRoute({ rpc: { json: true, timeout: "10000" } }, runtime, {
       callGateway,
       readNonObservingHealthConfig: async () => ({}),
       emitReachableGatewayAuthDiagnostic: vi.fn(async () => false) as never,

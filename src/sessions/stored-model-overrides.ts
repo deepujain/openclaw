@@ -1,12 +1,16 @@
 // Resolves persisted per-session model choices across child and parent sessions.
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import type { ModelFallbackRouteResolution } from "../agents/model-fallback.types.js";
+import type { ModelManifestNormalizationContext } from "../agents/model-ref-shared.js";
 import {
   normalizeStoredOverrideModel,
   resolvePersistedOverrideModelRef,
 } from "../agents/model-selection-persisted.js";
 import { resolveSessionParentSessionKey } from "../channels/plugins/session-conversation.js";
-import { resolveSessionModelOverrideRouteResolution } from "../config/sessions/model-override-provenance.js";
+import {
+  hasSessionActiveAutoModelFallback,
+  resolveSessionModelOverrideRouteResolution,
+} from "../config/sessions/model-override-provenance.js";
 import type { SessionEntry } from "../config/sessions/types.js";
 
 /** Model override loaded from the current session or its parent session. */
@@ -17,38 +21,54 @@ export type StoredModelOverride = {
   routeResolution: ModelFallbackRouteResolution;
 };
 
-function resolveStoredOverrideFromEntry(params: {
-  entry?: SessionEntry;
-  defaultProvider: string;
-  source: StoredModelOverride["source"];
-}): StoredModelOverride | null {
+function resolveStoredOverrideFromEntry(
+  params: {
+    entry?: SessionEntry;
+    defaultProvider: string;
+    source: StoredModelOverride["source"];
+    allowPluginNormalization?: boolean;
+  } & ModelManifestNormalizationContext,
+): StoredModelOverride | null {
+  if (params.entry?.modelOverrideSource === "default") {
+    return null;
+  }
+  const routeResolution = resolveSessionModelOverrideRouteResolution(params.entry);
   const normalized = normalizeStoredOverrideModel({
     providerOverride: params.entry?.providerOverride,
     modelOverride: params.entry?.modelOverride,
+    routeResolution,
   });
   const ref = resolvePersistedOverrideModelRef({
     defaultProvider: params.defaultProvider,
     overrideProvider: normalized.providerOverride,
     overrideModel: normalized.modelOverride,
+    routeResolution,
+    allowPluginNormalization: params.allowPluginNormalization,
+    manifestPlugins: params.manifestPlugins,
   });
   return ref
     ? {
         ...ref,
         source: params.source,
-        routeResolution: resolveSessionModelOverrideRouteResolution(params.entry),
+        routeResolution,
       }
     : null;
 }
 
 /** Resolves only the current session's persisted model override. */
-export function resolveDirectStoredModelOverride(params: {
-  sessionEntry?: SessionEntry;
-  defaultProvider: string;
-}): StoredModelOverride | null {
+export function resolveDirectStoredModelOverride(
+  params: {
+    sessionEntry?: SessionEntry;
+    defaultProvider: string;
+    allowPluginNormalization?: boolean;
+  } & ModelManifestNormalizationContext,
+): StoredModelOverride | null {
   return resolveStoredOverrideFromEntry({
     entry: params.sessionEntry,
     defaultProvider: params.defaultProvider,
     source: "session",
+    allowPluginNormalization: params.allowPluginNormalization,
+    manifestPlugins: params.manifestPlugins,
   });
 }
 
@@ -67,7 +87,7 @@ function resolveParentSessionKeyCandidate(params: {
   return null;
 }
 
-/** Resolves the persisted model override visible to the current session. */
+/** Keep prepared host metadata outside the published command resolver contract. */
 export function resolveStoredModelOverride(params: {
   loadSessionEntry?: (sessionKey: string) => SessionEntry | undefined;
   sessionEntry?: SessionEntry;
@@ -75,10 +95,39 @@ export function resolveStoredModelOverride(params: {
   sessionKey?: string;
   parentSessionKey?: string;
   defaultProvider: string;
+  allowPluginNormalization?: boolean;
 }): StoredModelOverride | null {
+  return resolveStoredModelOverrideCore({
+    loadSessionEntry: params.loadSessionEntry,
+    sessionEntry: params.sessionEntry,
+    sessionStore: params.sessionStore,
+    sessionKey: params.sessionKey,
+    parentSessionKey: params.parentSessionKey,
+    defaultProvider: params.defaultProvider,
+    allowPluginNormalization: params.allowPluginNormalization,
+  });
+}
+
+/** Resolves the persisted model override visible to the current session. */
+export function resolveStoredModelOverrideCore(
+  params: {
+    loadSessionEntry?: (sessionKey: string) => SessionEntry | undefined;
+    sessionEntry?: SessionEntry;
+    sessionStore?: Record<string, SessionEntry>;
+    sessionKey?: string;
+    parentSessionKey?: string;
+    defaultProvider: string;
+    allowPluginNormalization?: boolean;
+  } & ModelManifestNormalizationContext,
+): StoredModelOverride | null {
+  if (params.sessionEntry?.modelOverrideSource === "default") {
+    return null;
+  }
   const direct = resolveDirectStoredModelOverride({
     sessionEntry: params.sessionEntry,
     defaultProvider: params.defaultProvider,
+    allowPluginNormalization: params.allowPluginNormalization,
+    manifestPlugins: params.manifestPlugins,
   });
   if (direct) {
     return direct;
@@ -90,9 +139,15 @@ export function resolveStoredModelOverride(params: {
   if (!parentKey) {
     return null;
   }
+  const parentEntry = params.loadSessionEntry?.(parentKey) ?? params.sessionStore?.[parentKey];
+  if (hasSessionActiveAutoModelFallback(parentEntry)) {
+    return null;
+  }
   return resolveStoredOverrideFromEntry({
-    entry: params.loadSessionEntry?.(parentKey) ?? params.sessionStore?.[parentKey],
+    entry: parentEntry,
     defaultProvider: params.defaultProvider,
     source: "parent",
+    allowPluginNormalization: params.allowPluginNormalization,
+    manifestPlugins: params.manifestPlugins,
   });
 }

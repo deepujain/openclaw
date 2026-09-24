@@ -1,6 +1,6 @@
-// Discord plugin module implements message handler.context behavior.
 import {
   buildChannelInboundEventContext,
+  createCommandTurnContext,
   formatInboundEnvelope,
   formatInboundMediaUnavailableText,
   resolveEnvelopeFormatOptions,
@@ -10,6 +10,7 @@ import {
 import { resolveChannelContextVisibilityMode } from "openclaw/plugin-sdk/context-visibility-runtime";
 import { resolvePinnedMainDmOwnerFromAllowlist } from "openclaw/plugin-sdk/conversation-runtime";
 import { isDangerousNameMatchingEnabled } from "openclaw/plugin-sdk/dangerous-name-runtime";
+import { formatAudioTranscriptForAgent } from "openclaw/plugin-sdk/media-understanding-runtime";
 import {
   buildHistoryContextFromEntries,
   buildInboundHistoryFromEntries,
@@ -18,7 +19,11 @@ import {
 import { buildAgentSessionKey, resolveThreadSessionKeys } from "openclaw/plugin-sdk/routing";
 import { danger, logVerbose, shouldLogVerbose } from "openclaw/plugin-sdk/runtime-env";
 import { evaluateSupplementalContextVisibility } from "openclaw/plugin-sdk/security-runtime";
-import { readSessionUpdatedAt, resolveStorePath } from "openclaw/plugin-sdk/session-store-runtime";
+import {
+  getSessionEntry,
+  readSessionUpdatedAt,
+  resolveStorePath,
+} from "openclaw/plugin-sdk/session-store-runtime";
 import { truncateUtf16Safe } from "openclaw/plugin-sdk/text-utility-runtime";
 import { resolveDiscordConversationIdentity } from "../conversation-identity.js";
 import { ChannelType } from "../internal/discord.js";
@@ -28,20 +33,22 @@ import {
   buildDiscordInboundAccessContext,
   createDiscordSupplementalContextAccessChecker,
 } from "./inbound-context.js";
-import { resolveDiscordMessageStickers } from "./message-forwarded.js";
+import {
+  resolveDiscordMessageStickers,
+  resolveDiscordReferencedReplyMessageId,
+} from "./message-forwarded.js";
 import {
   createDiscordHistorySenderProvenance,
   filterDiscordHistoryEntriesForContext,
+  resolveDiscordHistoryMediaIds,
   type DiscordHistoryEntry,
 } from "./message-handler.history.js";
 import type { DiscordMessagePreflightContext } from "./message-handler.preflight.js";
+import { recoverDiscordChannelHistory } from "./message-handler.recent-history.js";
 import { removeDiscordReplayHistoryEntry } from "./message-handler.retry.js";
-import {
-  formatDiscordMediaText,
-  resolveReferencedReplyMediaList,
-  resolveDiscordMessageText,
-  type DiscordMediaInfo,
-} from "./message-utils.js";
+import { formatDiscordMediaText, resolveReferencedReplyMediaList } from "./message-media.js";
+import type { DiscordMediaInfo } from "./message-media.js";
+import { resolveDiscordMessageText } from "./message-text.js";
 import { buildDirectLabel, buildGuildLabel, resolveReplyContext } from "./reply-context.js";
 import { buildDiscordRoutePeer } from "./route-resolution.js";
 import { resolveDiscordAutoThreadReplyPlan, resolveDiscordThreadStarter } from "./threading.js";
@@ -54,10 +61,6 @@ function normalizeDiscordDmOwnerEntry(entry: string): string | undefined {
   const normalized = normalizeDiscordAllowList([entry], ["discord:", "user:", "pk:"]);
   const candidate = normalized?.ids.values().next().value;
   return typeof candidate === "string" && /^\d+$/.test(candidate) ? candidate : undefined;
-}
-
-function isContextAborted(abortSignal?: AbortSignal): boolean {
-  return Boolean(abortSignal?.aborted);
 }
 
 export async function buildDiscordMessageProcessContext(params: {
@@ -106,8 +109,12 @@ export async function buildDiscordMessageProcessContext(params: {
     boundSessionKey,
     route,
     commandAuthorized,
+    hasControlCommand,
     resolveChannelIngress,
   } = ctx;
+  if (abortSignal?.aborted || ctx.isPolicyCurrent?.() === false) {
+    return null;
+  }
 
   const fromLabel = isDirectMessage
     ? buildDirectLabel(author)
@@ -165,10 +172,44 @@ export async function buildDiscordMessageProcessContext(params: {
     agentId: route.agentId,
   });
   const envelopeOptions = resolveEnvelopeFormatOptions(cfg);
-  const previousTimestamp = readSessionUpdatedAt({
+  const routeSession = getSessionEntry({
+    agentId: route.agentId,
     storePath,
     sessionKey: route.sessionKey,
+    readConsistency: "latest",
   });
+  const previousTimestamp = routeSession?.updatedAt;
+  const shouldIncludeChannelHistory =
+    !isDirectMessage &&
+    (ctx.inboundEventKind === "room_event" ||
+      !(isGuildMessage && channelConfig?.autoThread && !threadChannel));
+  const recoversHistory = shouldIncludeChannelHistory && isGuildMessage && historyLimit > 0;
+  const historySessionScope = {
+    agentId: route.agentId,
+    storePath,
+    sessionKey: boundSessionKey ?? route.sessionKey,
+    readConsistency: "latest" as const,
+  };
+  const historySession = recoversHistory
+    ? historySessionScope.sessionKey === route.sessionKey
+      ? routeSession
+      : getSessionEntry(historySessionScope)
+    : undefined;
+  const isHistoryCurrent = () => {
+    if (abortSignal?.aborted || ctx.isPolicyCurrent?.() === false) {
+      return false;
+    }
+    if (!recoversHistory) {
+      return true;
+    }
+    const current = getSessionEntry(historySessionScope);
+    return (
+      current?.sessionId === historySession?.sessionId &&
+      current?.lifecycleRevision === historySession?.lifecycleRevision &&
+      current?.sessionStartedAt === historySession?.sessionStartedAt &&
+      (current?.updatedAt === 0) === (historySession?.updatedAt === 0)
+    );
+  };
   const channelHistory = createChannelHistoryWindow({ historyMap: guildHistories });
   let visibleChannelHistory: DiscordHistoryEntry[] | undefined;
   // Failed downloads (CDN error, SSRF block, size cap, timeout) produce
@@ -184,6 +225,12 @@ export async function buildDiscordMessageProcessContext(params: {
         })
       : body;
   const bodyWithMediaNotice = appendMediaUnavailableNotice(text) ?? text;
+  // Keep prepared message content separate from command provenance; machine
+  // transcriptions are always labeled untrusted for the model.
+  const agentFacingBody =
+    preflightAudioTranscript !== undefined
+      ? formatAudioTranscriptForAgent(preflightAudioTranscript)
+      : text;
   let combinedBody = formatInboundEnvelope({
     channel: "Discord",
     from: fromLabel,
@@ -194,27 +241,34 @@ export async function buildDiscordMessageProcessContext(params: {
     previousTimestamp,
     envelope: envelopeOptions,
   });
-  const shouldIncludeChannelHistory =
-    !isDirectMessage &&
-    (ctx.inboundEventKind === "room_event" ||
-      !(isGuildMessage && channelConfig?.autoThread && !threadChannel));
   if (shouldIncludeChannelHistory) {
     removeDiscordReplayHistoryEntry(guildHistories, messageChannelId, message.id);
     if (historyLimit > 0) {
-      const filteredHistory = filterDiscordHistoryEntriesForContext({
-        entries: guildHistories.get(messageChannelId) ?? [],
-        mode: contextVisibilityMode,
-        isSenderAllowed: isSupplementalContextSenderAllowed,
-      });
-      visibleChannelHistory = filteredHistory.entries;
-      if (filteredHistory.omitted > 0) {
-        logVerbose(
-          `discord: omit ${filteredHistory.omitted} pending history entries (mode=${contextVisibilityMode})`,
-        );
+      if (isGuildMessage) {
+        visibleChannelHistory =
+          historySession?.updatedAt === 0
+            ? []
+            : await recoverDiscordChannelHistory({
+                ctx,
+                sessionStartedAt: historySession?.sessionStartedAt,
+                isCurrent: isHistoryCurrent,
+                mode: contextVisibilityMode,
+                isSenderAllowed: isSupplementalContextSenderAllowed,
+              });
+      } else {
+        visibleChannelHistory = filterDiscordHistoryEntriesForContext({
+          entries: guildHistories.get(messageChannelId) ?? [],
+          mode: contextVisibilityMode,
+          isSenderAllowed: isSupplementalContextSenderAllowed,
+        }).entries.slice(-historyLimit);
+      }
+      if (!isHistoryCurrent()) {
+        return null;
       }
       combinedBody = buildHistoryContextFromEntries({
         entries: visibleChannelHistory,
         currentMessage: combinedBody,
+        historyKind: isGuildMessage ? "recent" : "pending",
         formatEntry: (entry) =>
           formatInboundEnvelope({
             channel: "Discord",
@@ -238,14 +292,6 @@ export async function buildDiscordMessageProcessContext(params: {
         memberRoleIds: replyContext.memberRoleIds,
       })
     : true;
-  const replyVisible = evaluateSupplementalContextVisibility({
-    mode: contextVisibilityMode,
-    kind: "quote",
-    senderAllowed: replySenderAllowed,
-  }).include;
-  if (replyContext && !replyVisible && isGuildMessage) {
-    logVerbose(`discord: drop reply context (mode=${contextVisibilityMode})`);
-  }
   if (forumContextLine) {
     combinedBody = `${combinedBody}\n${forumContextLine}`;
   }
@@ -260,10 +306,14 @@ export async function buildDiscordMessageProcessContext(params: {
       const starter = await resolveDiscordThreadStarter({
         channel: threadChannel,
         client,
+        accountId,
         parentId: threadParentId,
         parentType: threadParentType,
         resolveTimestampMs,
       });
+      if (!isHistoryCurrent()) {
+        return null;
+      }
       if (starter?.text) {
         const starterVisibility = evaluateSupplementalContextVisibility({
           mode: contextVisibilityMode,
@@ -308,6 +358,9 @@ export async function buildDiscordMessageProcessContext(params: {
     parentSessionKey,
     useSuffix: false,
   });
+  if (!isHistoryCurrent()) {
+    return null;
+  }
   const replyPlan = await resolveDiscordAutoThreadReplyPlan({
     client,
     message,
@@ -328,6 +381,9 @@ export async function buildDiscordMessageProcessContext(params: {
     groupScope: route.groupScope,
     threadParentInheritanceEnabled,
   });
+  if (!isHistoryCurrent()) {
+    return null;
+  }
   const deliverTarget = replyPlan.deliverTarget;
   const replyTarget = replyPlan.replyTarget;
   const replyReference = replyPlan.replyReference;
@@ -375,6 +431,7 @@ export async function buildDiscordMessageProcessContext(params: {
     {
       agentId: route.agentId,
       sessionKey: effectiveSessionKey,
+      nativeChannelId: messageChannelId,
       messageId: canonicalMessageId ?? message.id,
       inboundEventKind: ctx.inboundEventKind,
     },
@@ -383,6 +440,9 @@ export async function buildDiscordMessageProcessContext(params: {
       threadId: threadChannel?.id ?? autoThreadContext?.createdThreadId ?? undefined,
     },
   );
+  if (!isHistoryCurrent()) {
+    return null;
+  }
 
   const ctxPayload = await (ctx.buildContext ?? buildChannelInboundEventContext)({
     channelIngress,
@@ -423,9 +483,7 @@ export async function buildDiscordMessageProcessContext(params: {
       threadId: threadChannel?.id ?? autoThreadContext?.createdThreadId ?? undefined,
     },
     route: {
-      agentId: route.agentId,
-      dmScope: route.dmScope,
-      accountId: route.accountId,
+      ...route,
       routeSessionKey: route.sessionKey,
       dispatchSessionKey: effectiveSessionKey,
       parentSessionKey: autoThreadContext?.ParentSessionKey ?? threadKeys.parentSessionKey,
@@ -434,20 +492,24 @@ export async function buildDiscordMessageProcessContext(params: {
     },
     reply: {
       to: effectiveTo,
+      replyToId: resolveDiscordReferencedReplyMessageId(message) ?? undefined,
       ...(originatingTo !== effectiveTo ? { originatingTo } : {}),
     },
     message: {
       inboundEventKind: ctx.inboundEventKind,
       body: combinedBody,
-      rawBody: preflightAudioTranscript ?? baseText,
+      // RawBody/CommandBody keep only the typed text so machine-generated
+      // transcripts never enter command classification (telegram/whatsapp parity).
+      rawBody: baseText,
       // BodyForAgent wins over Body for the model's text, so the notice has to
-      // ride the agent-facing source too — keeping transcript precedence.
-      bodyForAgent: appendMediaUnavailableNotice(preflightAudioTranscript ?? baseText ?? text),
-      commandBody: preflightAudioTranscript ?? baseText,
+      // ride the agent-facing source too.
+      bodyForAgent: appendMediaUnavailableNotice(agentFacingBody),
+      commandBody: baseText,
       inboundHistory,
     },
     sessionTranscript: {
       historyLimit: shouldIncludeChannelHistory ? historyLimit : 0,
+      historyKind: isGuildMessage ? "recent" : "pending",
     },
     access: {
       mentions: {
@@ -461,44 +523,41 @@ export async function buildDiscordMessageProcessContext(params: {
         authorized: commandAuthorized,
       },
     },
-    commandTurn: {
-      kind: "text-slash" as const,
-      source: "text" as const,
+    commandTurn: createCommandTurnContext(hasControlCommand ? "text" : "message", {
       authorized: commandAuthorized,
-      body: preflightAudioTranscript ?? baseText,
-    },
+      body: baseText,
+    }),
     media: await toInboundMediaFactsWithMetadata(mediaList, {
       transcribed: (_media, index) => index === preflightAudioIndex,
     }),
     supplemental: {
-      quote:
-        replyContext && replyVisible
-          ? {
-              id: replyContext.id,
-              body: replyContext.body,
-              sender: replyContext.sender,
-              senderAllowed: replySenderAllowed,
-              isSelf: Boolean(botUserId && replyContext.senderId === botUserId),
-              media: async () => {
-                const referencedReplyMediaList = await resolveReferencedReplyMediaList(
-                  message,
-                  mediaMaxBytes,
-                  {
-                    fetchImpl: discordRestFetch,
-                    ssrfPolicy: cfg.browser?.ssrfPolicy,
-                    readIdleTimeoutMs: DISCORD_ATTACHMENT_IDLE_TIMEOUT_MS,
-                    totalTimeoutMs: DISCORD_ATTACHMENT_TOTAL_TIMEOUT_MS,
-                    abortSignal,
-                  },
-                );
-                return isContextAborted(abortSignal)
-                  ? []
-                  : await toInboundMediaFactsWithMetadata(referencedReplyMediaList, {
-                      messageId: replyContext.id,
-                    });
-              },
-            }
-          : undefined,
+      quote: replyContext
+        ? {
+            id: replyContext.id,
+            body: replyContext.body,
+            sender: replyContext.sender,
+            senderAllowed: replySenderAllowed,
+            isSelf: Boolean(botUserId && replyContext.senderId === botUserId),
+            media: async () => {
+              const referencedReplyMediaList = await resolveReferencedReplyMediaList(
+                message,
+                mediaMaxBytes,
+                {
+                  fetchImpl: discordRestFetch,
+                  ssrfPolicy: cfg.browser?.ssrfPolicy,
+                  readIdleTimeoutMs: DISCORD_ATTACHMENT_IDLE_TIMEOUT_MS,
+                  totalTimeoutMs: DISCORD_ATTACHMENT_TOTAL_TIMEOUT_MS,
+                  abortSignal,
+                },
+              );
+              return abortSignal?.aborted
+                ? []
+                : await toInboundMediaFactsWithMetadata(referencedReplyMediaList, {
+                    messageId: replyContext.id,
+                  });
+            },
+          }
+        : undefined,
       thread: {
         starterBody: !effectivePreviousTimestamp ? threadStarterBody : undefined,
         label: threadLabel,
@@ -507,6 +566,7 @@ export async function buildDiscordMessageProcessContext(params: {
       groupSystemPrompt: isGuildMessage ? groupSystemPrompt : undefined,
     },
     extra: {
+      GroupThread: ctx.groupThread,
       ...(preflightAudioTranscript !== undefined ? { Transcript: preflightAudioTranscript } : {}),
       GroupSubject: isDirectMessage ? undefined : groupChannel,
       GroupChannel: groupChannel,
@@ -515,6 +575,9 @@ export async function buildDiscordMessageProcessContext(params: {
       OwnerAllowFrom: ownerAllowFrom,
     },
   });
+  if (!isHistoryCurrent()) {
+    return null;
+  }
   const persistedSessionKey = ctxPayload.SessionKey ?? route.sessionKey;
   if (ctx.inboundEventKind === "room_event" && shouldIncludeChannelHistory) {
     const nativeMediaText = formatDiscordMediaText({
@@ -530,6 +593,7 @@ export async function buildDiscordMessageProcessContext(params: {
         body: historyText,
         timestamp: resolveTimestampMs(message.timestamp),
         messageId: message.id,
+        mediaIds: resolveDiscordHistoryMediaIds(message),
         senderProvenance: createDiscordHistorySenderProvenance({
           sender,
           memberRoleIds,

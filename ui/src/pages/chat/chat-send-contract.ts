@@ -1,8 +1,16 @@
+import type { ChatWorkContext } from "../../../../packages/gateway-protocol/src/chat-work-context.js";
 import type { GatewayBrowserClient, GatewayHelloOk } from "../../api/gateway.ts";
 import type { AgentsListResult } from "../../api/types.ts";
+import type { ApplicationChatSubmissions } from "../../app/chat-submissions.ts";
 import type { CommandClientPresentationAction } from "../../app/command-client-presentation.ts";
 import type { UiSettings } from "../../app/settings.ts";
-import type { ChatAttachment, ChatQueueItem } from "../../lib/chat/chat-types.ts";
+import type { AuthenticatedUser } from "../../app/user-profile.ts";
+import type {
+  ChatAttachment,
+  ChatGoalDraftMode,
+  ChatQueueItem,
+  HumanMention,
+} from "../../lib/chat/chat-types.ts";
 import type { ControlUiFollowUpMode } from "../../lib/chat/follow-up-mode.ts";
 import type { SessionCapability, SessionRefreshTarget } from "../../lib/sessions/index.ts";
 import type { ChatCommandHost } from "./chat-commands.ts";
@@ -10,11 +18,17 @@ import type { ChatRunStartupState } from "./chat-run-startup.ts";
 import type { ChatSendTimingEntry } from "./chat-send-ack.ts";
 import type { ChatInputHistoryState } from "./input-history.ts";
 import type { QueuedMessageEdit } from "./queued-message-edit.ts";
+import type { ChatRunError } from "./run-lifecycle.ts";
 import type { ChatScrollHost } from "./scroll.ts";
-import type { ToolStreamHost } from "./tool-stream.ts";
+import type { ToolStreamHost } from "./tool-stream-contract.ts";
 
 type ChatAgentsListSnapshot = Partial<Omit<AgentsListResult, "agents">> & {
   agents?: AgentsListResult["agents"];
+};
+
+export type ChatComposerRecoveryOwner = {
+  resolveOwner: () => ChatHost | undefined;
+  retainedAttachmentIds: (attachments: readonly ChatAttachment[]) => ReadonlySet<string>;
 };
 
 export type ChatHost = ChatInputHistoryState &
@@ -22,6 +36,9 @@ export type ChatHost = ChatInputHistoryState &
   ToolStreamHost &
   ChatCommandHost & {
     sessions: SessionCapability;
+    chatSubmissions: ApplicationChatSubmissions;
+    /** Initial placement owns admission even while transport loss hides its content. */
+    hasPendingInitialTurn?: (sessionKey: string) => boolean;
     client: GatewayBrowserClient | null;
     connected: boolean;
     connectionEpoch: number;
@@ -29,11 +46,19 @@ export type ChatHost = ChatInputHistoryState &
     reconnectResumeSessionId?: string | null;
     chatLoading: boolean;
     chatMessage: string;
+    canRestoreComposer?: () => boolean;
+    /** Captures this composer's identity while its presentation may hand ownership off. */
+    captureComposerRecoveryOwner?: () => ChatComposerRecoveryOwner | undefined;
+    chatMentions?: readonly HumanMention[];
+    /** Captured once at submit; queued delivery never re-reads the current page. */
+    getWorkContext?: () => ChatWorkContext | undefined;
+    chatGoalDraftMode?: ChatGoalDraftMode | null;
     chatMessages: unknown[];
     chatThinkingLevel: string | null;
     chatVerboseLevel: string | null;
     chatStreamStartedAt: number | null;
     chatAttachments: ChatAttachment[];
+    selectedChatSessionIncognito?: boolean;
     chatQueue: ChatQueueItem[];
     /** Pane-local row draft while a queued message remains held in the outbox. */
     chatQueuedEdit?: QueuedMessageEdit | null;
@@ -41,16 +66,16 @@ export type ChatHost = ChatInputHistoryState &
     chatDisplayedLeafEntryId?: string | null;
     chatRunId: string | null;
     chatRunStartup?: ChatRunStartupState | null;
-    chatRunUsageById?: Map<string, number>;
     chatSending: boolean;
     chatSendingScopeKey?: string | null;
-    chatRunError?: { summary: string } | null;
+    chatRunError?: ChatRunError | null;
     lastError: string | null;
     chatError?: string | null;
     hello: GatewayHelloOk | null;
+    selfUser?: AuthenticatedUser | null;
     requestUpdate?: () => void;
     refreshSessionsAfterChat: Map<string, SessionRefreshTarget>;
-    chatSubmitGuards?: Map<string, Promise<void>>;
+    chatSubmitGuards?: Set<string>;
     chatSendTimingsByRun?: Map<string, ChatSendTimingEntry>;
     eventLogBuffer?: unknown[];
     assistantAgentId?: string | null;

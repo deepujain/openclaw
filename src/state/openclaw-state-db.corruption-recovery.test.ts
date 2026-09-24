@@ -2,17 +2,17 @@
 import fs from "node:fs";
 import path from "node:path";
 import type { DatabaseSync } from "node:sqlite";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
 import { executeSqliteQuerySync, getNodeSqliteKysely } from "../infra/kysely-sync.js";
 import { requireNodeSqlite } from "../infra/node-sqlite.js";
-import { isSqliteCorruptionError } from "../infra/sqlite-transaction.js";
+import { isSqliteCorruptionError } from "../infra/sqlite-error-diagnostics.js";
+import { createSqliteWalReclamationResult } from "../infra/sqlite-wal-reclamation.js";
+import { openClawStateDatabaseCache } from "./openclaw-state-db-cache.js";
 import { withOpenClawStateDatabaseReadOnly } from "./openclaw-state-db-readonly.js";
 import type { DB as OpenClawStateKyselyDatabase } from "./openclaw-state-db.generated.js";
 import {
   closeOpenClawStateDatabaseForTest,
-  evictOpenClawStateDatabaseAfterCorruption,
-  getOpenClawStateDatabaseIfOpen,
   openOpenClawStateDatabase,
   runOpenClawStateWriteTransaction,
 } from "./openclaw-state-db.js";
@@ -176,21 +176,23 @@ describe("shared state write transaction corruption recovery", () => {
     const walBytesBeforeEviction = fs.statSync(walPath).size;
     const { DatabaseSync } = requireNodeSqlite();
     const peer = new DatabaseSync(cached.path);
+    const close = vi.spyOn(cached.walMaintenance, "close");
 
     try {
       peer.exec("BEGIN;");
       peer.prepare("SELECT count(*) FROM diagnostic_events").get();
-      const evictionStartedAt = performance.now();
       expect(
-        evictOpenClawStateDatabaseAfterCorruption(
+        openClawStateDatabaseCache.evictOpenClawStateDatabaseAfterCorruption(
           cached,
           sqliteError("database disk image is malformed", 11),
         ),
       ).toBe(true);
-      const evictionElapsedMs = performance.now() - evictionStartedAt;
 
-      expect(getOpenClawStateDatabaseIfOpen({ env })).toBeUndefined();
-      expect(evictionElapsedMs).toBeLessThan(250);
+      expect(
+        openClawStateDatabaseCache.getOpenClawStateDatabaseIfOpenAtPath(cached.path),
+      ).toBeUndefined();
+      expect(close).toHaveBeenCalledTimes(1);
+      expect(close).toHaveBeenCalledWith({ checkpointMode: "PASSIVE" });
       expect(fs.statSync(walPath).size).toBe(walBytesBeforeEviction);
       expect(peer.prepare("PRAGMA quick_check").get()).toEqual({ quick_check: "ok" });
       expect(
@@ -207,7 +209,9 @@ describe("shared state write transaction corruption recovery", () => {
     const { databasePath, healthySnapshot, poisoned } = prepareCorruptedCachedDatabase(env);
 
     expectNotADatabaseError(() => insertProbeEvent(env, "during-corruption"));
-    expect(getOpenClawStateDatabaseIfOpen({ env })).toBeUndefined();
+    expect(
+      openClawStateDatabaseCache.getOpenClawStateDatabaseIfOpenAtPath(databasePath),
+    ).toBeUndefined();
 
     fs.writeFileSync(databasePath, healthySnapshot);
 
@@ -227,6 +231,7 @@ describe("shared state write transaction corruption recovery", () => {
       path: cached.path,
       walMaintenance: {
         checkpoint: () => false,
+        reclaimFreePages: createSqliteWalReclamationResult,
         close: () => false,
       },
     };
@@ -241,7 +246,9 @@ describe("shared state write transaction corruption recovery", () => {
         ),
       ).toThrow(/file is not a database/u);
 
-      expect(getOpenClawStateDatabaseIfOpen({ env })).toBe(cached);
+      expect(openClawStateDatabaseCache.getOpenClawStateDatabaseIfOpenAtPath(cached.path)).toBe(
+        cached,
+      );
       expect(cached.db.isOpen).toBe(true);
       expect(injectedDb.isOpen).toBe(true);
     } finally {
@@ -262,7 +269,9 @@ describe("shared state write transaction corruption recovery", () => {
       ),
     ).toThrow(/database is locked/u);
 
-    expect(getOpenClawStateDatabaseIfOpen({ env })).toBe(cached);
+    expect(openClawStateDatabaseCache.getOpenClawStateDatabaseIfOpenAtPath(cached.path)).toBe(
+      cached,
+    );
   });
 });
 
@@ -272,7 +281,9 @@ describe("shared state read corruption recovery", () => {
     const { databasePath, healthySnapshot, poisoned } = prepareCorruptedCachedDatabase(env);
 
     expectNotADatabaseError(() => readProbeEventKeys(poisoned));
-    expect(getOpenClawStateDatabaseIfOpen({ env })).toBeUndefined();
+    expect(
+      openClawStateDatabaseCache.getOpenClawStateDatabaseIfOpenAtPath(databasePath),
+    ).toBeUndefined();
 
     fs.writeFileSync(databasePath, healthySnapshot);
 
@@ -291,7 +302,9 @@ describe("shared state read corruption recovery", () => {
         { env },
       ),
     );
-    expect(getOpenClawStateDatabaseIfOpen({ env })).toBeUndefined();
+    expect(
+      openClawStateDatabaseCache.getOpenClawStateDatabaseIfOpenAtPath(databasePath),
+    ).toBeUndefined();
 
     fs.writeFileSync(databasePath, healthySnapshot);
 

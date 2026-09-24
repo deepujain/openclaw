@@ -92,6 +92,10 @@ const DEFAULT_TRANSCRIPT_READ_MAX_LINES = 2_000;
 const DEFAULT_TRANSCRIPT_READ_MAX_BYTES = 50 * 1024 * 1024;
 const TIMEOUT_PARTIAL_DATA_GRACE_MS = 500;
 const HOOK_TIMEOUT_RECOVERY_GRACE_MS = TIMEOUT_PARTIAL_DATA_GRACE_MS + 1_000;
+// Optional trigger lookup must give up strictly before the preflight
+// watchdog fires, or the watchdog skips the whole invocation instead of
+// letting model recall continue without trigger context.
+const TRIGGER_LOOKUP_SETTLE_RESERVE_MS = 50;
 const MAX_ACTIVE_MEMORY_SEARCH_QUERY_CHARS = 480;
 const TERMINAL_MEMORY_SEARCH_POLL_INTERVAL_MS = 25;
 
@@ -128,42 +132,10 @@ const RECALLED_CONTEXT_LINE_PATTERNS = [
   /^active memory:/i,
 ];
 
-type ActiveRecallPluginConfig = {
-  enabled?: boolean;
-  mode?: ActiveMemoryMode;
-  agents?: string[];
-  model?: string;
-  modelFallback?: string;
+type ActiveRecallPluginConfig = Partial<
+  Omit<ResolvedActiveRecallPluginConfig, "timeoutMsIsDefault">
+> & {
   modelFallbackPolicy?: "default-remote" | "resolved-only";
-  allowedChatTypes?: Array<"direct" | "group" | "channel" | "explicit">;
-  allowedChatIds?: string[];
-  deniedChatIds?: string[];
-  thinking?: ActiveMemoryThinkingLevel;
-  fastMode?: ActiveMemoryFastMode;
-  promptStyle?:
-    | "balanced"
-    | "strict"
-    | "contextual"
-    | "recall-heavy"
-    | "precision-heavy"
-    | "preference-only";
-  toolsAllow?: string[];
-  promptOverride?: string;
-  promptAppend?: string;
-  timeoutMs?: number;
-  setupGraceTimeoutMs?: number;
-  queryMode?: "message" | "recent" | "full";
-  maxSummaryChars?: number;
-  recentUserTurns?: number;
-  recentAssistantTurns?: number;
-  recentUserChars?: number;
-  recentAssistantChars?: number;
-  logging?: boolean;
-  cacheTtlMs?: number;
-  circuitBreakerMaxTimeouts?: number;
-  circuitBreakerCooldownMs?: number;
-  persistTranscripts?: boolean;
-  transcriptDir?: string;
 };
 
 type ResolvedActiveRecallPluginConfig = {
@@ -172,19 +144,12 @@ type ResolvedActiveRecallPluginConfig = {
   agents: string[];
   model?: string;
   modelFallback?: string;
-  modelFallbackPolicy: "default-remote" | "resolved-only";
-  allowedChatTypes: Array<"direct" | "group" | "channel" | "explicit">;
+  allowedChatTypes: ActiveMemoryChatType[];
   allowedChatIds: string[];
   deniedChatIds: string[];
   thinking: ActiveMemoryThinkingLevel;
   fastMode?: ActiveMemoryFastMode;
-  promptStyle:
-    | "balanced"
-    | "strict"
-    | "contextual"
-    | "recall-heavy"
-    | "precision-heavy"
-    | "preference-only";
+  promptStyle: ActiveMemoryPromptStyle;
   toolsAllow: string[];
   promptOverride?: string;
   promptAppend?: string;
@@ -228,31 +193,31 @@ type ActiveMemorySearchDebug = {
   error?: string;
 };
 
-type ActiveRecallResult =
+type ActiveRecallResult = {
+  elapsedMs: number;
+  searchDebug?: ActiveMemorySearchDebug;
+} & (
   | {
       status: "empty" | "failed" | "no_relevant_memory" | "timeout" | "unavailable";
-      elapsedMs: number;
       summary: string | null;
-      searchDebug?: ActiveMemorySearchDebug;
     }
   | {
       status: "timeout_partial";
-      elapsedMs: number;
       summary: string;
-      searchDebug?: ActiveMemorySearchDebug;
     }
   | {
       status: "ok";
-      elapsedMs: number;
       rawReply: string;
       summary: string;
-      searchDebug?: ActiveMemorySearchDebug;
-    };
+    }
+);
+
+type ActiveMemoryPartialTimeoutData = Partial<RecallSubagentResult> & {
+  cleanupFailed?: boolean;
+};
 
 type ActiveMemoryPartialTimeoutError = Error & {
-  activeMemoryPartialReply?: string;
-  activeMemorySearchDebug?: ActiveMemorySearchDebug;
-  activeMemoryUnavailableMemorySearch?: boolean;
+  activeMemoryPartialData?: ActiveMemoryPartialTimeoutData;
 };
 
 type TranscriptReadLimits = {
@@ -261,15 +226,7 @@ type TranscriptReadLimits = {
   maxBytes?: number;
 };
 
-type ActiveMemoryTranscriptSource =
-  | {
-      kind: "runtime";
-      target: SessionTranscriptTargetParams;
-    }
-  | {
-      kind: "file";
-      sessionFile: string;
-    };
+type ActiveMemoryTranscriptSource = SessionTranscriptTargetParams;
 
 type RecallSubagentResult = {
   rawReply: string;
@@ -368,6 +325,7 @@ export {
   DEFAULT_TRANSCRIPT_READ_MAX_BYTES,
   DEFAULT_TRANSCRIPT_READ_MAX_LINES,
   HOOK_TIMEOUT_RECOVERY_GRACE_MS,
+  TRIGGER_LOOKUP_SETTLE_RESERVE_MS,
   LANCEDB_ACTIVE_MEMORY_TOOLS_ALLOW,
   MAX_ACTIVE_MEMORY_SEARCH_QUERY_CHARS,
   MAX_ACTIVE_MEMORY_TOOLS_ALLOW,
@@ -387,6 +345,7 @@ export type {
   ActiveMemoryChatType,
   ActiveMemoryMode,
   ActiveMemoryFastMode,
+  ActiveMemoryPartialTimeoutData,
   ActiveMemoryPartialTimeoutError,
   ActiveMemoryPromptStyle,
   ActiveMemorySearchDebug,

@@ -3,11 +3,11 @@
  * Reads provider-specific and manifest-declared env names without logging or
  * exposing secret values, with explicit single-key pins for flaky live lanes.
  */
+import { normalizeProviderId } from "@openclaw/model-catalog-core/provider-id";
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import { normalizeStringEntries } from "@openclaw/normalization-core/string-normalization";
-import { getProviderEnvVars } from "../secrets/provider-env-vars.js";
+import { getProviderEnvVarsCore } from "../secrets/provider-env-vars.js";
 import { classifyFailoverSignal } from "./failover/classify.js";
-import { normalizeProviderId } from "./model-selection.js";
 
 const KEY_SPLIT_RE = /[\s,;]+/g;
 const GOOGLE_LIVE_SINGLE_KEY = "OPENCLAW_LIVE_GEMINI_KEY";
@@ -132,7 +132,7 @@ export function collectProviderApiKeys(
   const fallback = config.fallbackVars
     .map((envVar) => normalizeOptionalString(env[envVar]))
     .filter(Boolean) as string[];
-  const manifestEnvVars = options.providerEnvVars ?? getProviderEnvVars(normalizedProvider);
+  const manifestEnvVars = options.providerEnvVars ?? getProviderEnvVarsCore(normalizedProvider);
   const manifestFallback = manifestEnvVars
     .map((envVar) => normalizeOptionalString(env[envVar]))
     .filter(Boolean) as string[];

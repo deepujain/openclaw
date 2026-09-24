@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import type { ProviderResolveUsageAuthContext } from "../plugins/types.js";
 
 const resolveProviderUsageAuthWithPluginMock = vi.fn(
   async (..._args: unknown[]): Promise<unknown> => null,
@@ -61,15 +62,16 @@ vi.mock("../plugins/manifest-contract-eligibility.js", () => ({
 }));
 
 vi.mock("../secrets/provider-env-vars.js", () => ({
-  listKnownProviderAuthEnvVarNames: () => [
+  listKnownProviderAuthEnvVarNamesCore: () => [
     "ANTHROPIC_API_KEY",
     "MINIMAX_CODE_PLAN_KEY",
     "OPENAI_API_KEY",
   ],
-  resolveProviderAuthEnvVarCandidates: () => ({
+  resolveProviderAuthEnvVarCandidatesCore: () => ({
     anthropic: ["ANTHROPIC_API_KEY"],
     minimax: ["MINIMAX_CODE_PLAN_KEY"],
     openai: ["OPENAI_API_KEY"],
+    zai: ["ZAI_API_KEY"],
   }),
   resolveProviderAuthLookupMaps: () => ({
     aliasMap: {},
@@ -77,6 +79,7 @@ vi.mock("../secrets/provider-env-vars.js", () => ({
       anthropic: ["ANTHROPIC_API_KEY"],
       minimax: ["MINIMAX_CODE_PLAN_KEY"],
       openai: ["OPENAI_API_KEY"],
+      zai: ["ZAI_API_KEY"],
     },
     authEvidenceMap: {},
   }),
@@ -134,21 +137,37 @@ describe("resolveProviderAuths plugin boundary", () => {
     resolveProviderUsageAuthWithPluginMock.mockResolvedValue(null);
   });
 
+  it("normalizes direct plugin candidates before provider env keys", async () => {
+    resolveProviderUsageAuthWithPluginMock.mockImplementationOnce(async (rawParams) => {
+      const { context } = rawParams as { context: ProviderResolveUsageAuthContext };
+      const token = context.resolveApiKeyFromConfigAndStore({
+        envDirect: [undefined, "first-\r\nkey", "second-key"],
+      });
+      return token ? { token } : null;
+    });
+    await expect(
+      resolveProviderAuthsForTest({ providers: ["zai"], env: { ZAI_API_KEY: "fallback-key" } }),
+    ).resolves.toEqual([{ provider: "zai", token: "first-key" }]);
+  });
+
   it("prefers plugin-owned usage auth when available", async () => {
     resolveProviderUsageAuthWithPluginMock.mockResolvedValueOnce({
       token: "plugin-zai-token",
     });
 
-    await expect(
-      resolveProviderAuthsForTest({
-        providers: ["zai"],
-      }),
-    ).resolves.toEqual([
-      {
-        provider: "zai",
-        token: "plugin-zai-token",
-      },
-    ]);
+    await withTempHome(async (homeDir) => {
+      await expect(
+        resolveProviderAuthsForTest({
+          providers: ["zai"],
+          env: { HOME: homeDir, ZAI_API_KEY: "zai-env-key" },
+        }),
+      ).resolves.toEqual([
+        {
+          provider: "zai",
+          token: "plugin-zai-token",
+        },
+      ]);
+    });
     expect(ensureAuthProfileStoreMock).not.toHaveBeenCalled();
   });
 
@@ -156,11 +175,14 @@ describe("resolveProviderAuths plugin boundary", () => {
     const authError = new Error("plugin auth failed");
     resolveProviderUsageAuthWithPluginMock.mockRejectedValueOnce(authError);
 
-    await expect(
-      resolveProviderAuthsForTest({
-        providers: ["anthropic"],
-      }),
-    ).rejects.toBe(authError);
+    await withTempHome(async (homeDir) => {
+      await expect(
+        resolveProviderAuthsForTest({
+          providers: ["anthropic"],
+          env: { HOME: homeDir, ANTHROPIC_API_KEY: "sk-ant-env" },
+        }),
+      ).rejects.toBe(authError);
+    });
   });
 
   it("resolves SecretRef-backed profiles before provider credential classification", async () => {
@@ -174,6 +196,8 @@ describe("resolveProviderAuths plugin boundary", () => {
       },
     };
     ensureAuthProfileStoreMock.mockReturnValue(store as never);
+    hasAnyAuthProfileStoreSourceMock.mockReturnValue(true);
+    ensureAuthProfileStoreWithoutExternalProfilesMock.mockReturnValue(store as never);
     resolveAuthProfileOrderMock.mockReturnValue(["anthropic:admin"]);
     resolveApiKeyForProfileMock.mockResolvedValue({
       apiKey: "sk-ant-admin-secretref",
@@ -215,21 +239,75 @@ describe("resolveProviderAuths plugin boundary", () => {
     ]);
   });
 
-  it("does not synthesize Codex app-server auth for generic OpenAI usage", async () => {
-    await expect(
-      resolveProviderAuthsForTest({
-        providers: ["openai"],
-      }),
-    ).resolves.toEqual([]);
-    expect(providerCalls(resolveProviderUsageAuthWithPluginMock)).toEqual(["openai"]);
+  it("excludes native credential providers from plugin OAuth resolution", async () => {
+    const store = {
+      profiles: {
+        "anthropic:claude-cli": {
+          type: "oauth",
+          provider: "anthropic",
+          access: "native-access",
+          refresh: "native-refresh",
+          expires: Date.now() + 60_000,
+        },
+        "anthropic:managed": {
+          type: "oauth",
+          provider: "anthropic",
+          access: "managed-access",
+          refresh: "managed-refresh",
+          expires: Date.now() + 60_000,
+        },
+      },
+    };
+    ensureAuthProfileStoreMock.mockReturnValue(store as never);
+    hasAnyAuthProfileStoreSourceMock.mockReturnValue(true);
+    ensureAuthProfileStoreWithoutExternalProfilesMock.mockReturnValue(store as never);
+    resolveAuthProfileOrderMock.mockReturnValue(["anthropic:claude-cli", "anthropic:managed"]);
+    resolveApiKeyForProfileMock.mockImplementation(async (params) => {
+      const profileId = (params as { profileId: string }).profileId;
+      return profileId === "anthropic:managed"
+        ? { apiKey: "managed-access", provider: "anthropic" }
+        : { apiKey: "native-access", provider: "claude-cli" };
+    });
+    resolveProviderUsageAuthWithPluginMock.mockImplementationOnce(async (rawParams) => {
+      const params = rawParams as {
+        context: {
+          resolveOAuthToken: (options: {
+            excludeProfileIds: string[];
+          }) => Promise<{ token: string } | null>;
+        };
+      };
+      return params.context.resolveOAuthToken({
+        excludeProfileIds: ["anthropic:claude-cli"],
+      });
+    });
+
+    await expect(resolveProviderAuthsForTest({ providers: ["anthropic"] })).resolves.toEqual([
+      { provider: "anthropic", token: "managed-access" },
+    ]);
+    expect(resolveApiKeyForProfileMock).toHaveBeenCalledTimes(1);
+    expect(resolveApiKeyForProfileMock).toHaveBeenCalledWith(
+      expect.objectContaining({ profileId: "anthropic:managed" }),
+    );
   });
 
-  it("skips plugin usage auth when requested and no direct credential source exists", async () => {
+  it("does not synthesize Codex app-server auth for generic OpenAI usage", async () => {
+    await withTempHome(async (homeDir) => {
+      await expect(
+        resolveProviderAuthsForTest({
+          providers: ["openai"],
+          env: { HOME: homeDir },
+        }),
+      ).resolves.toEqual([]);
+    });
+    // The credential-source gate keeps credential-less providers off plugin runtime entirely.
+    expect(resolveProviderUsageAuthWithPluginMock).not.toHaveBeenCalled();
+  });
+
+  it("skips plugin usage auth by default when no credential source exists", async () => {
     await withTempHome(async (homeDir) => {
       await expect(
         resolveProviderAuthsForTest({
           providers: ["zai"],
-          skipPluginAuthWithoutCredentialSource: true,
           env: { HOME: homeDir },
         }),
       ).resolves.toStrictEqual([]);
@@ -265,7 +343,6 @@ describe("resolveProviderAuths plugin boundary", () => {
       await expect(
         resolveProviderAuthsForTest({
           providers: ["anthropic", "zai"],
-          skipPluginAuthWithoutCredentialSource: true,
           env: { HOME: homeDir },
         }),
       ).resolves.toEqual([
@@ -307,7 +384,6 @@ describe("resolveProviderAuths plugin boundary", () => {
       await expect(
         resolveProviderAuthsForTest({
           providers: ["minimax"],
-          skipPluginAuthWithoutCredentialSource: true,
           env: { HOME: homeDir },
         }),
       ).resolves.toEqual([
@@ -332,7 +408,6 @@ describe("resolveProviderAuths plugin boundary", () => {
       await expect(
         resolveProviderAuthsForTest({
           providers: ["minimax"],
-          skipPluginAuthWithoutCredentialSource: true,
           env: {
             HOME: homeDir,
             MINIMAX_CODE_PLAN_KEY: "code-plan-key",
@@ -359,7 +434,6 @@ describe("resolveProviderAuths plugin boundary", () => {
       await expect(
         resolveProviderAuthsForTest({
           providers: ["openai"],
-          skipPluginAuthWithoutCredentialSource: true,
           env: {
             HOME: homeDir,
             OPENAI_API_KEY: "sk-admin-test",
@@ -385,7 +459,6 @@ describe("resolveProviderAuths plugin boundary", () => {
       await expect(
         resolveProviderAuthsForTest({
           providers: ["openai"],
-          skipPluginAuthWithoutCredentialSource: true,
           env: {
             HOME: homeDir,
             OPENAI_ADMIN_KEY: "sk-admin-test",
@@ -409,7 +482,6 @@ describe("resolveProviderAuths plugin boundary", () => {
       await expect(
         resolveProviderAuthsForTest({
           providers: ["anthropic"],
-          skipPluginAuthWithoutCredentialSource: true,
           env: { HOME: homeDir },
         }),
       ).resolves.toStrictEqual([]);
@@ -420,13 +492,84 @@ describe("resolveProviderAuths plugin boundary", () => {
     expect(resolveProviderUsageAuthWithPluginMock).not.toHaveBeenCalled();
   });
 
+  it("uses a caller-provided auth store for credential gating", async () => {
+    const store = {
+      profiles: {
+        "anthropic:external": {
+          type: "oauth",
+          provider: "anthropic",
+          access: "external-access",
+          refresh: "external-refresh",
+          expires: Date.now() + 60_000,
+        },
+      },
+    };
+    resolveAuthProfileOrderMock.mockReturnValue(["anthropic:external"]);
+    resolveApiKeyForProfileMock.mockResolvedValue({
+      apiKey: "external-access",
+      provider: "anthropic",
+    });
+    resolveProviderUsageAuthWithPluginMock.mockImplementationOnce(async (rawParams) => {
+      const params = rawParams as {
+        context: { resolveOAuthToken: () => Promise<{ token: string } | null> };
+      };
+      return params.context.resolveOAuthToken();
+    });
+
+    await expect(
+      resolveProviderAuthsForTest({
+        providers: ["anthropic"],
+        store: store as never,
+      }),
+    ).resolves.toEqual([{ provider: "anthropic", token: "external-access" }]);
+
+    expect(ensureAuthProfileStoreWithoutExternalProfilesMock).not.toHaveBeenCalled();
+    expect(ensureAuthProfileStoreMock).not.toHaveBeenCalled();
+  });
+
+  it("resolves a caller-provided lazy auth store once for credential gating", async () => {
+    const store = {
+      profiles: {
+        "anthropic:external": {
+          type: "oauth",
+          provider: "anthropic",
+          access: "external-access",
+          refresh: "external-refresh",
+          expires: Date.now() + 60_000,
+        },
+      },
+    };
+    const getStore = vi.fn(() => store as never);
+    resolveAuthProfileOrderMock.mockReturnValue(["anthropic:external"]);
+    resolveApiKeyForProfileMock.mockResolvedValue({
+      apiKey: "external-access",
+      provider: "anthropic",
+    });
+    resolveProviderUsageAuthWithPluginMock.mockImplementationOnce(async (rawParams) => {
+      const params = rawParams as {
+        context: { resolveOAuthToken: () => Promise<{ token: string } | null> };
+      };
+      return params.context.resolveOAuthToken();
+    });
+
+    await expect(
+      resolveProviderAuthsForTest({
+        providers: ["anthropic"],
+        getStore,
+      }),
+    ).resolves.toEqual([{ provider: "anthropic", token: "external-access" }]);
+
+    expect(getStore).toHaveBeenCalledOnce();
+    expect(ensureAuthProfileStoreWithoutExternalProfilesMock).not.toHaveBeenCalled();
+    expect(ensureAuthProfileStoreMock).not.toHaveBeenCalled();
+  });
+
   it("does not fall back to standard Anthropic API keys for usage auth", async () => {
     resolveProviderUsageAuthWithPluginMock.mockResolvedValueOnce({ handled: true });
     await withTempHome(async (homeDir) => {
       await expect(
         resolveProviderAuthsForTest({
           providers: ["anthropic", "zai"],
-          skipPluginAuthWithoutCredentialSource: true,
           env: {
             HOME: homeDir,
             ANTHROPIC_API_KEY: "sk-ant-api03-status-key", // pragma: allowlist secret

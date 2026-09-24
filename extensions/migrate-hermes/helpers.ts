@@ -19,7 +19,7 @@ const EDGE_DASHES_RE = /^-+|-+$/g;
 
 export function resolveHomePath(input: string): string {
   const value = input.trim();
-  return value ? path.resolve(value.replace(HOME_SHORTHAND_RE, os.homedir())) : value;
+  return value ? path.resolve(value.replace(HOME_SHORTHAND_RE, () => os.homedir())) : value;
 }
 
 export async function exists(filePath: string): Promise<boolean> {
@@ -45,13 +45,7 @@ export function parseEnv(content: string | undefined): Record<string, string> {
 }
 
 export function parseHermesConfig(content: string | undefined): Record<string, unknown> {
-  if (!content) {
-    return {};
-  }
-  const parsed = parseYaml(content);
-  return parsed && typeof parsed === "object" && !Array.isArray(parsed)
-    ? (parsed as Record<string, unknown>)
-    : {};
+  return content ? asNonArrayRecord(parseYaml(content)) : {};
 }
 
 export function childRecord(

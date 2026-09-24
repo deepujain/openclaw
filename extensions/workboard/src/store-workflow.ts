@@ -13,7 +13,6 @@ import { safeEqualSecret } from "openclaw/plugin-sdk/security-runtime";
 import { normalizeOptionalString } from "openclaw/plugin-sdk/string-coerce-runtime";
 import {
   assertCanMutateClaimedCard,
-  capText,
   cardBoardId,
   cardChildIds,
   cardParentIds,
@@ -48,6 +47,7 @@ import type {
 } from "./store-inputs.js";
 import {
   appendCompletionProof,
+  capText,
   clearDiagnostics,
   deriveChildIdempotencyKey,
   normalizeArtifact,
@@ -124,7 +124,11 @@ export class WorkboardWorkflowStore extends WorkboardPromoteStore {
           ? existingClaim
           : undefined;
       if (cardParentIds(guarded).length > 0 && guarded.status !== "ready" && !activeClaim) {
-        throw new Error("card dependencies are not done.");
+        throw new Error(
+          guarded.status === "blocked"
+            ? "card is blocked; use workboard_unblock before claiming."
+            : "card dependencies are not done.",
+        );
       }
       if (guarded.status === "scheduled") {
         throw new Error("card is scheduled for later.");
@@ -143,7 +147,6 @@ export class WorkboardWorkflowStore extends WorkboardPromoteStore {
             guarded.status === "backlog" || guarded.status === "todo" || guarded.status === "ready"
               ? "running"
               : guarded.status,
-          agentId: guarded.agentId ?? ownerId,
           ...(options.adoptWorkspaceAccess && !guarded.metadata?.automation?.workspaceAccess
             ? { workspaceAccess: options.adoptWorkspaceAccess }
             : {}),
@@ -158,7 +161,7 @@ export class WorkboardWorkflowStore extends WorkboardPromoteStore {
         },
       );
       return { card, token };
-    });
+    }, options.assertOwnerCurrent);
   }
 
   async heartbeat(id: string, input: WorkboardHeartbeatInput): Promise<WorkboardCard> {
@@ -204,10 +207,7 @@ export class WorkboardWorkflowStore extends WorkboardPromoteStore {
     input: WorkboardHeartbeatInput & { status?: unknown } = {},
   ): Promise<WorkboardCard> {
     return await this.enqueueMutation(async () => {
-      const existing = await this.get(id);
-      if (!existing) {
-        throw new Error(`card not found: ${id}`);
-      }
+      const existing = await this.requireCard(id);
       const status =
         input.status === undefined
           ? existing.status
@@ -240,10 +240,7 @@ export class WorkboardWorkflowStore extends WorkboardPromoteStore {
     input: WorkboardCompleteInput = {},
     scope: WorkboardMutationScope | null | undefined = input,
   ): Promise<WorkboardCard> {
-    const existing = await this.get(id);
-    if (!existing) {
-      throw new Error(`card not found: ${id}`);
-    }
+    const existing = await this.requireCard(id);
     assertCanMutateClaimedCard(existing, scope === null ? undefined : scope);
     const now = Date.now();
     const createdCardIds = normalizeStringList(input.createdCardIds, "created card ids", 120);
@@ -267,9 +264,6 @@ export class WorkboardWorkflowStore extends WorkboardPromoteStore {
     const proofId = normalizeBoundedString(input.proofId, undefined, 120, "proof id");
     if (input.proofId !== undefined && !proofId) {
       throw new Error("proofId must be a non-empty string.");
-    }
-    if (proofId && !proofInput) {
-      throw new Error("proof is required when proofId is provided.");
     }
     const proof = proofInput ? normalizeProofInput(proofInput, now) : undefined;
     const artifacts = Array.isArray(input.artifacts)
@@ -316,7 +310,7 @@ export class WorkboardWorkflowStore extends WorkboardPromoteStore {
                 { id: randomUUID(), body: summary, createdAt: now },
               ].slice(-MAX_CARD_COMMENTS)
             : metadata.comments,
-          proof: proof ? appendCompletionProof(metadata.proof, proof, proofId) : metadata.proof,
+          proof: appendCompletionProof(metadata.proof, proof, proofId),
           artifacts: artifacts.length
             ? [...(metadata.artifacts ?? []), ...artifacts].slice(-MAX_CARD_ARTIFACTS)
             : metadata.artifacts,
@@ -327,7 +321,7 @@ export class WorkboardWorkflowStore extends WorkboardPromoteStore {
       },
       {
         enforceStatusHolds: true,
-        ...(proof ? { preserveProofId: proofId ?? proof.id } : {}),
+        preserveProofId: proofId ?? proof?.id,
       },
     );
   }
@@ -382,10 +376,7 @@ export class WorkboardWorkflowStore extends WorkboardPromoteStore {
     options: { clearExecutionAssociation?: boolean } = {},
   ): Promise<WorkboardCard> {
     return await this.enqueueMutation(async () => {
-      const existing = await this.get(id);
-      if (!existing) {
-        throw new Error(`card not found: ${id}`);
-      }
+      const existing = await this.requireCard(id);
       assertCanMutateClaimedCard(existing, scope === null ? undefined : scope);
       const now = Date.now();
       const reason =
@@ -397,10 +388,7 @@ export class WorkboardWorkflowStore extends WorkboardPromoteStore {
 
   async unblock(id: string, scope?: WorkboardMutationScope): Promise<WorkboardCard> {
     return await this.enqueueMutation(async () => {
-      const existing = await this.get(id);
-      if (!existing) {
-        throw new Error(`card not found: ${id}`);
-      }
+      const existing = await this.requireCard(id);
       assertCanMutateClaimedCard(existing, scope);
       const metadata = clearDiagnostics(existing.metadata, ["blocked_too_long"]);
       return await this.updateCard(id, { status: "todo", metadata: { ...metadata, stale: null } });
@@ -413,10 +401,7 @@ export class WorkboardWorkflowStore extends WorkboardPromoteStore {
     scope?: WorkboardMutationScope | null,
   ): Promise<WorkboardCard> {
     return await this.enqueueMutation(async () => {
-      const existing = await this.get(id);
-      if (!existing) {
-        throw new Error(`card not found: ${id}`);
-      }
+      const existing = await this.requireCard(id);
       assertCanMutateClaimedCard(existing, scope === null ? undefined : scope);
       const agentId =
         input.agentId === undefined ? existing.agentId : normalizeOptionalString(input.agentId);
@@ -449,10 +434,7 @@ export class WorkboardWorkflowStore extends WorkboardPromoteStore {
     scope?: WorkboardMutationScope | null,
   ): Promise<WorkboardCard> {
     return await this.enqueueMutation(async () => {
-      const existing = await this.get(id);
-      if (!existing) {
-        throw new Error(`card not found: ${id}`);
-      }
+      const existing = await this.requireCard(id);
       assertCanMutateClaimedCard(existing, scope === null ? undefined : scope);
       const now = Date.now();
       const reason =
@@ -487,10 +469,7 @@ export class WorkboardWorkflowStore extends WorkboardPromoteStore {
   }
 
   async runs(id: string): Promise<{ card: WorkboardCard; attempts: WorkboardRunAttempt[] }> {
-    const card = await this.get(id);
-    if (!card) {
-      throw new Error(`card not found: ${id}`);
-    }
+    const card = await this.requireCard(id);
     return { card, attempts: card.metadata?.attempts ?? [] };
   }
 
@@ -500,10 +479,7 @@ export class WorkboardWorkflowStore extends WorkboardPromoteStore {
     scope?: WorkboardMutationScope | null,
   ): Promise<WorkboardCard> {
     return await this.enqueueMutation(async () => {
-      const existing = await this.get(id);
-      if (!existing) {
-        throw new Error(`card not found: ${id}`);
-      }
+      const existing = await this.requireCard(id);
       assertCanMutateClaimedCard(existing, scope === null ? undefined : scope);
       if (
         existing.status !== "triage" &&
@@ -555,10 +531,7 @@ export class WorkboardWorkflowStore extends WorkboardPromoteStore {
     return await this.enqueueMutation(
       async () =>
         await this.withCardCompensation(async () => {
-          const parent = await this.get(id);
-          if (!parent) {
-            throw new Error(`card not found: ${id}`);
-          }
+          const parent = await this.requireCard(id);
           assertCanMutateClaimedCard(parent, scope === null ? undefined : scope);
           const childrenInput = Array.isArray(input.children) ? input.children : [];
           if (childrenInput.length === 0) {

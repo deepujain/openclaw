@@ -1,5 +1,4 @@
-export type DockPanelSide = "bottom" | "left" | "right";
-export type DockPanelPlacement = DockPanelSide | "main";
+export type DockPanelPlacement = "bottom" | "left" | "right" | "main";
 
 type DockPanelLayout<TDock extends DockPanelPlacement> = {
   open: boolean;
@@ -61,7 +60,7 @@ export function createDockPanelLayout<TDock extends DockPanelPlacement>(
         if (!raw) {
           return { ...defaults };
         }
-        const parsed = JSON.parse(raw) as Partial<DockPanelLayout<DockPanelSide>>;
+        const parsed = JSON.parse(raw) as Partial<DockPanelLayout<DockPanelPlacement>>;
         return {
           open: Boolean(parsed.open),
           dock: options.supportedDocks.includes(parsed.dock as TDock)
@@ -83,3 +82,35 @@ export function createDockPanelLayout<TDock extends DockPanelPlacement>(
     },
   };
 }
+
+export const terminalPanelLayout = createDockPanelLayout({
+  storageKey: "openclaw.terminal.panel.v1",
+  minHeight: 140,
+  minWidth: 320,
+  defaultDock: "bottom",
+  supportedDocks: ["bottom", "right", "main"],
+  defaultHeight: 320,
+  defaultWidth: 520,
+});
+
+export const browserPanelLayout = createDockPanelLayout({
+  storageKey: "openclaw.browser.panel.v1",
+  minHeight: 240,
+  minWidth: 380,
+  defaultDock: "right",
+  supportedDocks: ["bottom", "right"],
+  defaultHeight: 420,
+  defaultWidth: 560,
+});
+
+export const assistantPanelLayout = createDockPanelLayout({
+  // Shipped key: operators' saved dock size and placement live here, so the
+  // legacy custodian spelling stays even though the dock is now shared.
+  storageKey: "openclaw.custodian.panel.v1",
+  minHeight: 240,
+  minWidth: 320,
+  defaultDock: "right",
+  supportedDocks: ["bottom", "right"],
+  defaultHeight: 420,
+  defaultWidth: 440,
+});

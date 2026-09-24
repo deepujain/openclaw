@@ -1,5 +1,6 @@
 // Pixverse provider module implements model/runtime integration.
 import { randomUUID } from "node:crypto";
+import { bufferToBlobPart } from "openclaw/plugin-sdk/blob-runtime";
 import { extensionForMime } from "openclaw/plugin-sdk/media-mime";
 import { isProviderApiKeyConfigured } from "openclaw/plugin-sdk/provider-auth";
 import { resolveApiKeyForProvider } from "openclaw/plugin-sdk/provider-auth-runtime";
@@ -133,29 +134,8 @@ function resolvePixVerseDurationSeconds(value: number | undefined): number {
   return Math.max(1, Math.min(MAX_DURATION_SECONDS, Math.round(value)));
 }
 
-function appendOptionalNumber(body: Record<string, unknown>, key: string, value: unknown): void {
-  const numberValue = asFiniteNumber(value);
-  if (numberValue != null) {
-    body[key] = numberValue;
-  }
-}
-
-function appendOptionalInt32Seed(body: Record<string, unknown>, value: unknown): void {
-  const seed = asSafeIntegerInRange(value, { min: 0, max: PIXVERSE_SEED_MAX });
-  if (seed !== undefined) {
-    body.seed = seed;
-  }
-}
-
 function readPixVerseSeed(value: unknown): number | undefined {
   return asSafeIntegerInRange(value, { min: 0, max: PIXVERSE_SEED_MAX });
-}
-
-function appendOptionalString(body: Record<string, unknown>, key: string, value: unknown): void {
-  const stringValue = normalizeOptionalString(value);
-  if (stringValue) {
-    body[key] = stringValue;
-  }
 }
 
 function buildPixVerseHeaders(headers: Headers, contentType?: string): Headers {
@@ -231,9 +211,8 @@ function buildUploadImageForm(asset: VideoGenerationSourceAsset): FormData {
   const mimeType = normalizeOptionalString(asset.mimeType) ?? "image/png";
   const extension = extensionForMime(mimeType)?.slice(1) ?? "png";
   const fileName = normalizeOptionalString(asset.fileName) ?? `image.${extension}`;
-  const bytes = new Uint8Array(asset.buffer.byteLength);
-  bytes.set(asset.buffer);
-  form.set("image", new File([bytes], fileName, { type: mimeType }));
+  const file = new File([bufferToBlobPart(asset.buffer)], fileName, { type: mimeType });
+  form.set("image", file);
   return form;
 }
 
@@ -258,24 +237,26 @@ function buildVideoBody(
   } else {
     body.aspect_ratio = normalizeOptionalString(req.aspectRatio) ?? "16:9";
   }
-  appendOptionalString(
-    body,
-    "negative_prompt",
+  const negativePrompt =
     normalizeOptionalString(options.negative_prompt) ??
-      normalizeOptionalString(options.negativePrompt),
-  );
-  appendOptionalString(
-    body,
-    "camera_movement",
+    normalizeOptionalString(options.negativePrompt);
+  if (negativePrompt) {
+    body.negative_prompt = negativePrompt;
+  }
+  const cameraMovement =
     normalizeOptionalString(options.camera_movement) ??
-      normalizeOptionalString(options.cameraMovement),
-  );
-  appendOptionalNumber(
-    body,
-    "template_id",
-    asFiniteNumber(options.template_id) ?? asFiniteNumber(options.templateId),
-  );
-  appendOptionalInt32Seed(body, options.seed);
+    normalizeOptionalString(options.cameraMovement);
+  if (cameraMovement) {
+    body.camera_movement = cameraMovement;
+  }
+  const templateId = asFiniteNumber(options.template_id) ?? asFiniteNumber(options.templateId);
+  if (templateId != null) {
+    body.template_id = templateId;
+  }
+  const seed = readPixVerseSeed(options.seed);
+  if (seed !== undefined) {
+    body.seed = seed;
+  }
   if (req.audio !== undefined) {
     body.generate_audio_switch = req.audio;
   }

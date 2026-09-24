@@ -4,10 +4,14 @@ import type { DispatchReplyWithDispatcher } from "../../auto-reply/reply/provide
 import type { FinalizedMsgContext } from "../../auto-reply/templating.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { PlatformMessageNotDispatchedError } from "../../infra/outbound/deliver-types.js";
+import { createStructuredOutboundPayloadPlan } from "../../infra/outbound/payloads.js";
+import { createDirectPendingFinalCustody } from "./direct-delivery-custody.js";
 import { dispatchRoutedChannelTurn } from "./lifecycle.js";
+import type { ChannelProviderOwnedMessageSendingDeliveryAdapter } from "./types.js";
 
 const dispatchReplyWithRoutedChannelDispatcherCore = vi.hoisted(() => vi.fn());
 const getGlobalHookRunner = vi.hoisted(() => vi.fn());
+const loadSessionEntryReadOnly = vi.hoisted(() => vi.fn());
 const settlePendingFinalDelivery = vi.hoisted(() =>
   vi.fn(async (_completion: unknown, state: string) => ({ state })),
 );
@@ -28,6 +32,11 @@ vi.mock("../../plugins/hook-runner-global.js", async (importOriginal) => {
 vi.mock("../../config/sessions/transcript.js", () => ({
   readRecentUserAssistantTextForSession: vi.fn(async () => []),
 }));
+
+vi.mock("../../config/sessions/session-accessor.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../config/sessions/session-accessor.js")>();
+  return { ...actual, loadSessionEntryReadOnly };
+});
 
 vi.mock("../../infra/outbound/delivery-completion.js", async (importOriginal) => {
   const actual =
@@ -52,6 +61,24 @@ function createCtx(overrides: Partial<FinalizedMsgContext> = {}): FinalizedMsgCo
   };
 }
 
+function createPayloadDispatch(
+  payload: ReplyPayload,
+  operation: "raw" | "prepared",
+): DispatchReplyWithDispatcher {
+  return async (params) => {
+    if (operation === "prepared") {
+      const [plan] = createStructuredOutboundPayloadPlan([payload]);
+      if (!plan || !params.dispatcherOptions.deliverPrepared) {
+        throw new Error("expected prepared delivery operation");
+      }
+      await params.dispatcherOptions.deliverPrepared(plan, { kind: "final" });
+    } else {
+      await params.dispatcherOptions.deliver(payload, { kind: "final" });
+    }
+    return { queuedFinal: true, counts: { tool: 0, block: 0, final: 1 } };
+  };
+}
+
 describe("channel turn failed-send custody", () => {
   const completion = {
     deliveryId: "delivery-failed",
@@ -64,9 +91,187 @@ describe("channel turn failed-send custody", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     getGlobalHookRunner.mockReturnValue(null);
+    loadSessionEntryReadOnly.mockReturnValue(undefined);
     settlePendingFinalDelivery.mockImplementation(async (_completion, state: string) => ({
       state,
     }));
+  });
+
+  it.each(["raw", "prepared"] as const)(
+    "revalidates the session writer immediately before provider I/O (%s)",
+    async (operation) => {
+      const sourcePayload = setReplyPayloadMetadata(
+        { text: "reply from the old writer" },
+        {
+          sessionWriterDeliveryAuthority: {
+            agentId: "main",
+            expectedLifecycleRevision: "revision-a",
+            expectedSessionId: "session-failed",
+            expectedWriterRunId: "run-old",
+            sessionKey: completion.sessionKey,
+            storePath: completion.storePath,
+          },
+        },
+      );
+      dispatchReplyWithRoutedChannelDispatcherCore.mockImplementationOnce(
+        createPayloadDispatch(sourcePayload, operation),
+      );
+      loadSessionEntryReadOnly.mockReturnValue({
+        activeWriterRunId: "run-new",
+        lifecycleRevision: "revision-b",
+        sessionId: "session-failed",
+      });
+      const platformSend = vi.fn(async (_payload: ReplyPayload) => ({ visibleReplySent: true }));
+
+      const providerSend: ChannelProviderOwnedMessageSendingDeliveryAdapter["deliverWithProviderMessageSending"] =
+        async (payload, info) => {
+          await info.onPlatformSendDispatch();
+          info.assertPlatformSendAuthorized();
+          return await platformSend(payload);
+        };
+      const deliverWithProviderMessageSending = vi.fn(providerSend);
+      const deliverPreparedWithProviderMessageSending = vi.fn<
+        NonNullable<
+          ChannelProviderOwnedMessageSendingDeliveryAdapter["deliverPreparedWithProviderMessageSending"]
+        >
+      >((plan, info) => providerSend(plan.payload, info));
+      const turn = dispatchRoutedChannelTurn({
+        cfg,
+        channel: "telegram",
+        accountId: "acct",
+        route: { agentId: "main", sessionKey: completion.sessionKey },
+        ctxPayload: createCtx({ Surface: "telegram", OriginatingTo: "chat-1" }),
+        delivery: {
+          preparePayload: async (payload) => ({ ...payload }),
+          deliverWithProviderMessageSending,
+          deliverPreparedWithProviderMessageSending,
+        },
+      });
+
+      await expect(turn).rejects.toBeInstanceOf(PlatformMessageNotDispatchedError);
+      expect(loadSessionEntryReadOnly).toHaveBeenCalledWith({
+        agentId: "main",
+        readConsistency: "latest",
+        sessionKey: completion.sessionKey,
+        storePath: completion.storePath,
+      });
+      expect(platformSend).not.toHaveBeenCalled();
+      expect(deliverWithProviderMessageSending).toHaveBeenCalledTimes(operation === "raw" ? 1 : 0);
+      expect(deliverPreparedWithProviderMessageSending).toHaveBeenCalledTimes(
+        operation === "prepared" ? 1 : 0,
+      );
+    },
+  );
+
+  it.each(["raw", "prepared"] as const)(
+    "blocks provider I/O when writer authority changes after async custody refresh (%s)",
+    async (operation) => {
+      const sourcePayload = setReplyPayloadMetadata(
+        { text: "reply from the replaced writer" },
+        {
+          sessionWriterDeliveryAuthority: {
+            agentId: "main",
+            expectedLifecycleRevision: "revision-a",
+            expectedSessionId: "session-failed",
+            expectedWriterRunId: "run-old",
+            sessionKey: completion.sessionKey,
+            storePath: completion.storePath,
+          },
+        },
+      );
+      dispatchReplyWithRoutedChannelDispatcherCore.mockImplementationOnce(
+        createPayloadDispatch(sourcePayload, operation),
+      );
+      loadSessionEntryReadOnly
+        .mockReturnValueOnce({
+          activeWriterRunId: "run-old",
+          lifecycleRevision: "revision-a",
+          sessionId: "session-failed",
+        })
+        .mockReturnValue({
+          activeWriterRunId: "run-new",
+          lifecycleRevision: "revision-b",
+          sessionId: "session-failed",
+        });
+      const platformSend = vi.fn(async (_payload: ReplyPayload) => ({ visibleReplySent: true }));
+
+      const providerSend: ChannelProviderOwnedMessageSendingDeliveryAdapter["deliverWithProviderMessageSending"] =
+        async (payload, info) => {
+          await info.onPlatformSendDispatch();
+          info.assertPlatformSendAuthorized();
+          return await platformSend(payload);
+        };
+      const deliverWithProviderMessageSending = vi.fn(providerSend);
+      const deliverPreparedWithProviderMessageSending = vi.fn<
+        NonNullable<
+          ChannelProviderOwnedMessageSendingDeliveryAdapter["deliverPreparedWithProviderMessageSending"]
+        >
+      >((plan, info) => providerSend(plan.payload, info));
+      const turn = dispatchRoutedChannelTurn({
+        cfg,
+        channel: "telegram",
+        accountId: "acct",
+        route: { agentId: "main", sessionKey: completion.sessionKey },
+        ctxPayload: createCtx({ Surface: "telegram", OriginatingTo: "chat-1" }),
+        delivery: {
+          preparePayload: async (payload) => ({ ...payload }),
+          deliverWithProviderMessageSending,
+          deliverPreparedWithProviderMessageSending,
+        },
+      });
+
+      await expect(turn).rejects.toBeInstanceOf(PlatformMessageNotDispatchedError);
+      expect(loadSessionEntryReadOnly).toHaveBeenCalledTimes(2);
+      expect(platformSend).not.toHaveBeenCalled();
+      expect(deliverWithProviderMessageSending).toHaveBeenCalledTimes(operation === "raw" ? 1 : 0);
+      expect(deliverPreparedWithProviderMessageSending).toHaveBeenCalledTimes(
+        operation === "prepared" ? 1 : 0,
+      );
+    },
+  );
+
+  it("serializes and revalidates pending-final custody before every provider post", async () => {
+    const payload = setReplyPayloadMetadata(
+      { text: "reply" },
+      { pendingFinalDeliveryCompletion: completion },
+    );
+    const custody = createDirectPendingFinalCustody(payload);
+    if (!custody) {
+      throw new Error("expected pending-final custody");
+    }
+    let resolveFirstCheck: ((result: { state: "unknown" }) => void) | undefined;
+    const firstCheck = new Promise<{ state: "unknown" }>((resolve) => {
+      resolveFirstCheck = resolve;
+    });
+    let checkCount = 0;
+    settlePendingFinalDelivery.mockImplementation(async () => {
+      if (checkCount++ === 0) {
+        return firstCheck;
+      }
+      return { state: "suppressed" };
+    });
+
+    const firstDispatch = custody.onPlatformSendDispatch();
+    const secondDispatch = custody.onPlatformSendDispatch();
+    await Promise.resolve();
+    expect(settlePendingFinalDelivery).toHaveBeenCalledOnce();
+    resolveFirstCheck?.({ state: "unknown" });
+
+    await expect(firstDispatch).resolves.toBeUndefined();
+    await expect(secondDispatch).rejects.toBeInstanceOf(PlatformMessageNotDispatchedError);
+
+    expect(settlePendingFinalDelivery).toHaveBeenNthCalledWith(
+      1,
+      { kind: "pending-final", ...completion },
+      "unknown",
+      ["prepared", "queued"],
+    );
+    expect(settlePendingFinalDelivery).toHaveBeenNthCalledWith(
+      2,
+      { kind: "pending-final", ...completion },
+      "unknown",
+      ["unknown"],
+    );
   });
 
   const run = (error: Error) => {

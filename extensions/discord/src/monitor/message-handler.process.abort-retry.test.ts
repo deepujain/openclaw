@@ -1,14 +1,17 @@
 // Discord message processing coverage split by cohesive behavior.
+import { createDeferred } from "openclaw/plugin-sdk/extension-shared";
 import { describe, expect, it, vi } from "vitest";
 import {
   BASE_CHANNEL_ROUTE,
   createAutomaticSourceDeliveryContext,
   createBaseContext,
+  createDirectMessageContextOverrides,
   createNoQueuedDispatchResult,
   deliverDiscordReply,
   dispatchInboundMessageForTest as dispatchInboundMessage,
   formatDiscordReplySkip,
   getLastDispatchCtx,
+  getLastDispatchReplyOptions,
   logVerboseForTest as logVerbose,
   recordInboundSessionForTest as recordInboundSession,
   runProcessDiscordMessage,
@@ -33,7 +36,7 @@ describe("processDiscordMessage deliver-lambda abort logging", () => {
     // the dispatch mock and then queue a single block reply via the captured
     // dispatcher. The mocked createReplyDispatcherWithTyping (see line ~229)
     // routes sendBlockReply straight into the deliver lambda, where the very
-    // first gate is `if (isProcessAborted(abortSignal)) return;` — the line
+    // first gate is `if (abortSignal?.aborted) return;` — the line
     // the PR added the logVerbose call to.
     dispatchInboundMessage.mockImplementationOnce(async (params?: DispatchInboundParams) => {
       abortController.abort();
@@ -70,6 +73,67 @@ describe("processDiscordMessage deliver-lambda abort logging", () => {
     // real logVerbose binding.
     verboseSpy.mockRestore();
   });
+});
+
+describe("processDiscordMessage thread binding activity failure", () => {
+  it.each(["current", "aborted", "policy changed"] as const)(
+    "continues only with the original inbound authority: %s",
+    async (authority) => {
+      const touchEntered = createDeferred<void>();
+      const releaseTouch = createDeferred<void>();
+      const abortController = new AbortController();
+      let policyCurrent = true;
+      const errorLog = vi.fn();
+      const activityError = new Error("Discord thread binding changed during persistence");
+      const ctx = await createAutomaticSourceDeliveryContext({
+        abortSignal: abortController.signal,
+        isPolicyCurrent: () => policyCurrent,
+        runtime: { log: vi.fn(), error: errorLog },
+        cfg: { messages: { statusReactions: { enabled: false } } },
+        discordConfig: { streaming: { mode: "off" } },
+      });
+      ctx.threadBinding = {
+        bindingId: "discord:default:c1",
+        targetSessionKey: ctx.route.sessionKey,
+        targetKind: "subagent",
+        conversation: { channel: "discord", accountId: "default", conversationId: "c1" },
+        status: "active",
+        boundAt: 100,
+      };
+      const touchThread = vi.fn(async () => {
+        touchEntered.resolve();
+        await releaseTouch.promise;
+        throw activityError;
+      });
+      ctx.threadBindings.touchThread = touchThread;
+      dispatchInboundMessage.mockImplementation(async (params?: DispatchInboundParams) => {
+        await params?.dispatcher.sendFinalReply({ text: "Still received your message." });
+        return { queuedFinal: true, counts: { final: 1, tool: 0, block: 0 } };
+      });
+
+      const processing = runProcessDiscordMessage(ctx);
+      await touchEntered.promise;
+      if (authority === "aborted") {
+        abortController.abort();
+      } else if (authority === "policy changed") {
+        policyCurrent = false;
+      }
+      releaseTouch.resolve();
+      await expect(processing).resolves.toBeUndefined();
+
+      expect(touchThread).toHaveBeenCalledExactlyOnceWith({ threadId: "c1" });
+      expect(errorLog).toHaveBeenCalledExactlyOnceWith(
+        expect.stringContaining(activityError.message),
+      );
+      const expectedDispatches = authority === "current" ? 1 : 0;
+      expect(recordInboundSession).toHaveBeenCalledTimes(expectedDispatches);
+      expect(dispatchInboundMessage).toHaveBeenCalledTimes(expectedDispatches);
+      expect(deliverDiscordReply).toHaveBeenCalledTimes(expectedDispatches);
+      if (authority === "current") {
+        expectFreshFinalText("Still received your message.");
+      }
+    },
+  );
 });
 
 describe("processDiscordMessage reply session init conflict retry", () => {
@@ -110,17 +174,58 @@ describe("processDiscordMessage reply session init conflict retry", () => {
     expect(guildHistories.get("c1")).toHaveLength(1);
     expect(guildHistories.get("c1")?.[0]).toMatchObject({
       body: "hi",
-      messageId: "m1",
+      messageId: "1001",
     });
     sleepSpy.mockRestore();
   });
 
-  it("commits replay ownership after a visible terminal failure notice", async () => {
+  it.each([
+    {
+      name: "an automatic group request",
+      visibleReplies: "automatic",
+      inboundEventKind: "user_request",
+      direct: false,
+      expectedMode: "automatic",
+      expectedSends: 1,
+    },
+    {
+      name: "an ambient room event",
+      visibleReplies: "automatic",
+      inboundEventKind: "room_event",
+      direct: false,
+      expectedMode: "message_tool_only",
+      expectedSends: 0,
+    },
+    {
+      name: "a group request requiring the message tool",
+      visibleReplies: "message_tool",
+      inboundEventKind: "user_request",
+      direct: false,
+      expectedMode: "message_tool_only",
+      expectedSends: 0,
+    },
+    {
+      name: "a direct request despite the group message-tool policy",
+      visibleReplies: "message_tool",
+      inboundEventKind: "user_request",
+      direct: true,
+      expectedMode: "automatic",
+      expectedSends: 1,
+    },
+  ] as const)("completes $name with a recorded terminal notice outcome", async (scenario) => {
     const sleepSpy = vi.mocked(sleepWithAbort).mockResolvedValue(undefined);
     const originalError = conflictError();
     dispatchInboundMessage.mockRejectedValue(originalError);
+    const errorLog = vi.fn();
 
-    const ctx = await createBaseContext();
+    const ctx = await createBaseContext({
+      ...(scenario.direct ? createDirectMessageContextOverrides() : {}),
+      inboundEventKind: scenario.inboundEventKind,
+      shouldRequireMention: false,
+      effectiveWasMentioned: scenario.inboundEventKind !== "room_event",
+      cfg: { messages: { groupChat: { visibleReplies: scenario.visibleReplies } } },
+      runtime: { log: vi.fn(), error: errorLog },
+    });
     await expect(runProcessDiscordMessage(ctx)).resolves.toBeUndefined();
 
     expect(dispatchInboundMessage).toHaveBeenCalledTimes(4);
@@ -128,10 +233,33 @@ describe("processDiscordMessage reply session init conflict retry", () => {
     expect(sleepSpy).toHaveBeenNthCalledWith(1, 250, undefined);
     expect(sleepSpy).toHaveBeenNthCalledWith(2, 1_000, undefined);
     expect(sleepSpy).toHaveBeenNthCalledWith(3, 2_500, undefined);
-    expectFreshFinalText(
-      "⚠️ Couldn't process this message because the session stayed busy. Please try again in a moment.",
+    expect(getLastDispatchReplyOptions()?.sourceReplyDeliveryMode).toBe(scenario.expectedMode);
+    expect(deliverDiscordReply).toHaveBeenCalledTimes(scenario.expectedSends);
+    expect(errorLog).toHaveBeenCalledExactlyOnceWith(
+      expect.stringContaining(
+        `terminal notice ${scenario.expectedSends === 1 ? "delivered" : "suppressed"}`,
+      ),
     );
+    if (scenario.expectedSends === 1) {
+      expectFreshFinalText(
+        "⚠️ Couldn't process this message because the session stayed busy. Please try again in a moment.",
+      );
+    }
     sleepSpy.mockRestore();
+  });
+
+  it("records downstream suppression without claiming its terminal notice was delivered", async () => {
+    dispatchInboundMessage.mockRejectedValue(conflictError());
+    deliverDiscordReply.mockResolvedValueOnce({ visibleReplySent: false });
+    const errorLog = vi.fn();
+    const ctx = await createBaseContext({ runtime: { log: vi.fn(), error: errorLog } });
+
+    await expect(runProcessDiscordMessage(ctx)).resolves.toBeUndefined();
+
+    expect(deliverDiscordReply).toHaveBeenCalledTimes(1);
+    expect(errorLog).toHaveBeenCalledExactlyOnceWith(
+      expect.stringContaining("terminal notice suppressed"),
+    );
   });
 
   it("keeps exhaustion retryable when the visible failure notice cannot land", async () => {
@@ -157,8 +285,7 @@ describe("processDiscordMessage reply session init conflict retry", () => {
 
   it("rebuilds a released replay without duplicating its pending history", async () => {
     const sleepSpy = vi.mocked(sleepWithAbort).mockResolvedValue(undefined);
-    dispatchInboundMessage.mockRejectedValue(conflictError());
-    deliverDiscordReply.mockRejectedValueOnce(new Error("Discord unavailable"));
+    dispatchInboundMessage.mockRejectedValueOnce(new Error("dispatch failed before completion"));
     const guildHistories = new Map();
     const createReplayContext = () =>
       createBaseContext({
@@ -177,7 +304,7 @@ describe("processDiscordMessage reply session init conflict retry", () => {
 
     expect(getLastDispatchCtx()?.Body).not.toContain("[Chat messages since your last reply");
     expect(guildHistories.get("c1")).toHaveLength(1);
-    expect(guildHistories.get("c1")?.[0]?.messageId).toBe("m1");
+    expect(guildHistories.get("c1")?.[0]?.messageId).toBe("1001");
     sleepSpy.mockRestore();
   });
 

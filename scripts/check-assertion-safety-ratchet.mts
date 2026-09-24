@@ -2,13 +2,18 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-import ts from "typescript";
+import * as ts from "typescript/unstable/ast";
+import {
+  createNativeTypeScriptParser,
+  type NativeTypeScriptParser,
+} from "./lib/native-typescript.mts";
 import {
   compareRatchetCounts,
   listRatchetRenames,
   loadRatchetReference,
   loadRatchetSnapshot,
   loadRatchetSources,
+  parseRatchetArgs,
   parseRatchetCounts,
   reportRatchetFailures,
   reportRatchetSuccess,
@@ -51,48 +56,40 @@ export function isGovernedAssertionSourcePath(filePath: string) {
   );
 }
 
-function scriptKindForPath(filePath: string) {
-  return filePath.endsWith(".tsx") ? ts.ScriptKind.TSX : ts.ScriptKind.TS;
-}
-
 function collectSafetyCommentLines(sourceFile: ts.SourceFile, source: string) {
-  const scanner = ts.createScanner(
-    ts.ScriptTarget.Latest,
-    false,
-    sourceFile.languageVariant,
-    source,
-  );
+  // Line text, not token scanning: a raw scanner desyncs on the `}` that ends a
+  // template substitution and then misses every later comment in the file.
   const sameLine = new Set<number>();
   const standalone = new Set<number>();
-  for (let token = scanner.scan(); token !== ts.SyntaxKind.EndOfFileToken; token = scanner.scan()) {
-    if (token !== ts.SyntaxKind.SingleLineCommentTrivia) {
-      continue;
+  sourceFile.getLineStarts().forEach((lineStart, line) => {
+    const lineEnd = source.indexOf("\n", lineStart);
+    const text = source.slice(lineStart, lineEnd === -1 ? source.length : lineEnd);
+    const commentStart = text.indexOf("//");
+    if (commentStart === -1 || !/^\/\/\s*SAFETY:\s*\S/u.test(text.slice(commentStart).trim())) {
+      return;
     }
-    const comment = source.slice(scanner.getTokenPos(), scanner.getTextPos()).trim();
-    if (!/^\/\/\s*SAFETY:\s*\S/u.test(comment)) {
-      continue;
-    }
-    const position = scanner.getTokenPos();
-    const line = sourceFile.getLineAndCharacterOfPosition(position).line;
     sameLine.add(line);
-    const lineStart = sourceFile.getPositionOfLineAndCharacter(line, 0);
-    if (source.slice(lineStart, position).trim() === "") {
+    if (text.slice(0, commentStart).trim() === "") {
       standalone.add(line);
     }
-  }
+  });
   return { sameLine, standalone };
 }
 
 function assertionOperatorPosition(sourceFile: ts.SourceFile, node: AssertionNode) {
-  const operatorKind = ts.isAsExpression(node)
-    ? ts.SyntaxKind.AsKeyword
-    : ts.SyntaxKind.LessThanToken;
-  return (
-    node
-      .getChildren(sourceFile)
-      .find((child) => child.kind === operatorKind)
-      ?.getStart(sourceFile) ?? node.getStart(sourceFile)
+  if (ts.isTypeAssertion(node)) {
+    return node.getStart(sourceFile);
+  }
+  const scanner = ts.createScanner(
+    true,
+    sourceFile.languageVariant,
+    sourceFile.text,
+    node.expression.end,
+    node.type.pos - node.expression.end,
   );
+  return scanner.scan() === ts.SyntaxKind.AsKeyword
+    ? scanner.getTokenStart()
+    : node.getStart(sourceFile);
 }
 
 function isUnknownAssertion(node: AssertionNode) {
@@ -100,35 +97,33 @@ function isUnknownAssertion(node: AssertionNode) {
   return node.type.kind === ts.SyntaxKind.UnknownKeyword;
 }
 
-export function countUnsafeAssertions(source: string, filePath = "src/source.ts") {
+export function countUnsafeAssertions(
+  source: string,
+  filePath: string,
+  sourceFile: ts.SourceFile,
+  parser: NativeTypeScriptParser,
+) {
   const repoPath = filePath.replaceAll("\\", "/");
   if (isDeclarationFile(repoPath)) {
     return 0;
   }
-  const sourceFile = ts.createSourceFile(
-    filePath,
-    source,
-    ts.ScriptTarget.Latest,
-    true,
-    scriptKindForPath(filePath),
-  );
-  const parseDiagnostics = (
-    sourceFile as ts.SourceFile & { parseDiagnostics: readonly ts.Diagnostic[] }
-  ).parseDiagnostics;
-  const diagnostic = parseDiagnostics[0];
+  const diagnostic = parser.getSyntacticDiagnostics(sourceFile.fileName)[0];
   if (diagnostic) {
-    const position = diagnostic.start ?? 0;
+    const position = diagnostic.pos;
     const line = sourceFile.getLineAndCharacterOfPosition(position).line + 1;
-    throw new Error(
-      `${filePath}:${line}: ${ts.flattenDiagnosticMessageText(diagnostic.messageText, "\n")}`,
-    );
+    throw new Error(`${filePath}:${line}: ${diagnostic.text}`);
   }
 
   const safetyCommentLines = collectSafetyCommentLines(sourceFile, source);
   let count = 0;
   const visit = (node: ts.Node): void => {
-    if (ts.isAsExpression(node) || ts.isTypeAssertionExpression(node)) {
-      if (!ts.isConstTypeReference(node.type) && !isUnknownAssertion(node)) {
+    if (ts.isAsExpression(node) || ts.isTypeAssertion(node)) {
+      const isConstAssertion =
+        ts.isTypeReferenceNode(node.type) &&
+        ts.isIdentifier(node.type.typeName) &&
+        node.type.typeName.text === "const" &&
+        !node.type.typeArguments;
+      if (!isConstAssertion && !isUnknownAssertion(node)) {
         const operatorLine = sourceFile.getLineAndCharacterOfPosition(
           assertionOperatorPosition(sourceFile, node),
         ).line;
@@ -140,7 +135,7 @@ export function countUnsafeAssertions(source: string, filePath = "src/source.ts"
         }
       }
     }
-    ts.forEachChild(node, visit);
+    node.forEachChild(visit);
   };
   visit(sourceFile);
   return count;
@@ -191,6 +186,7 @@ export function collectCurrentAssertionSafetyCounts(
   root = process.cwd(),
   options: { staged?: boolean } = {},
 ) {
+  using parser = createNativeTypeScriptParser({ cwd: root });
   const staged = options.staged === true;
   const filePaths = execFileSync(
     "git",
@@ -217,7 +213,12 @@ export function collectCurrentAssertionSafetyCounts(
       ]);
   const counts = new Map<string, number>();
   for (const [filePath, source] of sources) {
-    const count = countUnsafeAssertions(source, filePath);
+    const count = countUnsafeAssertions(
+      source,
+      filePath,
+      parser.parseSourceFile(filePath, source),
+      parser,
+    );
     if (count > 0) {
       counts.set(filePath, count);
     }
@@ -231,6 +232,7 @@ function allowanceWithExistingBaseCounts(
   proposed: ReadonlyMap<string, number>,
   allowed: ReadonlyMap<string, number>,
 ) {
+  using parser = createNativeTypeScriptParser({ cwd: root });
   const effective = new Map(allowed);
   for (const [filePath, count] of proposed) {
     if (count <= (effective.get(filePath) ?? 0)) {
@@ -243,7 +245,12 @@ function allowanceWithExistingBaseCounts(
         maxBuffer: GIT_MAX_BUFFER,
         stdio: ["ignore", "pipe", "ignore"],
       });
-      const baseCount = countUnsafeAssertions(source, filePath);
+      const baseCount = countUnsafeAssertions(
+        source,
+        filePath,
+        parser.parseSourceFile(filePath, source),
+        parser,
+      );
       if (baseCount > (effective.get(filePath) ?? 0)) {
         effective.set(filePath, baseCount);
       }
@@ -258,31 +265,6 @@ function writeBaseline(root: string, counts: ReadonlyMap<string, number>) {
   fs.writeFileSync(path.join(root, BASELINE_PATH), formatBaseline(counts));
 }
 
-function parseArgs(argv: string[]) {
-  const args: { base?: string; prune: boolean; staged: boolean } = {
-    prune: false,
-    staged: false,
-  };
-  for (let index = 0; index < argv.length; index += 1) {
-    const arg = argv[index];
-    if (arg === "--prune") {
-      args.prune = true;
-      continue;
-    }
-    if (arg === "--staged") {
-      args.staged = true;
-      continue;
-    }
-    if (arg === "--base" && argv[index + 1]) {
-      args.base = argv[index + 1];
-      index += 1;
-      continue;
-    }
-    throw new Error("Unknown or incomplete argument: " + arg);
-  }
-  return args;
-}
-
 function formatDeltas(entries: RatchetCountDelta[], comparison: ">" | "<") {
   return entries.map((entry) => `${entry.entry}: ${entry.current} ${comparison} ${entry.allowed}`);
 }
@@ -293,7 +275,7 @@ function totalCount(counts: ReadonlyMap<string, number>) {
 
 export function main(root = process.cwd(), argv: string[] = process.argv.slice(2)) {
   try {
-    const args = parseArgs(argv);
+    const args = parseRatchetArgs(argv);
     if (args.staged && args.prune) {
       throw new Error("--prune cannot be combined with --staged");
     }

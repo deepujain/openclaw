@@ -3,14 +3,19 @@ import {
   ErrorCodes,
   errorShape,
   type ErrorShape,
-  type SessionSharingRole,
-  type SessionVisibility,
 } from "../../packages/gateway-protocol/src/index.js";
 import { AgentSelectionRequiredError } from "../agents/agent-scope.js";
-import { isSessionMember, type SessionEntry } from "../config/sessions.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { isIncognitoSessionKey } from "../routing/session-key.js";
-import { verifyBoardViewTicket } from "./board-view-ticket.js";
+import {
+  resolveSessionMethodScope,
+  type SessionOperatorScope,
+} from "../shared/session-method-scopes-base.js";
+import {
+  authorizeGatewaySessionCreation,
+  operatorSessionCap,
+  resolveGatewayOperatorRoleActor,
+} from "./operator-role-policy.js";
 import {
   authenticatedProfileUnavailableError,
   gatewayClientSessionCreator,
@@ -21,412 +26,179 @@ import type {
   GatewayRequestContext,
   SessionMutationAuthorization,
 } from "./server-methods/types.js";
-import type { GatewayWsClient } from "./server/ws-types.js";
-import { resolveSessionGroupMutationTargetsByName } from "./session-group-mutation-targets.js";
+import { isSessionCreatorProfile } from "./session-creator.js";
 import {
-  invalidateSessionSharingSnapshot,
-  loadCachedSessionSharingSnapshot,
-  type SessionSharingSnapshot,
-} from "./session-sharing-snapshot-cache.js";
-import {
-  isApprovalSessionTargetMethod,
+  isAgentRunStartMethod,
   isRequiredSessionTargetMethod,
   isSessionProfileDependentMethod,
-  readSessionSharingStringParam as readStringParam,
+} from "./session-method-policy.js";
+import { SessionMutationAuthorizationChangedError } from "./session-mutation-authorization-error.js";
+import {
+  resolveRequestedSessionAgentId,
+  resolveRequestedSessionAgentInput,
+} from "./session-request-agent.js";
+import type { SessionRowReadView } from "./session-row-prepared-read.js";
+import { getSessionRowProjection } from "./session-row-projection-access.js";
+import {
+  authorizeIncognitoSessionTarget,
+  authorizeOwnSessionMutation,
+  authorizeSessionAgentRun,
+  authorizeSessionSharingTarget,
+  hiddenSessionNotFound,
+  isGatewayAdmin,
+  resolveSessionSharingTarget,
+  type SessionSharingTarget,
+} from "./session-sharing-policy.js";
+import {
+  createSessionListEntryFilter,
+  prepareProjectedSessionSharing,
+} from "./session-sharing-read.js";
+import {
   resolveDirectIncognitoTargets,
-  sessionMutationTargetFields,
+  resolveDirectSessionTargets,
+  resolveSessionMutationTargets,
+  resolveTalkSessionTargetInput,
   type SessionMutationTarget,
 } from "./session-sharing-target-input.js";
-import type {
-  GatewaySessionStoreCache,
-  GatewaySessionStoreDiscoveryCache,
-} from "./session-utils-store-lookup.js";
 import {
-  resolveCanonicalSessionStoreMatchFromStoreKeys,
-  resolveGatewaySessionStoreTargetWithStore,
-} from "./session-utils.js";
-
-type SessionSharingTarget = {
-  agentId: string;
-  canonicalKey: string;
-  entry: SessionEntry;
-  storeKey: string;
-  storeKeys: string[];
-  storePath: string;
-};
+  resolveGatewaySessionStoreTarget,
+  type GatewaySessionStoreCache,
+  type GatewaySessionStoreDiscoveryCache,
+} from "./session-utils-store-lookup.js";
+import { prepareTalkSessionTarget, assertTalkSessionStorageTarget } from "./talk/session-target.js";
+import type { PreparedTalkSessionTarget } from "./talk/session-target.types.js";
 
 type AuthorizedSessionMutationTarget = SessionMutationTarget & {
-  resolved: Pick<
-    SessionSharingTarget,
-    "agentId" | "canonicalKey" | "storeKey" | "storePath"
-  > | null;
+  resolved: Omit<SessionSharingTarget, "entry" | "storeKeys"> | null;
   sessionId: string | null;
+  lifecycleRevision?: string;
+  created?: true;
+  absentTarget?: ReturnType<typeof resolveGatewaySessionStoreTarget>;
 };
 
-export class SessionMutationAuthorizationChangedError extends Error {
-  readonly error: ErrorShape;
-
-  constructor(error: ErrorShape) {
-    super(error.message);
-    this.name = "SessionMutationAuthorizationChangedError";
-    this.error = error;
-  }
-}
-
-export { invalidateSessionSharingSnapshot };
-
-export function resolveSessionVisibility(
-  entry: Pick<SessionEntry, "visibility">,
-): SessionVisibility {
-  return entry.visibility ?? "shared";
-}
-
-export function isGatewayAdmin(client: Pick<GatewayClient, "connect"> | null): boolean {
-  // Internal/plugin-runtime runs reach authorization with a client that has no
-  // connect handshake; treat a connect-less client as a non-admin, never a crash.
-  return client?.connect?.scopes?.includes("operator.admin") === true;
-}
-
-export function allowedSessionVisibilities(cfg: OpenClawConfig): SessionVisibility[] {
-  const policy = cfg.session?.sharing;
-  return [
-    "shared",
-    ...(policy?.readOnly === false ? [] : (["read-only"] as const)),
-    ...(policy?.suggest === false ? [] : (["suggest"] as const)),
-    ...(policy?.drafts === false ? [] : (["draft"] as const)),
-  ];
-}
-
-export function isSessionVisibilityAllowed(
-  cfg: OpenClawConfig,
-  visibility: SessionVisibility,
-): boolean {
-  return allowedSessionVisibilities(cfg).includes(visibility);
-}
-
-export function resolveSessionSharingTarget(params: {
-  cfg: OpenClawConfig;
+type ExpectedSessionMutationTarget = Readonly<{
+  agentId: string;
   sessionKey: string;
-  agentId?: string;
-  projection?: "full" | "list";
-  storeCache?: GatewaySessionStoreCache;
-  targetDiscoveryCache?: GatewaySessionStoreDiscoveryCache;
-}): SessionSharingTarget | null {
-  const target = resolveGatewaySessionStoreTargetWithStore({
-    cfg: params.cfg,
-    key: params.sessionKey,
-    agentId: params.agentId,
-    clone: false,
-    ...(params.projection ? { projection: params.projection } : {}),
-    ...(params.storeCache ? { storeCache: params.storeCache } : {}),
-    ...(params.targetDiscoveryCache ? { targetDiscoveryCache: params.targetDiscoveryCache } : {}),
-  });
-  const match = resolveCanonicalSessionStoreMatchFromStoreKeys(target.store, target.storeKeys);
-  return match
-    ? {
-        agentId: target.agentId,
-        canonicalKey: target.canonicalKey,
-        entry: match.entry,
-        storeKey: match.key,
-        storeKeys: target.storeKeys,
-        storePath: target.storePath,
-      }
-    : null;
-}
+  storePath: string;
+  sessionId: string;
+}>;
 
-export function resolveSessionSharingRole(params: {
-  client: GatewayClient | null;
-  target: SessionSharingTarget;
-  includeMembership?: boolean;
-  isMember?: boolean;
-}): SessionSharingRole {
-  if (isGatewayAdmin(params.client)) {
-    return "admin";
-  }
-  const identity = gatewayClientSessionCreator(params.client);
-  // Shared-secret/no-auth solo deployments have no durable person identity.
-  if (!identity) {
-    return params.client?.authenticatedGitHubIdentitySync ? "viewer" : "owner";
-  }
-  if (params.target.entry.createdActor?.id === identity.id) {
-    return "owner";
-  }
-  if (params.isMember !== undefined) {
-    return params.isMember ? "member" : "viewer";
-  }
-  if (params.includeMembership === false) {
-    return "viewer";
-  }
-  if (
-    isSessionMember(
-      {
-        agentId: params.target.agentId,
-        sessionKey: params.target.storeKey,
-        storePath: params.target.storePath,
-      },
-      identity.id,
-    )
-  ) {
-    return "member";
-  }
-  return "viewer";
-}
-
-export function canManageSessionSharing(role: SessionSharingRole): boolean {
-  return role === "admin" || role === "owner";
-}
-
-function canMutateSession(params: {
-  role: SessionSharingRole;
-  visibility: SessionVisibility;
-}): boolean {
-  // Drafts stay creator/admin-only; membership becomes active only after promotion.
-  if (params.visibility === "draft") {
-    return params.role === "admin" || params.role === "owner";
-  }
-  return params.visibility === "shared" || params.role !== "viewer";
-}
-
-function incognitoSessionNotFound(sessionKey: string): ErrorShape {
-  return errorShape(ErrorCodes.INVALID_REQUEST, `Incognito session "${sessionKey}" was not found.`);
-}
-
-function isIncognitoSessionTarget(params: {
-  sessionKey: string;
-  target: Pick<SessionSharingTarget, "canonicalKey" | "entry"> | null;
-}): boolean {
-  return params.target
-    ? params.target.entry.incognito === true || isIncognitoSessionKey(params.target.canonicalKey)
-    : isIncognitoSessionKey(params.sessionKey);
-}
-
-export function isResolvedIncognitoSession(params: {
-  cfg: OpenClawConfig;
-  sessionKey: string;
-  agentId?: string;
-}): boolean {
-  return isIncognitoSessionTarget({
-    sessionKey: params.sessionKey,
-    target: resolveSessionSharingTarget(params),
-  });
-}
-
-export function authorizeIncognitoSessionTarget(params: {
-  client: GatewayClient | null;
-  sessionKey: string;
-  target: SessionSharingTarget | null;
-}): ErrorShape | null {
-  if (!isIncognitoSessionTarget(params)) {
-    return null;
-  }
-  if (isGatewayAdmin(params.client)) {
-    return null;
-  }
-  if (isGatewayClientProfilePending(params.client)) {
-    return authenticatedProfileUnavailableError();
-  }
-  const identity = gatewayClientSessionCreator(params.client);
-  if (!identity) {
-    return null;
-  }
-  return incognitoSessionNotFound(params.sessionKey);
-}
-
-export function canAccessIncognitoSession(params: {
-  cfg: OpenClawConfig;
-  client: GatewayClient | null;
-  sessionKey: string;
-  agentId?: string;
-}): boolean {
-  if (isGatewayAdmin(params.client)) {
-    return true;
-  }
-  return (
-    authorizeIncognitoSessionTarget({
-      client: params.client,
-      sessionKey: params.sessionKey,
-      target: resolveSessionSharingTarget(params),
-    }) === null
+function sessionMutationTargetChanged(method: string, sessionKey: string) {
+  return new SessionMutationAuthorizationChangedError(
+    errorShape(ErrorCodes.INVALID_REQUEST, `session changed before ${method}; retry the request`, {
+      details: { code: "SESSION_MUTATION_AUTHORIZATION_CHANGED", method, sessionKey },
+    }),
   );
 }
 
-export function authorizeResolvedSessionMutation(params: {
-  cfg: OpenClawConfig;
-  client: GatewayClient | null;
-  sessionKey: string;
-  agentId?: string;
-}): ErrorShape | null {
-  if (isGatewayAdmin(params.client)) {
-    return null;
-  }
-  if (isGatewayClientProfilePending(params.client)) {
-    return authenticatedProfileUnavailableError();
-  }
-  const target = resolveSessionSharingTarget(params);
-  const incognitoError = authorizeIncognitoSessionTarget({
-    client: params.client,
-    sessionKey: params.sessionKey,
-    target,
-  });
-  if (incognitoError) {
-    return incognitoError;
-  }
-  if (!target) {
-    return null;
-  }
-  return authorizeSessionSharingTarget({ client: params.client, target });
-}
-
-export function authorizeSessionSharingTarget(params: {
-  client: GatewayClient | null;
-  target: SessionSharingTarget;
-}): ErrorShape | null {
-  const visibility = resolveSessionVisibility(params.target.entry);
-  const role = resolveSessionSharingRole({ client: params.client, target: params.target });
-  return canMutateSession({ role, visibility })
-    ? null
-    : errorShape(ErrorCodes.INVALID_REQUEST, `session is ${visibility} for this connection`, {
-        details: {
-          code: "SESSION_PARTICIPATION_REQUIRED",
-          sessionKey: params.target.canonicalKey,
-          visibility,
-        },
-      });
-}
-
-function resolveSessionGroupMutationTargets(params: {
-  getCfg: () => OpenClawConfig;
-  requestParams: unknown;
-}): SessionMutationTarget[] | undefined {
-  const groupName = readStringParam(params.requestParams, "name");
-  return groupName
-    ? (resolveSessionGroupMutationTargetsByName(params.getCfg()).get(groupName) ?? [])
-    : undefined;
-}
-
-function resolveApprovalSessionTarget(
+function expectedSessionMutationTargetError(
+  expected: ExpectedSessionMutationTarget | undefined,
+  target: SessionSharingTarget | null,
   method: string,
-  params: unknown,
-  context: GatewayRequestContext,
-): SessionMutationTarget | undefined {
-  const id = readStringParam(params, "id");
-  if (!id) {
-    return undefined;
-  }
-  const kind = readStringParam(params, "kind");
-  const manager =
-    method === "plugin.approval.resolve" || kind === "plugin"
-      ? context.pluginApprovalManager
-      : method === "approval.resolve" && kind === "system-agent"
-        ? context.systemAgentApprovalManager
-        : context.execApprovalManager;
-  const resolvedId = manager?.lookupApprovalId(id, { includeResolved: true });
-  const recordId =
-    resolvedId?.kind === "exact" || resolvedId?.kind === "prefix" ? resolvedId.id : id;
-  const request = manager?.getSnapshot(recordId)?.request;
-  const sessionKey = readStringParam(request, "sessionKey");
-  const agentId = readStringParam(request, "agentId");
-  return sessionKey
-    ? {
-        sessionKey,
-        ...(agentId ? { agentId } : {}),
-      }
-    : undefined;
+): ErrorShape | null {
+  return expected &&
+    (!target ||
+      target.agentId !== expected.agentId ||
+      target.canonicalKey !== expected.sessionKey ||
+      target.storePath !== expected.storePath ||
+      target.entry.sessionId?.trim() !== expected.sessionId)
+    ? sessionMutationTargetChanged(method, expected.sessionKey).error
+    : null;
 }
 
-function resolveSessionMutationTargets(params: {
-  method: string;
-  requestParams: unknown;
-  context: GatewayRequestContext;
-  getCfg: () => OpenClawConfig;
-}): SessionMutationTarget[] | undefined {
-  if (params.method === "sessions.patchMany") {
-    const targets = (params.requestParams as { targets?: unknown } | null)?.targets;
-    return Array.isArray(targets)
-      ? targets.slice(0, 101).flatMap((target): SessionMutationTarget[] => {
-          const sessionKey = readStringParam(target, "key");
-          const agentId = readStringParam(target, "agentId");
-          return sessionKey ? [{ sessionKey, ...(agentId ? { agentId } : {}) }] : [];
-        })
-      : undefined;
-  }
-  if (
-    params.method === "sessions.groups.rename" ||
-    params.method === "sessions.groups.delete" ||
-    params.method === "sessions.groups.update"
-  ) {
-    return resolveSessionGroupMutationTargets({
-      getCfg: params.getCfg,
-      requestParams: params.requestParams,
-    });
-  }
-  if (isApprovalSessionTargetMethod(params.method)) {
-    const target = resolveApprovalSessionTarget(
-      params.method,
-      params.requestParams,
-      params.context,
-    );
-    return target ? [target] : undefined;
-  }
-  const requestedAgentId = readStringParam(params.requestParams, "agentId");
-  const directTargets: SessionMutationTarget[] = [];
-  for (const field of sessionMutationTargetFields(params.method)) {
-    const sessionKey = readStringParam(params.requestParams, field);
-    if (!sessionKey) {
-      continue;
-    }
-    // sessions.create applies its selected agent to the parent only for the
-    // unqualified global sentinels; other parents resolve their own store.
-    const parentUsesRequestedAgent =
-      field !== "parentSessionKey" || ["global", "unknown"].includes(sessionKey.toLowerCase());
-    directTargets.push({
-      sessionKey,
-      ...(requestedAgentId && parentUsesRequestedAgent ? { agentId: requestedAgentId } : {}),
-    });
-  }
-  if (directTargets.length) {
-    return directTargets;
-  }
-  if (params.method === "board.event" || params.method === "board.action") {
-    const ticket = readStringParam(params.requestParams, "ticket");
-    const claims = ticket ? verifyBoardViewTicket(ticket) : undefined;
-    if (!claims) {
-      return undefined;
-    }
-    if (requestedAgentId && requestedAgentId !== claims.agentId) {
-      return undefined;
-    }
-    return [
-      {
-        sessionKey: claims.sessionKey,
-        ...(claims.agentId ? { agentId: claims.agentId } : {}),
-      },
-    ];
-  }
-  if (params.method !== "sessions.abort") {
-    return undefined;
-  }
-  const runId = readStringParam(params.requestParams, "runId");
-  const run = runId ? params.context.chatAbortControllers.get(runId) : undefined;
-  return run
-    ? [{ sessionKey: run.sessionKey, ...(run.agentId ? { agentId: run.agentId } : {}) }]
-    : undefined;
-}
+// Documented contract (docs/gateway/protocol.md): these methods authorize by session
+// visibility inside their handler, not by mutation participation. The pipeline still
+// applies incognito checks and the operator role cap: a view/suggest-capped caller
+// must not reassign ownership of a foreign session it can merely see.
+const VISIBILITY_AUTHORIZED_METHODS = new Set(["sessions.assignOwner"]);
+
+export { SessionMutationAuthorizationChangedError } from "./session-mutation-authorization-error.js";
+export { invalidateSessionSharingSnapshot } from "./session-sharing-snapshot-cache.js";
+
+export {
+  canReceiveSessionEvent,
+  prepareSessionSharing,
+  prepareProjectedSessionSharing,
+  createSessionListEntryFilter,
+  createProfileSessionEntryFilter,
+} from "./session-sharing-read.js";
+
+export {
+  allowedSessionVisibilities,
+  authorizeIncognitoSessionTarget,
+  authorizeResolvedSessionMutation,
+  authorizeSessionSharingTarget,
+  canAccessIncognitoSession,
+  canManageSessionSharing,
+  isGatewayAdmin,
+  isResolvedIncognitoSession,
+  isSessionVisibilityAllowed,
+  prepareSessionSharingTargets,
+  resolveSessionSharingRole,
+  resolveSessionSharingTarget,
+  resolveSessionSharingTargets,
+  resolveSessionVisibility,
+} from "./session-sharing-policy.js";
 
 export function resolveSessionMutationAuthorization(params: {
   client: GatewayClient | null;
   method: string;
   requestParams: unknown;
   context: GatewayRequestContext;
+  /** Trusted prepared identity; never adopt a later target while capturing authority. */
+  expectedTarget?: ExpectedSessionMutationTarget;
+  /** The router's actual alternative admission, not other grants on the same client. */
+  sessionScope?: SessionOperatorScope;
+  sessionRowRead?: SessionRowReadView;
 }): { authorization?: SessionMutationAuthorization; error: ErrorShape | null } {
-  if (isGatewayAdmin(params.client)) {
+  const authorizesAgentRun = isAgentRunStartMethod(params.method, params.requestParams);
+  const authorizesRead =
+    resolveSessionMethodScope(params.method, params.requestParams) === "operator.sessions.read";
+  // Progress belongs to the current conversation, not merely its stable session ID.
+  // Capture this boundary for admins too so delayed writes cannot revive a reset card.
+  const bindsProgressLifecycle =
+    params.method === "progressCard.put" || params.method === "progressCard.refresh";
+  const adminBypass = isGatewayAdmin(params.client) && !authorizesAgentRun;
+  if (adminBypass && !bindsProgressLifecycle && !params.expectedTarget) {
     return { error: null };
   }
   if (
+    !adminBypass &&
     isGatewayClientProfilePending(params.client) &&
     isSessionProfileDependentMethod(params.method)
   ) {
     return { error: authenticatedProfileUnavailableError() };
+  }
+  // The role cap precedes handler visibility filtering on the current exact row.
+  if (params.method === "sessions.describe") {
+    const projection = params.sessionRowRead ?? getSessionRowProjection(params.context);
+    if (projection) {
+      const { cfg, policyConfig } = projection.state;
+      for (const target of resolveDirectSessionTargets(params.method, params.requestParams)) {
+        const agent = resolveRequestedSessionAgentId(cfg, target.sessionKey, target.agentId);
+        if (!agent.ok) {
+          return { error: agent.error };
+        }
+        const row = projection.describe({ key: target.sessionKey, agentId: agent.agentId });
+        const sharing = prepareProjectedSessionSharing({
+          cfg: policyConfig,
+          client: params.client,
+          isMember: (_target, identityId) => row?.membership.has(identityId) ?? false,
+        });
+        if (
+          row &&
+          gatewayClientSessionCreator(params.client) &&
+          sharing.sessionCap === "none" &&
+          !sharing.isCreator(row.entry.createdActor)
+        ) {
+          return { error: hiddenSessionNotFound(target.sessionKey) };
+        }
+      }
+    }
+    return { error: null };
+  }
+  if (params.method === "sessions.list") {
+    return { error: null };
   }
   // Resolve runtime config at most once per request and only when a path needs it. The context
   // getter reloads/resolves gateway config, so non-session requests (the vast majority) must not
@@ -434,23 +206,82 @@ export function resolveSessionMutationAuthorization(params: {
   // config change cannot split target discovery from authorization.
   let cachedCfg: OpenClawConfig | undefined;
   const getCfg = (): OpenClawConfig => (cachedCfg ??= params.context.getRuntimeConfig());
+  const getPolicyConfig = () => params.context.getCommittedRuntimeConfig?.() ?? getCfg();
+  const authorizeTargetAccess = (cfg: OpenClawConfig, target: SessionSharingTarget) =>
+    authorizesRead
+      ? createSessionListEntryFilter({ cfg, client: params.client })?.(
+          target.storeKey,
+          target.entry,
+        ) === false
+        ? hiddenSessionNotFound(target.canonicalKey)
+        : null
+      : authorizeSessionSharingTarget({ cfg, client: params.client, target });
   // Each cache pair defines one synchronous freshness epoch: initial authorization shares one,
   // while commit-time guards start fresh after handler work.
   const createLookupCaches = (): {
     storeCache: GatewaySessionStoreCache;
     targetDiscoveryCache: GatewaySessionStoreDiscoveryCache;
   } => ({ storeCache: new Map(), targetDiscoveryCache: new Map() });
-  const lookupCaches = createLookupCaches();
+  let lookupCaches: ReturnType<typeof createLookupCaches> | undefined;
   const resolveAuthorizedTarget = (
     targetRef: SessionMutationTarget,
-  ): { target: SessionSharingTarget | null } | { error: ErrorShape } => {
+    targetCount: number,
+  ):
+    | {
+        target: SessionSharingTarget | null;
+        preparedReadSource?: SessionSharingTarget["readSource"];
+      }
+    | { error: ErrorShape } => {
+    const input = resolveRequestedSessionAgentInput(targetRef.sessionKey, targetRef.agentId);
+    if (!input.ok) {
+      return { error: input.error };
+    }
     try {
+      if (
+        params.sessionRowRead &&
+        resolveDirectSessionTargets(params.method, params.requestParams).some(
+          (direct) =>
+            direct.sessionKey === targetRef.sessionKey && direct.agentId === targetRef.agentId,
+        )
+      ) {
+        const agent = resolveRequestedSessionAgentId(
+          params.sessionRowRead.state.cfg,
+          targetRef.sessionKey,
+          targetRef.agentId,
+        );
+        if (!agent.ok) {
+          return { error: agent.error };
+        }
+        const row = params.sessionRowRead.describe({
+          key: targetRef.sessionKey,
+          agentId: agent.agentId,
+        });
+        if (!row && params.sessionScope === "operator.sessions.read") {
+          return { error: hiddenSessionNotFound(targetRef.sessionKey) };
+        }
+        const readSource = row && params.sessionRowRead.readSource(row);
+        return {
+          preparedReadSource: readSource,
+          target: row?.storedEntry
+            ? {
+                agentId: row.agentId,
+                canonicalKey: row.key,
+                storeKey: row.key,
+                storeKeys: [row.key],
+                storePath: row.storeTarget.storePath,
+                readSource,
+                entry: row.storedEntry,
+              }
+            : null,
+        };
+      }
       return {
         target: resolveSessionSharingTarget({
           cfg: getCfg(),
           sessionKey: targetRef.sessionKey,
-          agentId: targetRef.agentId,
-          ...lookupCaches,
+          agentId: input.value,
+          ...(lookupCaches ??= createLookupCaches()),
+          exactRead: targetCount === 1,
         }),
       };
     } catch (error) {
@@ -462,10 +293,45 @@ export function resolveSessionMutationAuthorization(params: {
       throw error;
     }
   };
-  // Incognito direct reads and writes share this central participation choke point;
-  // hidden keys use the stale-session refusal instead of revealing existence.
-  for (const targetRef of resolveDirectIncognitoTargets(params.method, params.requestParams)) {
-    const resolved = resolveAuthorizedTarget(targetRef);
+  let talkInput: ReturnType<typeof resolveTalkSessionTargetInput>;
+  let talkSessionTarget: PreparedTalkSessionTarget | undefined;
+  try {
+    talkInput = resolveTalkSessionTargetInput(
+      params.method,
+      params.requestParams,
+      params.client?.connId,
+    );
+    if (talkInput?.kind === "relay") {
+      assertTalkSessionStorageTarget(getCfg(), talkInput.target);
+      talkSessionTarget = talkInput.target;
+    } else {
+      talkSessionTarget = talkInput && prepareTalkSessionTarget(getCfg(), talkInput.sessionKey);
+    }
+  } catch (error) {
+    return {
+      error: errorShape(
+        ErrorCodes.INVALID_REQUEST,
+        String(error instanceof Error ? error.message : error),
+      ),
+    };
+  }
+  const talkTargets = talkSessionTarget
+    ? [{ sessionKey: talkSessionTarget.canonicalKey, agentId: talkSessionTarget.agentId }]
+    : undefined;
+  const directTargets =
+    talkTargets ?? resolveDirectSessionTargets(params.method, params.requestParams);
+  const hidesForeignSessions =
+    !adminBypass &&
+    directTargets.length > 0 &&
+    gatewayClientSessionCreator(params.client) &&
+    operatorSessionCap(params.client, getPolicyConfig()) === "none";
+  // Incognito and role-hidden direct reads share the same non-disclosing access boundary.
+  const protectedTargets = hidesForeignSessions
+    ? directTargets
+    : (talkTargets?.filter((target) => isIncognitoSessionKey(target.sessionKey)) ??
+      resolveDirectIncognitoTargets(params.method, params.requestParams));
+  for (const targetRef of protectedTargets) {
+    const resolved = resolveAuthorizedTarget(targetRef, protectedTargets.length);
     if ("error" in resolved) {
       return { error: resolved.error };
     }
@@ -478,13 +344,55 @@ export function resolveSessionMutationAuthorization(params: {
     if (error) {
       return { error };
     }
+    if (
+      hidesForeignSessions &&
+      target &&
+      !isSessionCreatorProfile(
+        target.entry.createdActor,
+        params.client?.authenticatedUserProfile?.profileId,
+      )
+    ) {
+      return { error: hiddenSessionNotFound(targetRef.sessionKey) };
+    }
   }
-  const targetRefs = resolveSessionMutationTargets({
-    method: params.method,
-    requestParams: params.requestParams,
-    context: params.context,
-    getCfg,
-  });
+  const bindsOwnProfile = params.sessionScope === "operator.sessions.write";
+  const actor = resolveGatewayOperatorRoleActor(params.client);
+  const ownSessionProfileId =
+    bindsOwnProfile && actor?.kind === "operator" ? actor.profileId : undefined;
+  const ownProfileError = bindsOwnProfile
+    ? ownSessionProfileId
+      ? authorizeOwnSessionMutation({
+          client: params.client,
+          target: null,
+          expectedProfileId: ownSessionProfileId,
+        })
+      : authenticatedProfileUnavailableError()
+    : null;
+  if (ownProfileError) {
+    return { error: ownProfileError };
+  }
+  const requestedCreateKey =
+    params.requestParams &&
+    typeof params.requestParams === "object" &&
+    "key" in params.requestParams
+      ? normalizeOptionalString(params.requestParams.key)
+      : undefined;
+  const permitsGeneratedSession = params.method === "sessions.create" && !requestedCreateKey;
+  const targetRefs =
+    talkTargets ??
+    resolveSessionMutationTargets({
+      method: params.method,
+      requestParams: params.requestParams,
+      context: params.context,
+      getCfg,
+    }) ??
+    // Creation may not have a row yet, but it must retain its original person until commit.
+    (bindsOwnProfile && !isRequiredSessionTargetMethod(params.method) ? [] : undefined);
+  if (params.expectedTarget && targetRefs?.length !== 1) {
+    return {
+      error: sessionMutationTargetChanged(params.method, params.expectedTarget.sessionKey).error,
+    };
+  }
   if (!targetRefs) {
     if (isRequiredSessionTargetMethod(params.method)) {
       return {
@@ -495,19 +403,56 @@ export function resolveSessionMutationAuthorization(params: {
     }
     return { error: null };
   }
+  if (talkSessionTarget && authorizesAgentRun) {
+    const error = authorizeGatewaySessionCreation({
+      cfg: getCfg(),
+      client: params.client,
+      agentId: talkSessionTarget.agentId,
+    });
+    if (error) {
+      return { error };
+    }
+  }
   const authorizedTargets: AuthorizedSessionMutationTarget[] = [];
   for (const targetRef of targetRefs) {
-    const resolved = resolveAuthorizedTarget(targetRef);
+    const resolved = resolveAuthorizedTarget(targetRef, targetRefs.length);
     if ("error" in resolved) {
       return { error: resolved.error };
     }
     const target = resolved.target;
+    if (
+      bindsOwnProfile &&
+      (params.method === "sessions.patch" || params.method === "sessions.patchMany") &&
+      !target
+    ) {
+      return { error: hiddenSessionNotFound(targetRef.sessionKey) };
+    }
     const error =
+      expectedSessionMutationTargetError(params.expectedTarget, target, params.method) ??
+      authorizeOwnSessionMutation({
+        client: params.client,
+        target,
+        expectedProfileId: ownSessionProfileId,
+      }) ??
+      (target && authorizesAgentRun
+        ? authorizeSessionAgentRun({
+            cfg: getPolicyConfig(),
+            client: params.client,
+            target,
+          })
+        : null) ??
       authorizeIncognitoSessionTarget({
         client: params.client,
         sessionKey: targetRef.sessionKey,
         target,
-      }) ?? (target ? authorizeSessionSharingTarget({ client: params.client, target }) : null);
+      }) ??
+      (target &&
+      !(
+        VISIBILITY_AUTHORIZED_METHODS.has(params.method) &&
+        (operatorSessionCap(params.client, getPolicyConfig()) ?? "write") === "write"
+      )
+        ? authorizeTargetAccess(getPolicyConfig(), target)
+        : null);
     if (error) {
       return { error };
     }
@@ -519,73 +464,238 @@ export function resolveSessionMutationAuthorization(params: {
             canonicalKey: target.canonicalKey,
             storeKey: target.storeKey,
             storePath: target.storePath,
+            readSource: resolved.preparedReadSource,
           }
         : null,
       sessionId: target?.entry.sessionId?.trim() || null,
+      ...(!target && ["sessions.send", "sessions.create"].includes(params.method)
+        ? {
+            absentTarget: resolveGatewaySessionStoreTarget({
+              cfg: getCfg(),
+              key: targetRef.sessionKey,
+              agentId: targetRef.agentId,
+            }),
+          }
+        : {}),
+      ...(bindsProgressLifecycle || bindsOwnProfile
+        ? { lifecycleRevision: target?.entry.lifecycleRevision }
+        : {}),
     });
   }
   return {
     error: null,
-    authorization: (() => {
+    authorization: ((): SessionMutationAuthorization => {
+      const targetChanged = (sessionKey: string) =>
+        sessionMutationTargetChanged(params.method, sessionKey);
+      const assertTalkTargetCurrent = (cfg: OpenClawConfig) => {
+        if (!talkInput || !talkSessionTarget) {
+          return;
+        }
+        let current: PreparedTalkSessionTarget;
+        try {
+          if (talkInput.kind === "relay") {
+            if (!talkInput.isCurrent()) {
+              throw targetChanged(talkSessionTarget.sessionKey);
+            }
+            assertTalkSessionStorageTarget(cfg, talkSessionTarget);
+            current = talkSessionTarget;
+          } else {
+            current = prepareTalkSessionTarget(cfg, talkInput.sessionKey);
+          }
+        } catch {
+          throw targetChanged(talkSessionTarget.sessionKey);
+        }
+        if (
+          current.agentId !== talkSessionTarget.agentId ||
+          current.sessionKey !== talkSessionTarget.sessionKey ||
+          current.canonicalKey !== talkSessionTarget.canonicalKey ||
+          current.storePath !== talkSessionTarget.storePath
+        ) {
+          throw targetChanged(talkSessionTarget.sessionKey);
+        }
+        const error =
+          authorizesAgentRun &&
+          authorizeGatewaySessionCreation({
+            cfg: params.context.getCommittedRuntimeConfig?.() ?? cfg,
+            client: params.client,
+            agentId: current.agentId,
+          });
+        if (error) {
+          throw new SessionMutationAuthorizationChangedError(error);
+        }
+      };
       const assertTargetCurrent = (
         targetRef: SessionMutationTarget,
         expected: AuthorizedSessionMutationTarget | undefined,
         currentCfg: OpenClawConfig,
         currentLookupCaches?: ReturnType<typeof createLookupCaches>,
+        ensuredSessionId?: string,
       ) => {
+        if (expected?.absentTarget && !expected.created) {
+          const currentRoute = resolveGatewaySessionStoreTarget({
+            cfg: currentCfg,
+            key: targetRef.sessionKey,
+            agentId: targetRef.agentId,
+          });
+          // Absence is bound to its original store too. Checking the creation
+          // notification would discover a redirected write only after COMMIT.
+          if (
+            currentRoute.agentId !== expected.absentTarget.agentId ||
+            currentRoute.canonicalKey !== expected.absentTarget.canonicalKey ||
+            currentRoute.storePath !== expected.absentTarget.storePath
+          ) {
+            throw targetChanged(targetRef.sessionKey);
+          }
+        }
         const current = resolveSessionSharingTarget({
           cfg: currentCfg,
           sessionKey: targetRef.sessionKey,
           agentId: targetRef.agentId,
           ...currentLookupCaches,
+          exactRead:
+            Boolean(expected?.resolved?.readSource) ||
+            !currentLookupCaches ||
+            authorizedTargets.length === 1,
         });
+        // The guarded ensure may mint this row/id. Its result permits only that
+        // materialization, never a replacement of an already admitted session.
+        const ensuredTarget =
+          talkSessionTarget &&
+          authorizesAgentRun &&
+          expected?.sessionId === null &&
+          ensuredSessionId
+            ? {
+                agentId: talkSessionTarget.agentId,
+                canonicalKey: talkSessionTarget.canonicalKey,
+                storeKey: talkSessionTarget.canonicalKey,
+                storePath: talkSessionTarget.storePath,
+              }
+            : undefined;
+        const expectedResolved = expected?.resolved ?? ensuredTarget;
+        const expectedReadSource = expected?.resolved?.readSource;
+        const expectedSessionId = expected?.sessionId ?? (ensuredTarget ? ensuredSessionId : null);
         const sameResolvedTarget =
           expected !== undefined &&
           (current === null
-            ? expected.resolved === null
-            : expected.resolved !== null &&
-              current.agentId === expected.resolved.agentId &&
-              current.canonicalKey === expected.resolved.canonicalKey &&
-              current.storeKey === expected.resolved.storeKey &&
-              current.storePath === expected.resolved.storePath &&
-              (current.entry.sessionId?.trim() || null) === expected.sessionId);
+            ? expected.resolved === null && !ensuredSessionId
+            : expectedResolved !== undefined &&
+              expectedResolved !== null &&
+              current.agentId === expectedResolved.agentId &&
+              current.canonicalKey === expectedResolved.canonicalKey &&
+              current.storeKey === expectedResolved.storeKey &&
+              (expectedReadSource
+                ? current.readSource?.databaseIdentity === expectedReadSource.databaseIdentity &&
+                  current.readSource.databaseBirthtime === expectedReadSource.databaseBirthtime &&
+                  current.readSource.agentId === expectedReadSource.agentId
+                : current.storePath === expectedResolved.storePath) &&
+              (current.entry.sessionId?.trim() || null) === expectedSessionId &&
+              (!(bindsProgressLifecycle || bindsOwnProfile || expected.created) ||
+                current.entry.lifecycleRevision === expected.lifecycleRevision));
         if (!sameResolvedTarget) {
-          throw new SessionMutationAuthorizationChangedError(
-            errorShape(
-              ErrorCodes.INVALID_REQUEST,
-              `session changed before ${params.method}; retry the request`,
-              {
-                details: {
-                  code: "SESSION_MUTATION_AUTHORIZATION_CHANGED",
-                  method: params.method,
-                  sessionKey: targetRef.sessionKey,
-                },
-              },
-            ),
-          );
+          throw targetChanged(targetRef.sessionKey);
+        }
+        const ownershipError = authorizeOwnSessionMutation({
+          client: params.client,
+          target: current,
+          expectedProfileId: ownSessionProfileId,
+        });
+        if (ownershipError) {
+          throw new SessionMutationAuthorizationChangedError(ownershipError);
         }
         if (!current) {
           return;
         }
+        const policyConfig = params.context.getCommittedRuntimeConfig?.() ?? currentCfg;
+        const visibilityAuthorized =
+          VISIBILITY_AUTHORIZED_METHODS.has(params.method) &&
+          (operatorSessionCap(params.client, policyConfig) ?? "write") === "write";
         const error =
+          (authorizesAgentRun
+            ? authorizeSessionAgentRun({
+                cfg: policyConfig,
+                client: params.client,
+                target: current,
+              })
+            : null) ??
           authorizeIncognitoSessionTarget({
             client: params.client,
             sessionKey: targetRef.sessionKey,
             target: current,
-          }) ?? authorizeSessionSharingTarget({ client: params.client, target: current });
+          }) ??
+          (visibilityAuthorized ? null : authorizeTargetAccess(policyConfig, current));
         if (error) {
           throw new SessionMutationAuthorizationChangedError(error);
         }
       };
+      let createdSessionRecorded = false;
       return {
+        ...(talkSessionTarget ? { talkSessionTarget } : {}),
+        ...(authorizedTargets.length === 1 &&
+        authorizedTargets[0]?.resolved &&
+        authorizedTargets[0].sessionId
+          ? {
+              admittedTarget: Object.freeze({
+                agentId: authorizedTargets[0].resolved.agentId,
+                sessionKey: authorizedTargets[0].resolved.canonicalKey,
+                sessionId: authorizedTargets[0].sessionId,
+              }),
+            }
+          : {}),
+        recordCreatedSession: (created) => {
+          // Only the creation owner's COMMIT notification may replace an absent snapshot.
+          // Never adopt a response/reload result, or a later incarnation of the same key.
+          if (createdSessionRecorded) {
+            return;
+          }
+          let expected = authorizedTargets.find(
+            (target) =>
+              target.sessionId === null &&
+              target.absentTarget?.agentId === created.agentId &&
+              target.absentTarget.canonicalKey === created.sessionKey &&
+              target.absentTarget.storePath === created.storePath,
+          );
+          if (!expected && permitsGeneratedSession) {
+            expected = {
+              sessionKey: created.sessionKey,
+              agentId: created.agentId,
+              resolved: null,
+              sessionId: null,
+            };
+            authorizedTargets.push(expected);
+          }
+          if (!expected) {
+            return;
+          }
+          createdSessionRecorded = true;
+          expected.resolved = {
+            agentId: created.agentId,
+            canonicalKey: created.sessionKey,
+            storeKey: created.sessionKey,
+            storePath: created.storePath,
+          };
+          expected.sessionId = created.sessionId;
+          expected.lifecycleRevision = created.lifecycleRevision;
+          expected.created = true;
+        },
         assertCurrent: () => {
+          const error = ownSessionProfileId
+            ? authorizeOwnSessionMutation({
+                client: params.client,
+                target: null,
+                expectedProfileId: ownSessionProfileId,
+              })
+            : null;
+          if (error) {
+            throw new SessionMutationAuthorizationChangedError(error);
+          }
           const currentCfg = params.context.getRuntimeConfig();
+          assertTalkTargetCurrent(currentCfg);
           const currentLookupCaches = createLookupCaches();
           for (const authorized of authorizedTargets) {
             assertTargetCurrent(authorized, authorized, currentCfg, currentLookupCaches);
           }
         },
-        assertTargetCurrent: (targetRef: SessionMutationTarget) => {
+        assertTargetCurrent: (targetRef: SessionMutationTarget & { ensuredSessionId?: string }) => {
           // Batch outcomes preserve caller identities, but authorization owns normalized targets.
           // Resolve the same normalized identity so padded aliases cannot escape the snapshot fence.
           const sessionKey = normalizeOptionalString(targetRef.sessionKey);
@@ -594,108 +704,17 @@ export function resolveSessionMutationAuthorization(params: {
           const expected = authorizedTargets.find(
             (target) => target.sessionKey === sessionKey && target.agentId === agentId,
           );
-          assertTargetCurrent(normalizedTarget, expected, params.context.getRuntimeConfig());
+          const currentCfg = params.context.getRuntimeConfig();
+          assertTalkTargetCurrent(currentCfg);
+          assertTargetCurrent(
+            normalizedTarget,
+            expected,
+            currentCfg,
+            undefined,
+            targetRef.ensuredSessionId,
+          );
         },
       };
     })(),
-  };
-}
-
-function loadSharingSnapshot(
-  cfg: OpenClawConfig,
-  sessionKey: string,
-  agentId?: string,
-): SessionSharingSnapshot {
-  return loadCachedSessionSharingSnapshot({
-    agentId,
-    sessionKey,
-    resolve: () => {
-      const target = resolveSessionSharingTarget({ cfg, sessionKey, agentId });
-      return {
-        canonicalKey: target?.canonicalKey ?? sessionKey,
-        canonicalAgentId: target?.agentId ?? agentId,
-        snapshot: {
-          // Missing rows occur after deletion. Fail closed here; the delete path also
-          // emits an unscoped catalog invalidation so identified readers still refresh.
-          visibility: target ? resolveSessionVisibility(target.entry) : "draft",
-          incognito: target
-            ? target.entry.incognito === true || isIncognitoSessionKey(target.canonicalKey)
-            : isIncognitoSessionKey(sessionKey),
-          ...(target ? { creatorId: target.entry.createdActor?.id } : {}),
-        },
-      };
-    },
-  });
-}
-
-export function canReceiveSessionEvent(params: {
-  cfg: OpenClawConfig;
-  client: GatewayWsClient;
-  sessionKeys: readonly string[];
-  agentId?: string;
-  event?: string;
-  payload?: unknown;
-}): boolean {
-  if (isGatewayAdmin(params.client)) {
-    return true;
-  }
-  const identity = gatewayClientSessionCreator(params.client);
-  if (!identity) {
-    return params.event !== "session.suggestion" && params.event !== "session.typing";
-  }
-  const visible = params.sessionKeys.every((sessionKey) => {
-    const snapshot = loadSharingSnapshot(params.cfg, sessionKey, params.agentId);
-    if (snapshot.incognito) {
-      return false;
-    }
-    if (snapshot.visibility !== "draft" || snapshot.creatorId === identity.id) {
-      return true;
-    }
-    if (params.event !== "session.typing") {
-      return false;
-    }
-    const target = resolveSessionSharingTarget({
-      cfg: params.cfg,
-      sessionKey,
-      agentId: params.agentId,
-    });
-    return (
-      target !== null &&
-      canManageSessionSharing(resolveSessionSharingRole({ client: params.client, target }))
-    );
-  });
-  if (!visible || params.event !== "session.suggestion") {
-    return visible;
-  }
-  const authorId =
-    params.payload && typeof params.payload === "object"
-      ? (params.payload as { suggestion?: { author?: { id?: unknown } } }).suggestion?.author?.id
-      : undefined;
-  if (authorId === identity.id) {
-    return true;
-  }
-  return params.sessionKeys.every((sessionKey) => {
-    const target = resolveSessionSharingTarget({
-      cfg: params.cfg,
-      sessionKey,
-      agentId: params.agentId,
-    });
-    return (
-      target !== null && resolveSessionSharingRole({ client: params.client, target }) !== "viewer"
-    );
-  });
-}
-
-export function createSessionListEntryFilter(params: {
-  client: GatewayClient | null;
-}): ((sessionKey: string, entry: SessionEntry) => boolean) | undefined {
-  const identity = gatewayClientSessionCreator(params.client);
-  if (isGatewayAdmin(params.client) || !identity) {
-    return undefined;
-  }
-  return (sessionKey, entry) => {
-    const owner = entry.createdActor?.id === identity.id;
-    const incognito = entry.incognito === true || isIncognitoSessionKey(sessionKey);
-    return !incognito && (owner || resolveSessionVisibility(entry) !== "draft");
   };
 }

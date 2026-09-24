@@ -9,7 +9,6 @@ import {
 } from "openclaw/plugin-sdk/runtime-doctor-migrations";
 import { FsSafeError, root as fsRoot } from "openclaw/plugin-sdk/security-runtime";
 import { isRecord } from "openclaw/plugin-sdk/string-coerce-runtime";
-import { LEGACY_MEMORY_WIKI_COMPILED_CACHE_PATHS } from "./src/compiled-cache.js";
 import {
   resolveMemoryWikiAgentConfig,
   resolveMemoryWikiConfig,
@@ -36,6 +35,11 @@ import {
   writeMemoryWikiSourceSyncState,
 } from "./src/source-sync-state.js";
 export { legacyConfigRules, normalizeCompatibilityConfig } from "./src/config-compat.js";
+
+const LEGACY_MEMORY_WIKI_COMPILED_CACHE_PATHS = [
+  ".openclaw-wiki/cache/agent-digest.json",
+  ".openclaw-wiki/cache/claims.jsonl",
+] as const;
 
 function resolveHomeDir(env: NodeJS.ProcessEnv): string | undefined {
   return env.HOME?.trim() || env.USERPROFILE?.trim() || undefined;
@@ -90,6 +94,7 @@ function resolveConfiguredVaultRoots(params: {
   const homeDir = resolveHomeDir(params.env);
   const resolved = resolveMemoryWikiConfig(readConfiguredPluginConfig(params.config), {
     homedir: homeDir,
+    env: params.env,
   });
   if (resolved.vault.scope === "global") {
     return [resolved.vault.path];
@@ -146,10 +151,7 @@ export const stateMigrations: PluginDoctorStateMigration[] = [
     label: "Memory Wiki compiled cache files",
     async detectLegacyState(params) {
       const previews: string[] = [];
-      for (const vaultRoot of resolveConfiguredVaultRoots({
-        config: params.config,
-        env: params.env,
-      })) {
+      for (const vaultRoot of resolveConfiguredVaultRoots(params)) {
         const root = await openExistingVaultRoot(vaultRoot);
         if (!root) {
           continue;
@@ -171,10 +173,7 @@ export const stateMigrations: PluginDoctorStateMigration[] = [
     async migrateLegacyState(params) {
       const changes: string[] = [];
       const warnings: string[] = [];
-      for (const vaultRoot of resolveConfiguredVaultRoots({
-        config: params.config,
-        env: params.env,
-      })) {
+      for (const vaultRoot of resolveConfiguredVaultRoots(params)) {
         const root = await openExistingVaultRoot(vaultRoot);
         if (!root) {
           continue;
@@ -190,13 +189,17 @@ export const stateMigrations: PluginDoctorStateMigration[] = [
           } catch (error) {
             if (!isMissingPathError(error)) {
               warnings.push(
-                `Failed removing rebuildable Memory Wiki compiled cache ${filePath}: ${String(error)}`,
+                `Skipped rebuildable Memory Wiki compiled cache cleanup. Run openclaw doctor --fix to retry. ${filePath}: ${String(error)}`,
               );
             }
           }
         }
       }
-      return { changes, warnings };
+      return {
+        changes,
+        warnings,
+        ...(warnings.length > 0 ? { warningDisposition: "recoverable" as const } : {}),
+      };
     },
   },
   {
@@ -204,10 +207,7 @@ export const stateMigrations: PluginDoctorStateMigration[] = [
     label: "Memory Wiki source sync state",
     async detectLegacyState(params) {
       const previews: string[] = [];
-      for (const vaultRoot of resolveConfiguredVaultRoots({
-        config: params.config,
-        env: params.env,
-      })) {
+      for (const vaultRoot of resolveConfiguredVaultRoots(params)) {
         const filePath = resolveMemoryWikiSourceSyncStatePath(vaultRoot);
         const state = await readLegacyMemoryWikiSourceSyncState(vaultRoot);
         const count = Object.keys(state.entries).length;
@@ -224,10 +224,7 @@ export const stateMigrations: PluginDoctorStateMigration[] = [
       const changes: string[] = [];
       const warnings: string[] = [];
       const store = createMemoryWikiSourceSyncStateStore(params.context.openPluginStateKeyedStore);
-      for (const vaultRoot of resolveConfiguredVaultRoots({
-        config: params.config,
-        env: params.env,
-      })) {
+      for (const vaultRoot of resolveConfiguredVaultRoots(params)) {
         const filePath = resolveMemoryWikiSourceSyncStatePath(vaultRoot);
         if (!(await legacyStateFileExists(filePath))) {
           continue;
@@ -274,10 +271,7 @@ export const stateMigrations: PluginDoctorStateMigration[] = [
     label: "Memory Wiki import run records",
     async detectLegacyState(params) {
       const previews: string[] = [];
-      for (const vaultRoot of resolveConfiguredVaultRoots({
-        config: params.config,
-        env: params.env,
-      })) {
+      for (const vaultRoot of resolveConfiguredVaultRoots(params)) {
         const records = await readLegacyMemoryWikiImportRunRecords(vaultRoot);
         if (records.length === 0) {
           continue;
@@ -292,10 +286,7 @@ export const stateMigrations: PluginDoctorStateMigration[] = [
       const changes: string[] = [];
       const warnings: string[] = [];
       const store = createMemoryWikiImportRunStateStore(params.context.openPluginStateKeyedStore);
-      for (const vaultRoot of resolveConfiguredVaultRoots({
-        config: params.config,
-        env: params.env,
-      })) {
+      for (const vaultRoot of resolveConfiguredVaultRoots(params)) {
         const records = await readLegacyMemoryWikiImportRunRecords(vaultRoot);
         if (records.length === 0) {
           continue;

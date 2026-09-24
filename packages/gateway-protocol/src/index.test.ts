@@ -23,12 +23,7 @@ import {
   validateSessionsObserverVisibilityParams,
   validateSessionsPatchManyParams,
   validateSessionsPatchParams,
-  validateSessionsSearchParams,
   validateSessionsSendParams,
-  validateSessionsUsageParams,
-  validateTasksCancelParams,
-  validateTasksListParams,
-  validateTasksRecoveryParams,
   validateTalkConfigResult,
   validateTalkClientCreateParams,
   validateTalkClientCreateResult,
@@ -160,39 +155,30 @@ describe("lazy protocol validators", () => {
     expect(formatValidationErrors(validateCommandsListParams.errors)).toContain("must be boolean");
   });
 
-  it("accepts every sessions.list archive filter mode", () => {
+  it("validates sessions.list filters and activity ordering", () => {
     expectAccepted(validateSessionsListParams, [
       {},
       { archived: false },
       { archived: true },
       { archived: "all" },
       { involvingMe: true },
+      { sortBy: "updatedAt" },
+      { sortBy: "lastInteractionAt" },
+      { sortBy: "activity", activeMinutes: 1_440, limit: 100 },
+      { boardFace: "dashboard" },
+      { hasBoard: true },
+      { hasBoard: false },
     ]);
     expectRejected(validateSessionsListParams, [{ archived: "archived" }, { involvingMe: "yes" }]);
+    expectRejected(validateSessionsListParams, [{ sortBy: "recent" }]);
+    expectRejected(validateSessionsListParams, [{ boardFace: "grid" }, { hasBoard: "yes" }]);
   });
 
-  it("validates session board face list and patch values", () => {
-    expectAccepted(validateSessionsListParams, [{ boardFace: "dashboard" }]);
-    expectRejected(validateSessionsListParams, [{ boardFace: "grid" }]);
+  it("validates session board face patch values", () => {
     expectAccepted(validateSessionsPatchParams, [{ key: "agent:main:main", boardFace: "chat" }]);
     expectRejected(validateSessionsPatchParams, [{ key: "agent:main:main", boardFace: "grid" }]);
     // The schemas are closed objects; the pre-rename name must not slip back in.
     expectRejected(validateSessionsListParams, [{ face: "dashboard" }]);
-  });
-
-  it("validates session patch compare-and-swap identity", () => {
-    expectAccepted(validateSessionsPatchParams, [
-      sessionPatch({
-        key: "agent:main:self-archive",
-        archived: true,
-        expectedSessionId: "session-self-archive",
-        expectedLifecycleRevision: "revision-self-archive",
-      }),
-    ]);
-    expectRejected(validateSessionsPatchParams, [
-      sessionPatch({ key: "agent:main:self-archive", expectedSessionId: "" }),
-      sessionPatch({ key: "agent:main:self-archive", expectedLifecycleRevision: "" }),
-    ]);
   });
 
   it("validates bounded closed bulk session patch requests", () => {
@@ -213,6 +199,7 @@ describe("lazy protocol validators", () => {
       archived: false,
       pinned: true,
       unread: true,
+      contextWindow: "1m",
       thinkingLevel: "high",
       fastMode: "auto",
       toolOverrides: null,
@@ -222,8 +209,6 @@ describe("lazy protocol validators", () => {
       responseUsage: "full",
       elevatedLevel: "on",
       execHost: "gateway",
-      execSecurity: "allowlist",
-      execAsk: "on-miss",
       execNode: "node-1",
       model: "openai/gpt-5.6-luna",
       completionOwnerSessionKey: "agent:main:main",
@@ -266,6 +251,15 @@ describe("lazy protocol validators", () => {
       { targets: [target], patch: { archived: true, extra: true } },
       { targets: [target], patch: { archived: true }, extra: true },
     ]);
+  });
+
+  it.each(["execSecurity", "execAsk"])("accepts retired v4 session policy field %s", (field) => {
+    for (const value of ["deny", "always", null]) {
+      expectAccepted(validateSessionsPatchParams, [sessionPatch({ [field]: value })]);
+      expectAccepted(validateSessionsPatchManyParams, [
+        { targets: [{ key: "agent:main:main" }], patch: { [field]: value } },
+      ]);
+    }
   });
 
   it("validates sparse session tool overrides", () => {
@@ -407,48 +401,19 @@ describe("lazy protocol validators", () => {
     expectAccepted(protocol.validateSessionsCompactParams, [{ key: "global", agentId: "work" }]);
   });
 
-  it("accepts selected-agent scope on chat metadata params", () => {
-    expectAccepted(validateChatMetadataParams, [{}, { agentId: "work" }]);
+  it("accepts distinct session and draft-account scopes on chat metadata params", () => {
+    expectAccepted(validateChatMetadataParams, [
+      {},
+      { agentId: "work" },
+      { sessionKey: "agent:work:main" },
+      { agentId: "work", sessionKey: "global" },
+      { agentId: "work", authProfileId: "test:locked" },
+    ]);
     expectRejected(validateChatMetadataParams, [
       { agentId: "" },
       { agentId: "work", view: "configured" },
-    ]);
-  });
-
-  it("accepts an IANA time zone for session usage while retaining UTC offsets", () => {
-    expectAccepted(validateSessionsUsageParams, [
-      { mode: "specific", timeZone: "Europe/Vienna" },
-      { mode: "specific", utcOffset: "UTC+2" },
-    ]);
-    expectRejected(validateSessionsUsageParams, [
-      { mode: "specific", timeZone: "" },
-      { mode: "specific", timeZone: 2 },
-    ]);
-  });
-
-  it("validates bounded session transcript search params", () => {
-    const search = (overrides: Record<string, unknown> = {}) => ({
-      query: "deployment failure",
-      ...overrides,
-    });
-    expectAccepted(validateSessionsSearchParams, [
-      search(),
-      search({
-        agentId: "work",
-        sessionKeys: ["agent:work:main", "agent:work:other"],
-        limit: 25,
-      }),
-    ]);
-    expectRejected(validateSessionsSearchParams, [
-      search({ agentId: "" }),
-      search({ sessionKey: "agent:work:main" }),
-      search({ sessionKeys: [] }),
-      search({
-        sessionKeys: Array.from({ length: 201 }, (_, index) => `session-${index}`),
-      }),
-      search({ limit: 26 }),
-      { query: "" },
-      { query: "x".repeat(4097) },
+      { sessionKey: "" },
+      { sessionKey: "agent:work:main", authProfileId: "test:locked" },
     ]);
   });
 
@@ -735,6 +700,21 @@ describe("validateTalkConfigResult", () => {
       }),
     ]);
   });
+
+  it("accepts response-only realtime client routing hints", () => {
+    expectAccepted(validateTalkConfigResult, [
+      {
+        config: {
+          clientHints: {
+            realtime: {
+              modelSource: "gateway",
+              gatewayRelaySupported: false,
+            },
+          },
+        },
+      },
+    ]);
+  });
 });
 
 describe("validateTalkClientCreateParams", () => {
@@ -851,7 +831,7 @@ describe("validateTalkSessionRelayParams", () => {
     expectAccepted(validateTalkSessionAppendAudioParams, [
       talkSession({ audioBase64: "aGVsbG8=", timestamp: 123 }),
     ]);
-    expectAccepted(validateTalkSessionCancelOutputParams, [talkSession({ reason: "barge-in" })]);
+    expectAccepted(validateTalkSessionCancelOutputParams, [talkSession({ turnId: "turn-7" })]);
     expectAccepted(validateTalkSessionSubmitToolResultParams, [
       talkSession({
         callId: "call-1",
@@ -1003,18 +983,27 @@ describe("validateModelsListParams", () => {
   it("accepts the supported model catalog views", () => {
     expectAccepted(validateModelsListParams, [
       {},
+      { sessionKey: "agent:work:saved", view: "configured" },
+      { agentId: "work", authProfileId: "personal:reader:account" },
       { view: "default" },
       { view: "configured" },
       { view: "all" },
       { view: "configured", preparedOnly: true },
       { view: "all", refresh: true },
+      { view: "configured", provider: "minimax", includeDetails: true },
     ]);
   });
 
   it("rejects unknown model catalog views and extra fields", () => {
     expectRejected(validateModelsListParams, [
       { view: "available" },
-      { view: "configured", provider: "minimax" },
+      { sessionKey: "agent:work:saved", authProfileId: "personal:reader:account" },
+      { sessionKey: "" },
+      { authProfileId: "" },
+      { preparedOnly: true, refresh: true },
+      { view: "configured", unexpected: true },
+      { provider: "" },
+      { includeDetails: "yes" },
     ]);
   });
 });
@@ -1042,40 +1031,12 @@ describe("validateModelsProbeParams", () => {
   });
 });
 
-describe("validateTasksListParams", () => {
-  it("accepts SDK task ledger filters", () => {
-    expectAccepted(validateTasksListParams, [
-      {
-        status: ["running", "completed"],
-        agentId: "main",
-        sessionKey: "agent:main:main",
-        limit: 50,
-        cursor: "100",
-      },
-    ]);
-  });
-
-  it("rejects internal task statuses and unknown fields", () => {
-    expectRejected(validateTasksListParams, [{ status: "succeeded" }]);
-    expectRejected(validateTasksCancelParams, [{ taskId: "task-1", force: true }]);
-  });
-});
-
-describe("validateTasksRecoveryParams", () => {
-  it("accepts one to ten task ids and rejects unbounded recovery batches", () => {
-    expectAccepted(validateTasksRecoveryParams, [{ taskIds: ["task-1", "task-2"] }]);
-    expectRejected(validateTasksRecoveryParams, [
-      { taskIds: [] },
-      { taskIds: Array.from({ length: 11 }, (_, index) => `task-${index}`) },
-      { taskIds: ["task-1"], force: true },
-    ]);
-  });
-});
-
 describe("validateNodePresenceActivityPayload", () => {
   it("accepts bounded input idle time", () => {
     expectAccepted(validateNodePresenceActivityPayload, [
       { idleSeconds: 12 },
+      { idleSeconds: 12, source: "app" },
+      { idleSeconds: 12, source: "system" },
       { idleSeconds: 2_592_000, saturated: true },
       { action: "clear" },
     ]);
@@ -1083,6 +1044,7 @@ describe("validateNodePresenceActivityPayload", () => {
 
   it("rejects negative, unbounded, and extra fields", () => {
     expectRejected(validateNodePresenceActivityPayload, [
+      { idleSeconds: 12, source: "browser" },
       { idleSeconds: -1 },
       { idleSeconds: 2_592_001 },
       { idleSeconds: 1, active: true },

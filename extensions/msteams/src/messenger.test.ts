@@ -9,6 +9,7 @@ import { resolvePreferredOpenClawTmpDir } from "openclaw/plugin-sdk/temp-path";
 import { withServer } from "openclaw/plugin-sdk/test-env";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { StoredConversationReference } from "./conversation-store.js";
+import { teamsMarkdownDeliveryCases } from "./format.test-fixtures.js";
 const graphUploadMockState = vi.hoisted(() => ({
   uploadAndShareSharePoint: vi.fn(),
   getDriveItemProperties: vi.fn(),
@@ -330,31 +331,33 @@ describe("msteams messenger", () => {
       expect(ids).toEqual(["id:one", "id:two"]);
     });
 
-    it("sends top-level messages via proactive send context", async () => {
-      const texts: string[] = [];
-      let capturedConversationId: string | undefined;
+    it.each(teamsMarkdownDeliveryCases)(
+      "sends $name via proactive send context",
+      async ({ source, expected }) => {
+        const texts: string[] = [];
+        let capturedConversationId: string | undefined;
 
-      const ids = await sendMSTeamsMessages({
-        replyStyle: "top-level",
-        app: createMockApp({
-          createFn: async (activity: unknown) => {
-            const text = (activity as Record<string, unknown>)?.text;
-            texts.push(typeof text === "string" ? text : "");
-            return { id: typeof text === "string" ? `id:${text}` : "created" };
-          },
-          onClientCreated: (_serviceUrl, conversationId) => {
-            capturedConversationId = conversationId;
-          },
-        }),
-        appId: "app123",
-        conversationRef: baseRef,
-        messages: [{ text: "hello" }],
-      });
+        const ids = await sendMSTeamsMessages({
+          replyStyle: "top-level",
+          app: createMockApp({
+            createFn: createRecordedSendActivity(texts),
+            onClientCreated: (_serviceUrl, conversationId) => {
+              capturedConversationId = conversationId;
+            },
+          }),
+          appId: "app123",
+          conversationRef: baseRef,
+          messages: renderReplyPayloadsToMessages([{ text: source }], {
+            textChunkLimit: 4000,
+            tableMode: "off",
+          }),
+        });
 
-      expect(texts).toEqual(["hello"]);
-      expect(ids).toEqual(["id:hello"]);
-      expect(capturedConversationId).toBe("19:abc@thread.tacv2");
-    });
+        expect(texts).toEqual([expected]);
+        expect(ids).toEqual([`id:${expected}`]);
+        expect(capturedConversationId).toBe("19:abc@thread.tacv2");
+      },
+    );
 
     it("requires SharePoint storage for channel files", async () => {
       const tmpDir = await mkdtemp(path.join(resolvePreferredOpenClawTmpDir(), "msteams-storage-"));
@@ -508,13 +511,14 @@ describe("msteams messenger", () => {
       expect(retryEvents).toEqual([{ nextAttempt: 2, delayMs: 0 }]);
     });
 
-    it("retries full activity preparation when media upload fails transiently", async () => {
+    it("retries media preparation but reuses it after provider dispatch starts", async () => {
       const tmpDir = await mkdtemp(path.join(resolvePreferredOpenClawTmpDir(), "msteams-retry-"));
       const localFile = path.join(tmpDir, "retry.txt");
       await writeFile(localFile, "hello");
 
       try {
         const attempts: string[] = [];
+        const providerPayloads: string[] = [];
         const retryEvents: Array<{ nextAttempt: number; delayMs: number }> = [];
         let uploadAttempts = 0;
         graphUploadMockState.uploadAndShareSharePoint.mockImplementation(async () => {
@@ -535,8 +539,12 @@ describe("msteams messenger", () => {
           name: "retry.txt",
         });
 
+        const sendActivity = createRecordedSendActivity(attempts, 429);
         const ctx = {
-          sendActivity: createRecordedSendActivity(attempts),
+          sendActivity: async (activity: unknown) => {
+            providerPayloads.push(JSON.stringify(activity));
+            return await sendActivity(activity);
+          },
         };
         const ids = await sendMSTeamsMessages({
           replyStyle: "thread",
@@ -555,14 +563,18 @@ describe("msteams messenger", () => {
             getAccessToken: async () => "token",
           },
           sharePointSiteId: "site-123",
-          retry: { maxAttempts: 2, baseDelayMs: 0, maxDelayMs: 0 },
+          retry: { maxAttempts: 3, baseDelayMs: 0, maxDelayMs: 0 },
           onRetry: (e) => retryEvents.push({ nextAttempt: e.nextAttempt, delayMs: e.delayMs }),
         });
 
         expect(uploadAttempts).toBe(2);
-        expect(attempts).toEqual(["one"]);
+        expect(attempts).toEqual(["one", "one"]);
+        expect(providerPayloads[1]).toBe(providerPayloads[0]);
         expect(ids).toEqual(["id:one"]);
-        expect(retryEvents).toEqual([{ nextAttempt: 2, delayMs: 0 }]);
+        expect(retryEvents).toEqual([
+          { nextAttempt: 2, delayMs: 0 },
+          { nextAttempt: 3, delayMs: 0 },
+        ]);
       } finally {
         await rm(tmpDir, { recursive: true, force: true });
       }

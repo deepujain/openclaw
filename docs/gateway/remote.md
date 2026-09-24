@@ -27,6 +27,11 @@ The Gateway WebSocket binds to **loopback** by default, on port `18789` (`gatewa
 
 For the always-on and laptop setups, prefer keeping `gateway.bind: "loopback"` and using **Tailscale Serve** for the Control UI, or a trusted LAN/Tailnet bind with `gateway.remote.transport: "direct"`. SSH tunnel is the fallback that works from any machine.
 
+Application previews need their own private ingress. A tunnel that forwards only
+the Gateway port does not forward portals. Use [managed private Serve or wildcard
+portal ingress](/gateway/portals#remote-access); the browser and application must
+use the service's returned portal URLs without replacing their host or port.
+
 ## Command flow (what runs where)
 
 One Gateway owns state and channels; nodes are peripherals. Example (Telegram message routed to a node tool):
@@ -49,7 +54,12 @@ With the tunnel up, `openclaw health` and `openclaw status --deep` reach the rem
 To replace per-client SSH tunnels with one private `wss://` endpoint while keeping the Gateway on loopback, follow [Give your Gateway a stable HTTPS URL](/gateway/stable-https-url).
 
 <Note>
-Replace `18789` with your configured `gateway.port` (or `--port` / `OPENCLAW_GATEWAY_PORT`).
+The first port is local; the final port is the remote Gateway destination. To keep
+the local URL above, replace only the remote destination with your
+configured `gateway.port` (or `--port` / `OPENCLAW_GATEWAY_PORT`). For example,
+`ssh -N -L 18789:127.0.0.1:29443 user@gateway-host` reaches a Gateway on remote port
+`29443` through the same local URL. Discovery and onboarding use the resolved
+Gateway service port for this destination.
 </Note>
 
 <Warning>
@@ -73,6 +83,18 @@ Persist a remote target so CLI commands use it by default:
 ```
 
 When the Gateway is loopback-only, keep the URL at `ws://127.0.0.1:18789` and open the SSH tunnel first. In the macOS app's SSH-tunnel transport, the discovered Gateway hostname goes in `gateway.remote.sshTarget` (`user@host` or `user@host:port`); `gateway.remote.url` stays the local tunnel URL. If the remote port differs from the local one, set `gateway.remote.remotePort`.
+
+Running `openclaw configure --section gateway` or interactive onboarding again
+preserves the remote TLS fingerprint and transport settings when you keep the
+same URL (ignoring surrounding whitespace). Changing the URL clears those
+endpoint settings. A newly confirmed discovery fingerprint replaces the saved
+pin only for the discovered URL, and your selected auth method still applies.
+Accepting a discovered direct connection selects direct transport. Choosing a
+discovered SSH tunnel clears saved transport settings for the suggested loopback
+URL, which may now reach a different host; start the displayed tunnel manually.
+
+The onboarding and configure readiness checks use the saved TLS fingerprint for
+that same endpoint. Probing a different URL does not inherit its certificate pin.
 
 Host-key verification is strict by default (`gateway.remote.sshHostKeyPolicy: "strict"`). Set it to `"openssh"` to delegate to your effective OpenSSH config instead; review your user and system SSH settings before enabling it.
 
@@ -267,7 +289,7 @@ ssh-copy-id -i ~/.ssh/id_rsa <REMOTE_USER>@<REMOTE_IP>
 openclaw config set gateway.remote.token "<your-token>"
 ```
 
-Use `gateway.remote.password` instead if the remote Gateway uses password auth. `OPENCLAW_GATEWAY_TOKEN` is still valid as a shell-level override, but the durable remote-client setup is `gateway.remote.token` / `gateway.remote.password`.
+The Gateway accepts its configured secret in either field: `gateway.remote.token` or `gateway.remote.password` both work, including for password-mode Gateways. The server's `gateway.auth.mode` selects which configured secret to use. `OPENCLAW_GATEWAY_TOKEN` is still valid as a shell-level override, but the durable remote-client setup is `gateway.remote.token` / `gateway.remote.password`.
 
 #### Step 4: create the LaunchAgent
 
@@ -302,6 +324,9 @@ launchctl bootstrap gui/$UID ~/Library/LaunchAgents/ai.openclaw.ssh-tunnel.plist
 
 The tunnel starts automatically at login, restarts on crash, and keeps the forwarded port live.
 
+Open or reopen OpenClaw.app after setup, then verify the connection using the
+[macOS remote access](/platforms/mac/remote) checks.
+
 <Note>
 If you have a leftover `com.openclaw.ssh-tunnel` LaunchAgent from an older setup, unload and delete it.
 </Note>
@@ -331,4 +356,5 @@ launchctl bootout gui/$UID/ai.openclaw.ssh-tunnel
 
 - [Tailscale](/gateway/tailscale)
 - [Authentication](/gateway/authentication)
-- [Remote gateway setup](/gateway/remote-gateway-readme)
+- [Trusted proxy auth](/gateway/trusted-proxy-auth) — authenticating remote access through a reverse proxy
+- [Network](/network) — the hub for how OpenClaw connects, pairs, and secures devices across localhost, LAN, and tailnet

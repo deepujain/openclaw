@@ -1,14 +1,7 @@
 // Write Cli Startup Metadata script supports OpenClaw repository automation.
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import fs, {
-  existsSync,
-  mkdirSync,
-  mkdtempSync,
-  readdirSync,
-  readFileSync,
-  writeFileSync,
-} from "node:fs";
+import fs, { existsSync, mkdtempSync, readdirSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -16,6 +9,7 @@ import { toErrorObject } from "@openclaw/normalization-core/error-coercion";
 import pMap from "p-map";
 import type { RootHelpRenderOptions } from "../src/cli/program/root-help.js";
 import type { OpenClawConfig } from "../src/config/config.js";
+import { replaceFileAtomicSync } from "../src/infra/replace-file.js";
 import { resolveCliStartupRootHelpBundleIdentity } from "./lib/cli-startup-root-help-bundle.js";
 import { terminateManagedChild } from "./lib/managed-child-process.mts";
 
@@ -46,6 +40,7 @@ const COMMAND_HELP_RENDER_KILL_GRACE_MS = 5_000;
 // proxy for module-loading throughput on a disk-contended host.
 const COMMAND_HELP_RENDER_CONCURRENCY = 2;
 const PRECOMPUTED_SUBCOMMAND_HELP_COMMANDS = [
+  "config",
   "doctor",
   "gateway",
   "models",
@@ -282,6 +277,7 @@ function resolveSubcommandHelpSourceSignature(sourceRootDir: string = rootDir): 
       path.join(sourceRootDir, "src/cli/program/context.ts"),
       path.join(sourceRootDir, "src/cli/banner.ts"),
       path.join(sourceRootDir, "src/cli/help-format.ts"),
+      path.join(sourceRootDir, "src/cli/config-cli.ts"),
       path.join(sourceRootDir, "src/cli/daemon-cli/register-service-commands.ts"),
       path.join(sourceRootDir, "src/cli/program/register.maintenance.ts"),
       path.join(sourceRootDir, "src/cli/program/register.status-health-sessions.ts"),
@@ -1085,10 +1081,10 @@ async function writeCliStartupMetadata(options?: {
       supervisor,
     );
 
-  mkdirSync(resolvedDistDir, { recursive: true });
-  writeFileSync(
-    resolvedOutputPath,
-    `${JSON.stringify(
+  const outputDir = fs.realpathSync(path.dirname(resolvedOutputPath));
+  replaceFileAtomicSync({
+    filePath: path.join(outputDir, path.basename(resolvedOutputPath)),
+    content: `${JSON.stringify(
       {
         generatedBy: "scripts/write-cli-startup-metadata.ts",
         generatorSignature,
@@ -1108,8 +1104,11 @@ async function writeCliStartupMetadata(options?: {
       null,
       2,
     )}\n`,
-    "utf8",
-  );
+    // Keep build artifact permissions; the atomic helper defaults to private files/directories.
+    mode: 0o666 & ~process.umask(),
+    dirMode: fs.statSync(outputDir).mode,
+    preserveExistingMode: true,
+  });
 }
 
 function hasAllPrecomputedSubcommandHelpText(value: unknown): boolean {

@@ -1,3 +1,4 @@
+import { getRuntimeConfig } from "../../../config/config.js";
 import { withPluginRuntimeRegistryScope } from "../../../plugins/runtime/gateway-request-scope.js";
 import { removeInternalSessionEffectsSession } from "../../internal-session-effects.js";
 import {
@@ -13,7 +14,6 @@ import {
 import {
   loadSubagentRegistryPluginRuntimeHandle,
   resolveSubagentRegistryContextEngine,
-  type SubagentRegistryDeps,
 } from "./subagent-registry-deps.js";
 import { safeRemoveAttachmentsDir } from "./subagent-registry-helpers.js";
 import type {
@@ -22,18 +22,17 @@ import type {
 } from "./subagent-registry.types.js";
 
 export function createSubagentRegistryContextCleanup(config: {
-  deps: () => SubagentRegistryDeps;
   persist: (...runIds: string[]) => void;
   warn: (message: string, meta?: Record<string, unknown>) => void;
 }) {
-  const { deps, persist, warn } = config;
+  const { persist, warn } = config;
   const endedHookInFlightRunIds = new Set<string>();
 
   async function runContextEngineSubagentEnded(
     params: ContextEngineSubagentEndedParams,
     options?: { isCurrent?: () => boolean },
   ): Promise<void> {
-    const cfg = deps().getRuntimeConfig();
+    const cfg = getRuntimeConfig();
     const registry = await loadSubagentRegistryPluginRuntimeHandle({
       config: cfg,
       ...(params.workspaceDir ? { workspaceDir: params.workspaceDir } : {}),
@@ -44,10 +43,22 @@ export function createSubagentRegistryContextCleanup(config: {
         agentDir: params.agentDir,
         workspaceDir: params.workspaceDir,
       });
-      if (options?.isCurrent?.() === false) {
-        return;
+      let failure: { error: unknown } | undefined;
+      try {
+        if (options?.isCurrent?.() !== false) {
+          await engine.onSubagentEnded?.(params);
+        }
+      } catch (error) {
+        failure = { error };
       }
-      await engine.onSubagentEnded?.(params);
+      try {
+        await engine.dispose?.();
+      } catch (error) {
+        failure ??= { error };
+      }
+      if (failure) {
+        throw failure.error;
+      }
     });
   }
 
@@ -135,39 +146,44 @@ export function createSubagentRegistryContextCleanup(config: {
     if (params.entry.endedHookEmittedAt) {
       return;
     }
-    const cfg = deps().getRuntimeConfig();
-    const registry = await loadSubagentRegistryPluginRuntimeHandle({
-      config: cfg,
-      ...(params.entry.workspaceDir ? { workspaceDir: params.entry.workspaceDir } : {}),
-      allowGatewaySubagentBinding: true,
-    });
-    await withPluginRuntimeRegistryScope(registry, async () => {
-      if (params.entry.endedHookEmittedAt || params.isCurrent?.() === false) {
-        return;
-      }
-      // Plugin loading yields after the terminal lock is released. Resolve the
-      // event from the canonical row only after that boundary so an older callback
-      // cannot claim the exactly-once hook with a superseded timeout or error.
-      const reason = params.entry.endedReason ?? params.reason ?? SUBAGENT_ENDED_REASON_COMPLETE;
-      const outcome =
-        reason === SUBAGENT_ENDED_REASON_KILLED
-          ? SUBAGENT_ENDED_OUTCOME_KILLED
-          : resolveLifecycleOutcomeFromRunOutcome(params.entry.execution.outcome);
-      const error =
-        params.entry.execution.outcome?.status === "error"
-          ? params.entry.execution.outcome.error
-          : undefined;
-      await emitSubagentEndedHookOnce({
-        entry: params.entry,
-        reason,
-        sendFarewell: params.sendFarewell,
-        accountId: params.accountId ?? params.entry.requesterOrigin?.accountId,
-        outcome,
-        error,
-        inFlightRunIds: endedHookInFlightRunIds,
-        persist,
+    // Loading and entering plugin scope are part of the best-effort hook boundary.
+    try {
+      const cfg = getRuntimeConfig();
+      const registry = await loadSubagentRegistryPluginRuntimeHandle({
+        config: cfg,
+        ...(params.entry.workspaceDir ? { workspaceDir: params.entry.workspaceDir } : {}),
+        allowGatewaySubagentBinding: true,
       });
-    });
+      await withPluginRuntimeRegistryScope(registry, async () => {
+        if (params.entry.endedHookEmittedAt || params.isCurrent?.() === false) {
+          return;
+        }
+        // Plugin loading yields after the terminal lock is released. Resolve the
+        // event from the canonical row only after that boundary so an older callback
+        // cannot claim the exactly-once hook with a superseded timeout or error.
+        const reason = params.entry.endedReason ?? params.reason ?? SUBAGENT_ENDED_REASON_COMPLETE;
+        const outcome =
+          reason === SUBAGENT_ENDED_REASON_KILLED
+            ? SUBAGENT_ENDED_OUTCOME_KILLED
+            : resolveLifecycleOutcomeFromRunOutcome(params.entry.execution.outcome);
+        const error =
+          params.entry.execution.outcome?.status === "error"
+            ? params.entry.execution.outcome.error
+            : undefined;
+        await emitSubagentEndedHookOnce({
+          entry: params.entry,
+          reason,
+          sendFarewell: params.sendFarewell,
+          accountId: params.accountId ?? params.entry.requesterOrigin?.accountId,
+          outcome,
+          error,
+          inFlightRunIds: endedHookInFlightRunIds,
+          persist,
+        });
+      });
+    } catch (err) {
+      warn("subagent_ended hook failed (best-effort)", { phase: "plugin-runtime", err });
+    }
   }
 
   return {

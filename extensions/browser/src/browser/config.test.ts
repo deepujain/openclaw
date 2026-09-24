@@ -2,12 +2,13 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { createOpenClawTestState, type OpenClawTestState } from "openclaw/plugin-sdk/test-state";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import type { BrowserConfig, BrowserProfileConfig } from "../config/config.js";
-import { resolveUserPath } from "../utils.js";
+import type { BrowserConfig, BrowserProfileConfig } from "openclaw/plugin-sdk/config-contracts";
+import { withEnv, withTempDir } from "openclaw/plugin-sdk/test-env";
+import { resolveUserPath } from "openclaw/plugin-sdk/text-utility-runtime";
+import { describe, expect, it, vi } from "vitest";
 import {
   getManagedBrowserMissingDisplayError,
+  isLocalManagedProfile,
   resolveBrowserConfig,
   resolveManagedBrowserHeadlessMode,
   resolveProfile,
@@ -15,55 +16,6 @@ import {
 import { getBrowserProfileCapabilities } from "./profile-capabilities.js";
 
 const BROWSER_HEADLESS_ENV_KEY = "OPENCLAW_BROWSER_HEADLESS";
-
-// Isolate the extension relay secret (read from stateDir/credentials) so the
-// extension-token assertions do not pick up a developer's real secret file.
-let isolatedStateDir = "";
-let openClawState: OpenClawTestState;
-beforeEach(async () => {
-  openClawState = await createOpenClawTestState({
-    layout: "state-only",
-    prefix: "openclaw-cfg-",
-  });
-  isolatedStateDir = openClawState.stateDir;
-});
-afterEach(async () => {
-  await openClawState.cleanup();
-});
-
-/** Write a relay secret into the isolated state dir's credentials directory. */
-function writeRelaySecret(token: string): void {
-  const dir = path.join(isolatedStateDir, "credentials");
-  fs.mkdirSync(dir, { recursive: true });
-  fs.writeFileSync(path.join(dir, "browser-extension-relay.secret"), `${token}\n`);
-}
-
-function withEnv<T>(env: Record<string, string | undefined>, fn: () => T): T {
-  const snapshot = new Map<string, string | undefined>();
-  for (const [key] of Object.entries(env)) {
-    snapshot.set(key, process.env[key]);
-  }
-
-  try {
-    for (const key of Object.keys(env)) {
-      const value = env[key];
-      if (value === undefined) {
-        delete process.env[key];
-      } else {
-        process.env[key] = value;
-      }
-    }
-    return fn();
-  } finally {
-    for (const [key, value] of snapshot) {
-      if (value === undefined) {
-        delete process.env[key];
-      } else {
-        process.env[key] = value;
-      }
-    }
-  }
-}
 
 function resolveRequiredProfile(config: BrowserConfig, profileName: string) {
   const profile = resolveProfile(resolveBrowserConfig(config), profileName);
@@ -82,6 +34,123 @@ function withProfile(
 }
 
 describe("browser config", () => {
+  it.each(["chromium", "lightpanda"] as const)(
+    "rejects Lightpanda endpoint aliases in unvalidated runtime config (%s)",
+    (engine) => {
+      expect(() =>
+        resolveBrowserConfig({
+          profiles: {
+            lightweight: {
+              engine: "lightpanda",
+              cdpUrl: "ws://127.0.0.1:9222/",
+              attachOnly: true,
+            },
+            alias: { engine, cdpUrl: "ws://127.0.0.1:9222", attachOnly: true },
+          },
+        }),
+      ).toThrow(/dedicated CDP endpoint/);
+    },
+  );
+
+  it.each(["ws://127.0.0.1:9222/", "ws://lightpanda:9222/", "wss://browser.example/cdp"])(
+    "resolves Lightpanda as a persistent, externally owned semantic browser: %s",
+    (cdpUrl) => {
+      const profile = resolveRequiredProfile(
+        withProfile(
+          "lightweight",
+          { engine: "lightpanda", cdpUrl, attachOnly: true },
+          { headless: false, executablePath: "/usr/bin/chromium", attachOnly: false },
+        ),
+        "lightweight",
+      );
+      expect(profile).toMatchObject({
+        engine: "lightpanda",
+        cdpUrl,
+        attachOnly: true,
+        headless: true,
+        driver: "openclaw",
+      });
+      expect(profile.executablePath).toBeUndefined();
+      expect(isLocalManagedProfile(profile)).toBe(false);
+      expect(getBrowserProfileCapabilities(profile)).toMatchObject({
+        mode: "lightweight-cdp",
+        browserFilesystemLocal: false,
+        usesPersistentPlaywright: true,
+        supportsJsonTabEndpoints: false,
+        supportsPerTabWs: false,
+        supportsMultipleTabs: false,
+        supportsPageText: true,
+        supportsScreenshots: false,
+        supportsVisualActions: false,
+        supportsDownloads: false,
+        supportsPdf: false,
+        supportsUploads: false,
+        supportsDialogs: false,
+        supportsStorage: false,
+        supportsScreencast: false,
+        supportsConsole: false,
+        supportsBatchActions: false,
+        supportsRequests: false,
+        supportsErrors: false,
+        supportsEmulation: false,
+      });
+    },
+  );
+
+  it.each<Partial<BrowserProfileConfig>>([
+    { cdpUrl: undefined },
+    { cdpUrl: "http://127.0.0.1:9222" },
+    { cdpUrl: "not-a-url" },
+    { attachOnly: undefined },
+    { attachOnly: false },
+    { driver: "existing-session" },
+    { driver: "extension" },
+    { cdpPort: 9222 },
+    { userDataDir: "/tmp/chrome-profile" },
+    { mcpCommand: "chrome-devtools-mcp" },
+    { mcpArgs: [] },
+    { executablePath: "/usr/bin/chromium" },
+    { headless: false },
+  ])("rejects incompatible Lightpanda runtime config without schema validation: %j", (invalid) => {
+    expect(() =>
+      resolveRequiredProfile(
+        withProfile("lightweight", {
+          engine: "lightpanda",
+          cdpUrl: "ws://127.0.0.1:9222/",
+          attachOnly: true,
+          ...invalid,
+        }),
+        "lightweight",
+      ),
+    ).toThrow(/Lightpanda/);
+  });
+
+  it("fills defaults without changing caller-owned profiles or prototype-like names", () => {
+    const selected = Object.freeze({ driver: "existing-session" as const, attachOnly: true });
+    const profiles = Object.freeze({
+      ["__proto__"]: Object.freeze({ cdpPort: 18802 }),
+      constructor: Object.freeze({ cdpPort: 18803 }),
+      user: selected,
+    });
+    const resolved = resolveBrowserConfig(
+      Object.freeze({ profiles, defaultProfile: "user", cdpUrl: "http://127.0.0.1:9222/" }),
+    );
+
+    expect(Object.keys(profiles)).toEqual(["__proto__", "constructor", "user"]);
+    expect(selected).not.toHaveProperty("cdpUrl");
+    expect(Object.keys(resolved.profiles)).toEqual([
+      "__proto__",
+      "constructor",
+      "user",
+      "openclaw",
+      "chrome",
+    ]);
+    expect(Object.getPrototypeOf(resolved.profiles)).toBe(Object.prototype);
+    expect(resolveProfile(resolved, "__proto__")?.cdpPort).toBe(18802);
+    expect(resolveProfile(resolved, "constructor")?.cdpPort).toBe(18803);
+    expect(resolveProfile(resolved, "user")?.cdpUrl).toBe("http://127.0.0.1:9222");
+  });
+
   it("defaults to enabled with loopback defaults and lobster-orange color", () => {
     const resolved = resolveBrowserConfig(undefined);
     expect(resolved.enabled).toBe(true);
@@ -92,6 +161,7 @@ describe("browser config", () => {
     const profile = resolveProfile(resolved, resolved.defaultProfile);
     expect(profile?.name).toBe("openclaw");
     expect(profile?.driver).toBe("openclaw");
+    expect(profile?.engine).toBe("chromium");
     expect(profile?.cdpPort).toBe(18800);
     expect(profile?.cdpUrl).toBe("http://127.0.0.1:18800");
 
@@ -125,8 +195,7 @@ describe("browser config", () => {
     // Relay port sits just below the CDP allocation range (controlPort + 8).
     expect(chrome?.cdpPort).toBe(resolved.extensionRelayDefaultPort);
     expect(resolved.extensionRelayDefaultPort).toBe(resolved.controlPort + 8);
-    // No host-local relay secret exists yet (isolated state dir), so the relay
-    // cdpUrl carries no Basic credentials until pairing/startup creates one.
+    // Only a running relay supplies the process-local Basic credential.
     expect(chrome?.cdpUrl).toBe(`http://127.0.0.1:${resolved.extensionRelayDefaultPort}`);
     expect(chrome?.cdpIsLoopback).toBe(true);
   });
@@ -156,6 +225,17 @@ describe("browser config", () => {
       },
     });
     expect(resolveProfile(resolved, "work")?.cdpPort).toBe(20123);
+  });
+
+  it("keeps literal $ patterns in home when expanding a tilde executable path", () => {
+    const spy = vi.spyOn(os, "homedir").mockReturnValue("/home/$&user");
+    try {
+      expect(resolveBrowserConfig({ executablePath: "~/chrome-bin" }).executablePath).toBe(
+        path.resolve("/home/$&user/chrome-bin"),
+      );
+    } finally {
+      spy.mockRestore();
+    }
   });
 
   it("does not assign an implicit extension relay an explicitly pinned extension port", () => {
@@ -191,11 +271,28 @@ describe("browser config", () => {
     expect(() => resolveBrowserConfig({ profiles })).toThrow(/extension.*relay.*port/i);
   });
 
-  it("keeps the host-local relay key out of the extension cdpUrl", () => {
-    const relayKey = "a".repeat(64);
-    writeRelaySecret(relayKey);
+  it.each([
+    { name: "empty", content: "" },
+    { name: "malformed", content: "not-a-relay-key\n" },
+    { name: "valid", content: `${"a1".repeat(32)}\n` },
+  ])("normalizes config independently of a $name relay secret", async ({ content }) => {
+    await withTempDir("openclaw-config-relay-", async (dir) => {
+      const stateDir = fs.realpathSync(dir);
+      const credentials = path.join(stateDir, "credentials");
+      fs.mkdirSync(credentials, { mode: 0o700 });
+      const secretPath = path.join(credentials, "browser-extension-relay.secret");
+      withEnv({ OPENCLAW_STATE_DIR: stateDir, OPENCLAW_OAUTH_DIR: credentials }, () => {
+        const withoutSecret = resolveBrowserConfig(undefined);
+        fs.writeFileSync(secretPath, content, { flag: "wx", mode: 0o600 });
+        expect(resolveBrowserConfig(undefined)).toEqual(withoutSecret);
+        expect(fs.readFileSync(secretPath, "utf8")).toBe(content);
+      });
+    });
+  });
+
+  it("keeps the lifecycle's host-local relay key out of the extension cdpUrl", () => {
     const resolved = resolveBrowserConfig(undefined);
-    expect(resolved.extensionRelayToken).toBe(relayKey);
+    resolved.extensionRelayToken = "a1".repeat(32);
     const chrome = resolveProfile(resolved, "chrome");
     expect(chrome?.cdpUrl).toBe(`http://127.0.0.1:${resolved.extensionRelayDefaultPort}`);
 
@@ -758,6 +855,7 @@ describe("browser config", () => {
       exact: true,
       expected: {
         name: "chrome-live",
+        engine: "chromium",
         driver: "existing-session",
         attachOnly: true,
         cdpPort: 0,

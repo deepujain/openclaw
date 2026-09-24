@@ -5,46 +5,64 @@
  * Playwright tracing scoped to the selected browser tab.
  */
 import crypto from "node:crypto";
+import { formatErrorMessage } from "openclaw/plugin-sdk/security-runtime";
 import { normalizeOptionalString } from "openclaw/plugin-sdk/string-coerce-runtime";
+import { DEFAULT_TRACE_DIR } from "../paths.js";
+import { getBrowserProfileCapabilities } from "../profile-capabilities.js";
 import type { PwAiModule } from "../pw-ai-module.js";
 import type { BrowserRouteContext } from "../server-context.js";
 import {
   readBody,
+  resolveProfileContext,
   resolveTargetIdFromBody,
   resolveTargetIdFromQuery,
   withPlaywrightRouteContext,
 } from "./agent.shared.js";
+import { EXISTING_SESSION_LIMITS } from "./existing-session-limits.js";
 import { resolveWritableOutputPathOrRespond } from "./output-paths.js";
-import { DEFAULT_TRACE_DIR } from "./path-output.js";
+import { readRoutePositiveInteger } from "./route-numeric.js";
 import type { BrowserRequest, BrowserResponse, BrowserRouteRegistrar } from "./types.js";
-import { toBoolean, toStringOrEmpty } from "./utils.js";
+import { jsonError, toBoolean, toStringOrEmpty } from "./utils.js";
 
-function browserDebugTargetPayload(
-  targetId: string,
-  url?: string,
-): { ok: true; targetId: string; url?: string } {
-  return { ok: true, targetId, ...(url ? { url } : {}) };
-}
-
-async function sendPlaywrightDebugCollection(params: {
+async function sendPlaywrightDebugResult(params: {
   req: BrowserRequest;
   res: BrowserResponse;
   ctx: BrowserRouteContext;
   targetId?: string;
   feature: string;
-  collect: (ctx: { cdpUrl: string; targetId: string; pw: PwAiModule }) => Promise<object>;
+  existingSessionUnsupported?: string;
+  collect: (ctx: {
+    cdpUrl: string;
+    targetId: string;
+    pw: PwAiModule;
+    signal: AbortSignal;
+  }) => Promise<object | null>;
 }): Promise<void> {
+  const profileCtx = resolveProfileContext(params.req, params.res, params.ctx);
+  if (!profileCtx) {
+    return;
+  }
+  if (
+    params.existingSessionUnsupported &&
+    getBrowserProfileCapabilities(profileCtx.profile).usesChromeMcp
+  ) {
+    return jsonError(params.res, 501, params.existingSessionUnsupported);
+  }
   await withPlaywrightRouteContext({
     req: params.req,
     res: params.res,
     ctx: params.ctx,
+    profileCtx,
     targetId: params.targetId,
     feature: params.feature,
     enforceCurrentUrlAllowed: true,
-    run: async ({ cdpUrl, tab, pw, resolveTabUrl }) => {
-      const result = await params.collect({ cdpUrl, targetId: tab.targetId, pw });
+    run: async ({ cdpUrl, tab, pw, resolveTabUrl, signal }) => {
+      const result = await params.collect({ cdpUrl, targetId: tab.targetId, pw, signal });
+      if (result === null) {
+        return;
+      }
       const url = await resolveTabUrl(tab.url);
-      params.res.json({ ...browserDebugTargetPayload(tab.targetId, url), ...result });
+      params.res.json({ ok: true, targetId: tab.targetId, ...(url ? { url } : {}), ...result });
     },
   });
 }
@@ -58,21 +76,19 @@ export function registerBrowserAgentDebugRoutes(
     const targetId = resolveTargetIdFromQuery(req.query);
     const level = typeof req.query.level === "string" ? req.query.level : "";
 
-    await withPlaywrightRouteContext({
+    await sendPlaywrightDebugResult({
       req,
       res,
       ctx,
       targetId,
       feature: "console messages",
-      enforceCurrentUrlAllowed: true,
-      run: async ({ cdpUrl, tab, pw, resolveTabUrl }) => {
+      collect: async ({ cdpUrl, targetId: resolvedTargetId, pw }) => {
         const messages = await pw.getConsoleMessagesViaPlaywright({
           cdpUrl,
-          targetId: tab.targetId,
+          targetId: resolvedTargetId,
           level: normalizeOptionalString(level),
         });
-        const url = await resolveTabUrl(tab.url);
-        res.json({ ...browserDebugTargetPayload(tab.targetId, url), messages });
+        return { messages };
       },
     });
   });
@@ -81,12 +97,13 @@ export function registerBrowserAgentDebugRoutes(
     const targetId = resolveTargetIdFromQuery(req.query);
     const clear = toBoolean(req.query.clear) ?? false;
 
-    await sendPlaywrightDebugCollection({
+    await sendPlaywrightDebugResult({
       req,
       res,
       ctx,
       targetId,
       feature: "page errors",
+      existingSessionUnsupported: EXISTING_SESSION_LIMITS.errors,
       collect: async ({ cdpUrl, targetId: targetIdValue, pw }) =>
         await pw.getPageErrorsViaPlaywright({
           cdpUrl,
@@ -101,12 +118,13 @@ export function registerBrowserAgentDebugRoutes(
     const filter = typeof req.query.filter === "string" ? req.query.filter : "";
     const clear = toBoolean(req.query.clear) ?? false;
 
-    await sendPlaywrightDebugCollection({
+    await sendPlaywrightDebugResult({
       req,
       res,
       ctx,
       targetId,
       feature: "network requests",
+      existingSessionUnsupported: EXISTING_SESSION_LIMITS.requests,
       collect: async ({ cdpUrl, targetId: targetIdLocal, pw }) =>
         await pw.getNetworkRequestsViaPlaywright({
           cdpUrl,
@@ -117,24 +135,49 @@ export function registerBrowserAgentDebugRoutes(
     });
   });
 
+  app.get("/text", async (req, res) => {
+    const targetId = resolveTargetIdFromQuery(req.query);
+    const selector = normalizeOptionalString(req.query.selector);
+    let maxChars: number | undefined;
+    try {
+      maxChars = readRoutePositiveInteger(req.query.maxChars, "maxChars");
+    } catch (err) {
+      return jsonError(res, 400, formatErrorMessage(err));
+    }
+    await sendPlaywrightDebugResult({
+      req,
+      res,
+      ctx,
+      targetId,
+      feature: "page text",
+      existingSessionUnsupported: EXISTING_SESSION_LIMITS.text,
+      collect: async ({ cdpUrl, targetId: textTargetId, pw, signal }) =>
+        await pw.getPageTextViaPlaywright({
+          cdpUrl,
+          targetId: textTargetId,
+          selector,
+          maxChars,
+          signal,
+        }),
+    });
+  });
+
   app.get("/dialogs", async (req, res) => {
     const targetId = resolveTargetIdFromQuery(req.query);
 
-    await withPlaywrightRouteContext({
+    await sendPlaywrightDebugResult({
       req,
       res,
       ctx,
       targetId,
       feature: "dialog state",
-      enforceCurrentUrlAllowed: true,
-      run: async ({ cdpUrl, tab, pw, resolveTabUrl }) => {
+      collect: async ({ cdpUrl, targetId: resolvedTargetId, pw }) => {
         const browserState = await pw.getObservedBrowserStateViaPlaywright({
           cdpUrl,
-          targetId: tab.targetId,
+          targetId: resolvedTargetId,
           ssrfPolicy: ctx.state().resolved.ssrfPolicy,
         });
-        const url = await resolveTabUrl(tab.url);
-        res.json({ ...browserDebugTargetPayload(tab.targetId, url), browserState });
+        return { browserState };
       },
     });
   });
@@ -146,23 +189,21 @@ export function registerBrowserAgentDebugRoutes(
     const snapshots = toBoolean(body.snapshots) ?? undefined;
     const sources = toBoolean(body.sources) ?? undefined;
 
-    await withPlaywrightRouteContext({
+    await sendPlaywrightDebugResult({
       req,
       res,
       ctx,
       targetId,
       feature: "trace start",
-      enforceCurrentUrlAllowed: true,
-      run: async ({ cdpUrl, tab, pw, resolveTabUrl }) => {
+      collect: async ({ cdpUrl, targetId: resolvedTargetId, pw }) => {
         await pw.traceStartViaPlaywright({
           cdpUrl,
-          targetId: tab.targetId,
+          targetId: resolvedTargetId,
           screenshots,
           snapshots,
           sources,
         });
-        const url = await resolveTabUrl(tab.url);
-        res.json(browserDebugTargetPayload(tab.targetId, url));
+        return {};
       },
     });
   });
@@ -172,14 +213,13 @@ export function registerBrowserAgentDebugRoutes(
     const targetId = resolveTargetIdFromBody(body);
     const out = toStringOrEmpty(body.path) || "";
 
-    await withPlaywrightRouteContext({
+    await sendPlaywrightDebugResult({
       req,
       res,
       ctx,
       targetId,
       feature: "trace stop",
-      enforceCurrentUrlAllowed: true,
-      run: async ({ cdpUrl, tab, pw, resolveTabUrl }) => {
+      collect: async ({ cdpUrl, targetId: resolvedTargetId, pw }) => {
         const id = crypto.randomUUID();
         const tracePath = await resolveWritableOutputPathOrRespond({
           res,
@@ -190,18 +230,14 @@ export function registerBrowserAgentDebugRoutes(
           ensureRootDir: true,
         });
         if (!tracePath) {
-          return;
+          return null;
         }
         const committedTracePath = await pw.traceStopViaPlaywright({
           cdpUrl,
-          targetId: tab.targetId,
+          targetId: resolvedTargetId,
           path: tracePath,
         });
-        const url = await resolveTabUrl(tab.url);
-        res.json({
-          ...browserDebugTargetPayload(tab.targetId, url),
-          path: committedTracePath,
-        });
+        return { path: committedTracePath };
       },
     });
   });

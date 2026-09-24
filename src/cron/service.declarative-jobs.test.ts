@@ -1,12 +1,17 @@
 import { describe, expect, it, vi } from "vitest";
+import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { resolveCronJobConfigRevision } from "./config-revision.js";
+import { resolveCronSession } from "./isolated-agent/session.js";
+import { toPublicCronJob } from "./public-job.js";
 import { CronService } from "./service.js";
 import {
   createCronStoreHarness,
   createNoopLogger,
   installCronTestHooks,
+  writeCronStoreSnapshot,
 } from "./service.test-harness.js";
 import type { CronAddResult } from "./service/state.js";
+import { resolveSkillCollectionReviewMonitorSpecs } from "./skill-collection-review-monitor.js";
 import { loadCronStore } from "./store.js";
 import type { CronJob, CronJobCreate } from "./types.js";
 
@@ -62,6 +67,7 @@ function ownedDeclaration(params: {
   declarationKey: string;
   owner: TriggerStateOwner;
   script?: string;
+  once?: boolean;
   state?: CronJobCreate["state"];
   sameOwnerEdit?: boolean;
 }): CronJobCreate {
@@ -71,14 +77,14 @@ function ownedDeclaration(params: {
     delivery: { mode: "none" },
     trigger:
       params.owner === "condition"
-        ? { script, ...(params.sameOwnerEdit ? { once: true } : {}) }
+        ? { script, ...(params.once !== undefined ? { once: params.once } : {}) }
         : undefined,
     payload:
       params.owner === "script"
         ? { kind: "script", script, ...(params.sameOwnerEdit ? { timeoutSeconds: 45 } : {}) }
         : { kind: "agentTurn", message: "report" },
     ...(params.state ? { state: params.state } : {}),
-    ...(params.sameOwnerEdit && params.owner === "none" ? { displayName: "Updated report" } : {}),
+    ...(params.sameOwnerEdit ? { displayName: "Updated report" } : {}),
   });
 }
 
@@ -136,6 +142,15 @@ describe("CronService declarative jobs", () => {
         created: false,
         updated: false,
         id: created.id,
+      });
+
+      await cron.update(created.id, { state: { consecutiveErrors: 2 } });
+      const alreadyEnabled = declarativeResult(
+        await cron.add(declaration(), { enabledExplicit: true }),
+      );
+      expect(alreadyEnabled).toMatchObject({
+        updated: false,
+        job: { enabled: true, state: { consecutiveErrors: 2 } },
       });
 
       await cron.update(created.id, {
@@ -197,6 +212,181 @@ describe("CronService declarative jobs", () => {
     }
   });
 
+  it.each(["auto-disabled", "stream-exhausted"] as const)(
+    "resets %s state when a declaration explicitly re-enables the job",
+    async (failure) => {
+      const { storePath } = await makeStorePath();
+      const input = declaration({
+        delivery: { mode: "none" },
+        ...(failure === "stream-exhausted"
+          ? { schedule: { kind: "stream" as const, command: ["node", "events.mjs"] } }
+          : {}),
+      });
+      const writer = createCronService(storePath);
+      const created = declarativeResult(await writer.add(input));
+      writer.stop();
+      const job = (await loadCronStore(storePath)).jobs[0]!;
+      job.enabled = failure === "stream-exhausted";
+      job.state.consecutiveErrors = 10;
+      job.state.scheduleErrorCount = 3;
+      if (failure === "auto-disabled") {
+        job.state.autoDisabled = {
+          reason: "consecutive-failures",
+          atMs: Date.now(),
+          consecutiveErrors: 10,
+        };
+      } else {
+        job.state.streamRestartExhausted = true;
+        job.state.streamConsecutiveFailures = 5;
+        job.state.streamError = "source exited repeatedly";
+      }
+      await writeCronStoreSnapshot({ storePath, jobs: [job] });
+      const cron = createCronService(storePath);
+      try {
+        const unchanged = declarativeResult(await cron.add(input, { enabledExplicit: false }));
+        expect(unchanged).toMatchObject({ updated: false, job: { enabled: job.enabled } });
+        expect(unchanged.job.state).toEqual(job.state);
+
+        const enabled = declarativeResult(await cron.add(input, { enabledExplicit: true }));
+        expect(enabled).toMatchObject({
+          id: created.id,
+          updated: true,
+          job: { enabled: true, state: { consecutiveErrors: 0, scheduleErrorCount: 0 } },
+        });
+        const persisted = (await loadCronStore(storePath)).jobs[0]!;
+        expect(persisted.state.autoDisabled).toBeUndefined();
+        expect(persisted.state.streamRestartExhausted).toBeUndefined();
+        if (failure === "stream-exhausted") {
+          expect(persisted.state.streamConsecutiveFailures).toBe(0);
+          expect(persisted.state.streamError).toBeUndefined();
+        }
+        expect(declarativeResult(await cron.add(input, { enabledExplicit: true })).updated).toBe(
+          false,
+        );
+      } finally {
+        cron.stop();
+      }
+    },
+  );
+
+  it("persists an ineligible review and reconciles recovery without replacing its job", async () => {
+    const { storePath } = await makeStorePath();
+    const cron = createCronService(storePath);
+    const cfg = {
+      agents: {
+        defaults: { model: "openai/gpt-blocked" },
+        list: [{ id: "main", models: { "openai/gpt-blocked": { agentRuntime: { id: "codex" } } } }],
+      },
+      skills: { workshop: { autonomous: { mode: "auto" } } },
+    } as OpenClawConfig;
+    const project = () => {
+      const [spec] = resolveSkillCollectionReviewMonitorSpecs(cfg, []);
+      return spec!.input;
+    };
+    await cron.start();
+    try {
+      const created = declarativeResult(
+        await cron.add(project(), { enabledExplicit: true, systemOwned: true }),
+      );
+      expect(created.job).toMatchObject({
+        enabled: false,
+        displayName: expect.stringContaining("no-rooted-runtime"),
+      });
+      expect(created.job.state.nextRunAtMs).toBeUndefined();
+      expect(
+        (await loadCronStore(storePath)).jobs.find((job) => job.id === created.id),
+      ).toMatchObject({ enabled: false, displayName: created.job.displayName });
+      cfg.agents!.defaults!.model = "anthropic/claude-sonnet-4-6";
+      const recovered = declarativeResult(
+        await cron.add(project(), { enabledExplicit: true, systemOwned: true }),
+      );
+      expect(recovered).toMatchObject({
+        id: created.id,
+        created: false,
+        updated: true,
+        enabled: true,
+      });
+      expect(recovered.job.displayName).toBe("Skill collection review (main)");
+      expect(recovered.job.state.nextRunAtMs).toEqual(expect.any(Number));
+      expect(
+        (await loadCronStore(storePath)).jobs.find((job) => job.id === created.id),
+      ).toMatchObject({ enabled: true, displayName: "Skill collection review (main)" });
+    } finally {
+      cron.stop();
+    }
+  });
+
+  it("keeps the first creator across declaration convergence and restart", async () => {
+    const { storePath } = await makeStorePath();
+    const writer = createCronService(storePath);
+    await writer.start();
+    let createdId = "";
+    const selections = [
+      {
+        skillId: "00000000-0000-4000-8000-000000000001",
+        revision: "a".repeat(64),
+        name: "s_report_00000000000040008000",
+        ownerProfileId: "profile-ada",
+      },
+    ];
+
+    try {
+      const created = declarativeResult(
+        await writer.add(declaration(), {
+          createdActor: { type: "human", source: "profile", id: "profile-ada" },
+          skillLibrarySelections: selections,
+        }),
+      );
+      createdId = created.id;
+      expect(created.job).toMatchObject({
+        createdActor: { type: "human", id: "profile-ada" },
+      });
+
+      const converged = declarativeResult(
+        await writer.add(declaration({ displayName: "Updated report" }), {
+          createdActor: { type: "human", source: "profile", id: "profile-bob" },
+          skillLibrarySelections: [],
+        }),
+      );
+      expect(converged).toMatchObject({ created: false, updated: true, id: created.id });
+      expect(converged.job).toMatchObject({
+        createdActor: { type: "human", id: "profile-ada" },
+      });
+    } finally {
+      writer.stop();
+    }
+
+    const reader = createCronService(storePath, false);
+    await expect(reader.readJob(createdId)).resolves.toMatchObject({
+      createdActor: { type: "human", id: "profile-ada" },
+      skillLibrarySelections: selections,
+    });
+    const job = (await loadCronStore(storePath)).jobs.find((stored) => stored.id === createdId)!;
+    expect(toPublicCronJob(job)).not.toHaveProperty("skillLibrarySelections");
+    const first = resolveCronSession({
+      cfg: {},
+      sessionKey: "agent:ops:cron:test",
+      agentId: "ops",
+      nowMs: Date.now(),
+      store: {},
+      skillLibrarySelections: job.skillLibrarySelections,
+      forceNew: true,
+      lifecycleTimestamps: {},
+    });
+    expect(first.sessionEntry.skillLibrarySelections).toEqual(selections);
+    const restarted = resolveCronSession({
+      cfg: {},
+      sessionKey: "agent:ops:cron:test",
+      agentId: "ops",
+      nowMs: Date.now(),
+      store: { "agent:ops:cron:test": first.sessionEntry },
+      skillLibrarySelections: [],
+      forceNew: true,
+      lifecycleTimestamps: {},
+    });
+    expect(restarted.sessionEntry.skillLibrarySelections).toEqual(selections);
+  });
+
   it("keeps declaration-key uniqueness local to the caller visibility predicate", async () => {
     const { storePath } = await makeStorePath();
     const cron = createCronService(storePath);
@@ -252,6 +442,8 @@ describe("CronService declarative jobs", () => {
         previous: TriggerStateOwner;
         next: TriggerStateOwner;
         replaceScript?: boolean;
+        previousOnce?: boolean;
+        nextOnce?: boolean;
         sameOwnerEdit?: boolean;
         replacementState?: CronJobCreate["state"];
       }> = [
@@ -277,6 +469,64 @@ describe("CronService declarative jobs", () => {
         { name: "same script owner", previous: "script", next: "script", sameOwnerEdit: true },
         { name: "same absent owner", previous: "none", next: "none", sameOwnerEdit: true },
         {
+          name: "same explicit-false condition owner",
+          previous: "condition",
+          next: "condition",
+          previousOnce: false,
+          nextOnce: false,
+          sameOwnerEdit: true,
+        },
+        {
+          name: "condition once enabled from default",
+          previous: "condition",
+          next: "condition",
+          nextOnce: true,
+        },
+        {
+          name: "condition once disabled to default",
+          previous: "condition",
+          next: "condition",
+          previousOnce: true,
+        },
+        {
+          name: "condition once enabled from explicit false",
+          previous: "condition",
+          next: "condition",
+          previousOnce: false,
+          nextOnce: true,
+        },
+        {
+          name: "condition once disabled to explicit false",
+          previous: "condition",
+          next: "condition",
+          previousOnce: true,
+          nextOnce: false,
+        },
+        {
+          name: "condition once made explicit false",
+          previous: "condition",
+          next: "condition",
+          nextOnce: false,
+        },
+        {
+          name: "condition explicit false omitted",
+          previous: "condition",
+          next: "condition",
+          previousOnce: false,
+        },
+        {
+          name: "condition once explicit replacement",
+          previous: "condition",
+          next: "condition",
+          nextOnce: true,
+          replacementState: {
+            triggerState: { owner: "replacement" },
+            triggerEvalCount: 0,
+            lastTriggerEvalAtMs: 444,
+            lastTriggerFireAtMs: 555,
+          },
+        },
+        {
           name: "explicit replacement state and count",
           previous: "condition",
           next: "condition",
@@ -299,6 +549,7 @@ describe("CronService declarative jobs", () => {
           const input = ownedDeclaration({
             declarationKey,
             owner: testCase.previous,
+            once: testCase.previousOnce,
             state: retiredTriggerState,
           });
           if (mutationPath === "ordinary update") {
@@ -314,6 +565,7 @@ describe("CronService declarative jobs", () => {
             declarationKey,
             owner: testCase.next,
             script: testCase.replaceScript ? 'return "replacement"' : undefined,
+            once: testCase.nextOnce,
             state: testCase.replacementState,
             sameOwnerEdit: testCase.sameOwnerEdit,
           });

@@ -6,6 +6,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
+import { safeRealpathSync } from "../infra/boundary-path.js";
 import type { ExecHost } from "../infra/exec-approvals.js";
 import { isPathInside, safeStatSync } from "../infra/path-guards.js";
 import type { BashSandboxConfig } from "./bash-tools.shared.js";
@@ -60,7 +61,7 @@ function unavailable(requestedCwd: string): ExecWorkdirResolution {
 
 function resolveExistingHostWorkdir(workdir: string): string | null {
   const stats = safeStatSync(workdir);
-  return stats?.isDirectory() ? workdir : null;
+  return stats?.isDirectory() ? (safeRealpathSync(workdir) ?? path.resolve(workdir)) : null;
 }
 
 function safeCurrentCwd(): string | null {
@@ -431,6 +432,15 @@ export async function resolveExecWorkdir(params: {
   if (!requestedCwd) {
     return unavailable("current working directory");
   }
-  const resolved = resolveExistingHostWorkdir(requestedCwd);
+  let hostPath = requestedCwd;
+  if (explicitWorkdir.kind === "specified" && defaultCwd && !path.isAbsolute(requestedCwd)) {
+    const baseCwd = resolveExistingHostWorkdir(defaultCwd);
+    if (!baseCwd) {
+      return unavailable(defaultCwd);
+    }
+    // Preserve filesystem traversal through symlinks and reject missing path segments.
+    hostPath = `${baseCwd}${path.sep}${requestedCwd}`;
+  }
+  const resolved = resolveExistingHostWorkdir(hostPath);
   return resolved ? { kind: "local", hostCwd: resolved } : unavailable(requestedCwd);
 }

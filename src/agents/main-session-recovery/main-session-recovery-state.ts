@@ -1,7 +1,7 @@
 import {
   PENDING_FINAL_DELIVERY_CLEAR_PATCH,
   sanitizePendingFinalDeliveryText,
-} from "../../auto-reply/reply/pending-final-delivery.js";
+} from "../../auto-reply/reply/pending-final-delivery-state.js";
 import type {
   InternalSessionEntry as SessionEntry,
   MainRestartRecoveryState,
@@ -13,6 +13,7 @@ import {
   isCronSessionKey,
   isSubagentSessionKey,
 } from "../../routing/session-key.js";
+import { interruptAdmittedMainSessionRecovery } from "./main-session-recovery-admitted-interruption.js";
 import { buildMainSessionRecoveryClearPatch } from "./main-session-recovery-clear.js";
 import type {
   MainSessionRecoveryCommand,
@@ -21,7 +22,10 @@ import type {
   MainSessionRecoveryTransitionResult,
   MainSessionRecoveryView,
 } from "./main-session-recovery-types.js";
-import { MAX_RECOVERY_RETRIES } from "./main-session-restart-recovery-shared.js";
+import {
+  MAX_RECOVERY_RETRIES,
+  resolveRestartRecoveryTerminalClientRunId,
+} from "./main-session-restart-recovery-shared.js";
 
 export type {
   MainSessionRecoveryCommand,
@@ -48,6 +52,12 @@ function createCycle(cycleId: string): MainRestartRecoveryState {
     revision: 1,
     chargedAttempts: 0,
   };
+}
+
+export function getMainSessionRecoveryRetryCount(
+  state: MainRestartRecoveryState | undefined,
+): number {
+  return state ? state.chargedAttempts - (state.startedAttempt ?? 0) : 0;
 }
 
 function matchesObservation(
@@ -149,6 +159,16 @@ export function isMainSessionRecoveryPending(entry: SessionEntry, sessionKey: st
     !state?.foregroundClaims &&
     !state?.reservation &&
     !state?.tombstone
+  );
+}
+
+/** Failed foreground admission can leave an unfinished recovery cycle behind. */
+export function isMainSessionRecoveryReconciliationCandidate(entry: SessionEntry): boolean {
+  return (
+    (entry.status === undefined || entry.status === "running" || entry.status === "failed") &&
+    entry.abortedLastRun !== true &&
+    entry.mainRestartRecovery !== undefined &&
+    !entry.mainRestartRecovery.tombstone
   );
 }
 
@@ -268,12 +288,13 @@ function inspectMainSessionRecovery(params: {
   if (state.reservation) {
     return { status: "blocked" };
   }
-  if (state.chargedAttempts >= MAX_RECOVERY_RETRIES) {
+  const retryCount = getMainSessionRecoveryRetryCount(state);
+  if (retryCount >= MAX_RECOVERY_RETRIES) {
     return {
       status: "exhausted",
       observation,
       reason:
-        `main-session restart recovery blocked after ${state.chargedAttempts} charged automatic resume attempts; ` +
+        `main-session restart recovery blocked after ${retryCount} automatic attempts without a started runtime turn; ` +
         MAIN_RESTART_RECOVERY_REMEDIATION_HINT,
     };
   }
@@ -333,7 +354,9 @@ export function transitionMainSessionRecovery(
         });
       }
       entry.status = "running";
+      entry.activeWriterRunId = undefined;
       entry.lifecycleRunId = undefined;
+      entry.lastRunId = undefined;
       entry.abortedLastRun = true;
       if (command.resetRuntime) {
         entry.startedAt = undefined;
@@ -363,7 +386,7 @@ export function transitionMainSessionRecovery(
         isMainRestartRecoveryCandidate(entry, command.sessionKey) &&
         !entry.mainRestartRecovery
       ) {
-        // Rows interrupted by an older shipped version acquire identity before scanning.
+        // Acquire recovery identity before scanning interrupted rows.
         entry.mainRestartRecovery = createCycle(command.cycleId);
       }
       let state = entry.mainRestartRecovery;
@@ -450,13 +473,14 @@ export function transitionMainSessionRecovery(
         },
       };
     }
-    case "bind_admitted_execution_identity": {
+    case "bind_admitted_execution_identity":
+    case "register_recovery_turn": {
       const state = entry.mainRestartRecovery;
       if (
         !state ||
         state.cycleId !== command.cycleId ||
-        // Recovery may reuse its public run id. The charged attempt is the
-        // durable admission fence that rejects delayed binds from older work.
+        // Keep attempt identity monotonic across successful starts. Resetting the
+        // counter itself would let delayed admission callbacks match newer work.
         state.chargedAttempts !== command.attempt ||
         entry.sessionId !== command.sessionId ||
         entry.lifecycleRunId !== command.runId ||
@@ -467,15 +491,22 @@ export function transitionMainSessionRecovery(
       ) {
         return { kind: "rejected", reason: "stale_reservation" };
       }
-      if (state.executionIdentity) {
-        return JSON.stringify(state.executionIdentity) === JSON.stringify(command.token)
-          ? { kind: "no_change" }
-          : { kind: "rejected", reason: "stale_reservation" };
+      if (command.kind === "register_recovery_turn") {
+        if (state.startedAttempt === command.attempt) {
+          return { kind: "no_change" };
+        }
+        updateRecoveryState(entry, state, { startedAttempt: command.attempt });
+      } else {
+        if (state.executionIdentity) {
+          return JSON.stringify(state.executionIdentity) === JSON.stringify(command.token)
+            ? { kind: "no_change" }
+            : { kind: "rejected", reason: "stale_reservation" };
+        }
+        if (command.token.runId !== command.runId) {
+          return { kind: "rejected", reason: "stale_reservation" };
+        }
+        updateRecoveryState(entry, state, { executionIdentity: command.token });
       }
-      if (command.token.runId !== command.runId) {
-        return { kind: "rejected", reason: "stale_reservation" };
-      }
-      updateRecoveryState(entry, state, { executionIdentity: command.token });
       return { kind: "applied" };
     }
     case "cancel_reservation":
@@ -517,6 +548,7 @@ export function transitionMainSessionRecovery(
       });
       entry.abortedLastRun = false;
       entry.lifecycleRunId = command.runId;
+      entry.lastRunId = undefined;
       recordLifecycleFence(entry, {
         runId: command.runId,
         lifecycleGeneration: command.lifecycleGeneration,
@@ -529,37 +561,19 @@ export function transitionMainSessionRecovery(
           Object.assign(entry, PENDING_FINAL_DELIVERY_CLEAR_PATCH);
         }
       }
-      return { kind: "admitted_recovery" };
+      return {
+        kind: "admitted_recovery",
+        admission: {
+          cycleId: state.cycleId,
+          attempt: state.chargedAttempts,
+          lifecycleGeneration: command.lifecycleGeneration,
+          runId: command.runId,
+          sessionId: command.sessionId,
+        },
+      };
     }
-    case "mark_admitted_recovery_interrupted": {
-      const state = entry.mainRestartRecovery;
-      if (entry.sessionId !== command.sessionId) {
-        return { kind: "rejected", reason: "session_replaced" };
-      }
-      if (
-        !state ||
-        state.reservation ||
-        !entry.restartRecoveryRuns?.some(
-          (run) =>
-            run.runId === command.runId && run.lifecycleGeneration === command.lifecycleGeneration,
-        )
-      ) {
-        return { kind: "rejected", reason: "stale_reservation" };
-      }
-      entry.status = "running";
-      entry.lifecycleRunId = undefined;
-      entry.abortedLastRun = true;
-      entry.startedAt = undefined;
-      entry.endedAt = undefined;
-      entry.runtimeMs = undefined;
-      if (entry.restartRecoveryDeliveryRunId === command.runId) {
-        // Gateway accepted this RPC id before setup failed. Rotate it on retry
-        // or the dedupe cache replays that terminal pre-dispatch failure.
-        entry.restartRecoveryDeliveryRunId = undefined;
-      }
-      entry.updatedAt = command.now;
-      return { kind: "applied" };
-    }
+    case "mark_admitted_recovery_interrupted":
+      return interruptAdmittedMainSessionRecovery(entry, command);
     case "claim_foreground": {
       if (
         entry.sessionId === command.sessionId &&
@@ -580,7 +594,7 @@ export function transitionMainSessionRecovery(
       if (state.tombstone) {
         return { kind: "rejected", reason: "already_tombstoned" };
       }
-      if (state.chargedAttempts >= MAX_RECOVERY_RETRIES) {
+      if (getMainSessionRecoveryRetryCount(state) >= MAX_RECOVERY_RETRIES) {
         // The final charge fences foreground work until the scheduler commits
         // the matching tombstone. Admitting here can race that reconciliation.
         return { kind: "rejected", reason: "recovery_exhausted" };
@@ -699,6 +713,7 @@ export function transitionMainSessionRecovery(
       entry.abortedLastRun = false;
       entry.status = "failed";
       entry.lifecycleRunId = undefined;
+      entry.lastRunId = resolveRestartRecoveryTerminalClientRunId(entry);
       entry.endedAt = command.now;
       entry.runtimeMs = Math.max(0, command.now - (entry.startedAt ?? command.now));
       entry.updatedAt = command.now;

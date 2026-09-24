@@ -3,14 +3,14 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { expectDefined } from "@openclaw/normalization-core";
-import { captureEnv, setTestEnvValue } from "./env.js";
-import { cleanupSessionStateForTest } from "./session-state-cleanup.js";
+import { captureEnv, deleteTestEnvValue, setTestEnvValue } from "./env.js";
 
 const HOME_ENV_KEYS = [
   "HOME",
   "USERPROFILE",
   "HOMEDRIVE",
   "HOMEPATH",
+  "OPENCLAW_HOME",
   "OPENCLAW_STATE_DIR",
 ] as const;
 
@@ -46,31 +46,42 @@ async function ensurePrefixRoot(prefix: string): Promise<string> {
 
 /** Creates a temporary OpenClaw home and process env override for stateful tests. */
 export async function createTempHomeEnv(prefix: string): Promise<TempHomeEnv> {
+  const { cleanupSessionStateForTest } = await import("./session-state-cleanup.js");
   const prefixRoot = await ensurePrefixRoot(prefix);
   const home = path.join(prefixRoot, `home-${String(nextHomeIndex)}`);
   const stateDir = path.join(home, ".openclaw");
   nextHomeIndex += 1;
-  await fs.rm(home, { recursive: true, force: true });
-  await fs.mkdir(stateDir, { recursive: true });
-
   const snapshot = captureEnv([...HOME_ENV_KEYS]);
-  setTestEnvValue("HOME", home);
-  setTestEnvValue("USERPROFILE", home);
-  setTestEnvValue("OPENCLAW_STATE_DIR", stateDir);
+  try {
+    await fs.rm(home, { recursive: true, force: true });
+    await fs.mkdir(stateDir, { recursive: true, mode: 0o700 });
+    setTestEnvValue("HOME", home);
+    setTestEnvValue("USERPROFILE", home);
+    deleteTestEnvValue("OPENCLAW_HOME");
+    setTestEnvValue("OPENCLAW_STATE_DIR", stateDir);
 
-  if (process.platform === "win32") {
-    const match = home.match(/^([A-Za-z]:)(.*)$/);
-    if (match) {
-      setTestEnvValue("HOMEDRIVE", expectDefined(match[1], "temp home regex capture 1"));
-      setTestEnvValue("HOMEPATH", match[2] || "\\");
+    if (process.platform === "win32") {
+      const match = home.match(/^([A-Za-z]:)(.*)$/);
+      if (match) {
+        setTestEnvValue("HOMEDRIVE", expectDefined(match[1], "temp home regex capture 1"));
+        setTestEnvValue("HOMEPATH", match[2] || "\\");
+      }
     }
+  } catch (error) {
+    // No fixture work has started, so rollback must not drain shared session state.
+    snapshot.restore();
+    await fs.rm(home, { recursive: true, force: true });
+    throw error;
   }
 
   return {
     home,
     restore: async () => {
-      await cleanupSessionStateForTest({ stateDir }).catch(() => undefined);
-      snapshot.restore();
+      try {
+        await cleanupSessionStateForTest({ stateDir });
+      } finally {
+        snapshot.restore();
+      }
       await fs.rm(home, { recursive: true, force: true });
     },
   };

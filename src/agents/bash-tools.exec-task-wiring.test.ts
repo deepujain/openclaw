@@ -1,5 +1,9 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import fs from "node:fs/promises";
+import path from "node:path";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createDeferred } from "../../test/helpers/promise.js";
+import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
+import { getProcessSupervisor } from "../process/supervisor/index.js";
 
 const taskTracking = vi.hoisted(() => ({
   createBackgroundExecTask: vi.fn(),
@@ -8,14 +12,98 @@ const taskTracking = vi.hoisted(() => ({
 
 vi.mock("./bash-tools.exec-task-tracking.js", () => taskTracking);
 
-import { getFinishedSession } from "./bash-process-registry.js";
+import { getFinishedSession, waitForExecScope } from "./bash-process-registry.js";
 import { createExecTool } from "./bash-tools.exec-run.js";
 import type { BashSandboxConfig } from "./bash-tools.shared.js";
+import {
+  getGatewayToolCallerIdentity,
+  withGatewayToolCallerIdentity,
+} from "./tools/gateway-caller-context.js";
 
 describe("exec background task wiring", () => {
+  const tempDirs = useAutoCleanupTempDirTracker(afterEach);
   beforeEach(() => {
     taskTracking.createBackgroundExecTask.mockReset();
     taskTracking.finalizeBackgroundExecTask.mockReset();
+  });
+
+  it("launches a provider transport from its owner cwd", async () => {
+    const providerCwd = await fs.realpath(tempDirs.make("sandbox-provider-cwd-"));
+    const tool = createExecTool({
+      host: "sandbox",
+      security: "full",
+      ask: "off",
+      sandbox: {
+        containerName: "provider",
+        workspaceDir: process.cwd(),
+        containerWorkdir: "/remote/workspace",
+        buildExecSpec: async () => ({
+          argv: [process.execPath, "-e", "process.stdout.write(process.cwd())"],
+          env: process.env,
+          cwd: providerCwd,
+          stdinMode: "pipe-closed",
+        }),
+      },
+    });
+    const result = await tool.execute("provider-cwd", { command: "pwd" });
+    expect(result.details.status).toBe("completed");
+    expect(result.content).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ type: "text", text: expect.stringContaining(providerCwd) }),
+      ]),
+    );
+  });
+
+  it("does not spawn when the turn closes during asynchronous process preparation", async () => {
+    const abortController = new AbortController();
+    const finalizeExec = vi.fn<NonNullable<BashSandboxConfig["finalizeExec"]>>();
+    const preparationStarted = createDeferred();
+    const preparation =
+      createDeferred<Awaited<ReturnType<NonNullable<BashSandboxConfig["buildExecSpec"]>>>>();
+    const spawn = vi.spyOn(getProcessSupervisor(), "spawn");
+    const tool = createExecTool({
+      host: "sandbox",
+      security: "full",
+      ask: "off",
+      sandbox: {
+        containerName: "sandbox",
+        workspaceDir: process.cwd(),
+        containerWorkdir: process.cwd(),
+        buildExecSpec: async () => {
+          preparationStarted.resolve();
+          return await preparation.promise;
+        },
+        finalizeExec,
+      },
+    });
+    try {
+      const execution = tool.execute(
+        "closed-before-spawn",
+        { command: "sandbox-command" },
+        abortController.signal,
+      );
+      const settled = Promise.allSettled([execution]);
+      await preparationStarted.promise;
+      abortController.abort(new Error("turn closed during preparation"));
+      preparation.resolve({
+        argv: [process.execPath, "-e", ""],
+        env: process.env,
+        stdinMode: "pipe-closed",
+        finalizeToken: "cancelled-startup",
+      });
+      await settled;
+      expect(spawn.mock.calls.length).toBe(0);
+      await expect(execution).rejects.toThrow("turn closed during preparation");
+      expect(finalizeExec).toHaveBeenCalledExactlyOnceWith({
+        token: "cancelled-startup",
+        status: "failed",
+        exitCode: null,
+        timedOut: false,
+      });
+      expect(taskTracking.createBackgroundExecTask).not.toHaveBeenCalled();
+    } finally {
+      spawn.mockRestore();
+    }
   });
 
   it("does not register a foreground command that settles before the yield timer", async () => {
@@ -96,6 +184,87 @@ describe("exec background task wiring", () => {
     }
   });
 
+  it("keeps a fast background process handle while joining registration and terminal settlement", async () => {
+    const registrationStarted = createDeferred();
+    const registration = createDeferred<{ taskId: string }>();
+    const processExited = createDeferred();
+    const finalizationStarted = createDeferred();
+    const finalization = createDeferred();
+    const scopeKey = "exec-registration-race";
+    const workspace = tempDirs.make("exec-registration-race-");
+    const releaseFile = path.join(workspace, "release");
+    const source = `const fs = require('node:fs'); const gate = ${JSON.stringify(releaseFile)}; const watcher = fs.watch(process.cwd(), () => { if (fs.existsSync(gate)) watcher.close(); }); if (fs.existsSync(gate)) watcher.close();`;
+    const handle = { taskId: "task-fast-exit" };
+    taskTracking.createBackgroundExecTask.mockImplementation(() => {
+      registrationStarted.resolve();
+      return registration.promise;
+    });
+    taskTracking.finalizeBackgroundExecTask.mockImplementation(() => {
+      finalizationStarted.resolve();
+      return finalization.promise;
+    });
+    const tool = createExecTool({
+      host: "sandbox",
+      security: "full",
+      ask: "off",
+      scopeKey,
+      sessionKey: "agent:main:registration-race",
+      sandbox: {
+        containerName: "sandbox",
+        workspaceDir: workspace,
+        containerWorkdir: workspace,
+        buildExecSpec: async () => ({
+          argv: [process.execPath, "-e", source],
+          env: process.env,
+          cwd: workspace,
+          stdinMode: "pipe-closed",
+        }),
+        finalizeExec: async () => {
+          processExited.resolve();
+        },
+      },
+    });
+    const execution = tool.execute("fast-exit-registration", {
+      command: "sandbox-command",
+      background: true,
+    });
+    const returned = vi.fn();
+    void execution.then(returned, returned);
+    await registrationStarted.promise;
+    const scopeReleased = vi.fn();
+    const joined = waitForExecScope(scopeKey).then(scopeReleased);
+    try {
+      await fs.writeFile(releaseFile, "");
+      await processExited.promise;
+      expect(returned).not.toHaveBeenCalled();
+      expect(scopeReleased).not.toHaveBeenCalled();
+      registration.resolve(handle);
+      await finalizationStarted.promise;
+      await vi.waitFor(() => expect(returned).toHaveBeenCalledOnce());
+      expect(scopeReleased).not.toHaveBeenCalled();
+      const result = await execution;
+      expect(result.details.status).toBe("running");
+      if (result.details.status !== "running") {
+        throw new Error("Expected the promoted background process handle");
+      }
+      finalization.resolve();
+      await joined;
+      expect(getFinishedSession(result.details.sessionId)).toMatchObject({
+        exitCode: 0,
+        terminalStatus: "completed",
+      });
+      expect(taskTracking.finalizeBackgroundExecTask).toHaveBeenCalledExactlyOnceWith({
+        handle,
+        outcome: expect.objectContaining({ status: "completed", exitCode: 0 }),
+      });
+    } finally {
+      await fs.writeFile(releaseFile, "");
+      registration.resolve(handle);
+      finalization.resolve();
+      await Promise.allSettled([execution, joined]);
+    }
+  });
+
   it.each([
     {
       label: "foreground execution",
@@ -139,6 +308,10 @@ describe("exec background task wiring", () => {
 
   it("keeps a real background process running after its tool signal aborts", async () => {
     const abortController = new AbortController();
+    const settledIdentity = vi.fn();
+    taskTracking.finalizeBackgroundExecTask.mockImplementation(() =>
+      settledIdentity(getGatewayToolCallerIdentity()),
+    );
     const tool = createExecTool({
       host: "gateway",
       security: "full",
@@ -149,13 +322,20 @@ describe("exec background task wiring", () => {
     const command =
       `${JSON.stringify(process.execPath)} -e ` +
       `"setTimeout(() => process.stdout.write('background-survived\\n'), 30)"`;
-    const result = await tool.execute(
-      "abort-real-background",
-      { command, background: true },
-      abortController.signal,
+    const result = await withGatewayToolCallerIdentity(
+      { agentId: "main", sessionKey: "agent:main:background-lifetime" },
+      () =>
+        tool.execute(
+          "abort-real-background",
+          { command, background: true },
+          abortController.signal,
+        ),
     );
 
     expect(result.details.status).toBe("running");
+    expect(taskTracking.createBackgroundExecTask).toHaveBeenCalledWith(
+      expect.objectContaining({ command }),
+    );
     if (result.details.status !== "running") {
       throw new Error("expected a running background process");
     }
@@ -163,10 +343,11 @@ describe("exec background task wiring", () => {
     abortController.abort();
 
     await expect
-      .poll(() => getFinishedSession(sessionId)?.status, {
+      .poll(() => getFinishedSession(sessionId)?.terminalStatus, {
         timeout: 5_000,
         interval: 10,
       })
       .toBe("completed");
+    expect(settledIdentity).toHaveBeenCalledExactlyOnceWith(undefined);
   });
 });

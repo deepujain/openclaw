@@ -1,12 +1,17 @@
 /** Detects when secrets runtime preparation can safely use a fast path. */
 import { existsSync } from "node:fs";
+import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { uniqueStrings } from "@openclaw/normalization-core/string-normalization";
 import { listAgentIds, resolveAgentDir } from "../agents/agent-scope-config.js";
 import { resolveSharedAuthStorePath } from "../agents/auth-profiles/path-resolve.js";
-import { getRuntimeAuthProfileStoreCredentialsRevision } from "../agents/auth-profiles/runtime-snapshots.js";
+import {
+  getRuntimeAuthProfileStoreCredentialsRevision,
+  getRuntimeAuthProfileStoreSnapshotsRevision,
+  prepareRuntimeAuthProfileStoreSnapshots,
+} from "../agents/auth-profiles/runtime-snapshots.js";
 import { resolveAuthProfileDatabasePath } from "../agents/auth-profiles/sqlite.js";
 import type { AuthProfileStore } from "../agents/auth-profiles/types.js";
-import { resolveLegacyInheritedAuthDir } from "../agents/legacy-inherited-auth-dir.js";
+import { resolveLegacyInheritedAuthAgentDir } from "../agents/legacy-inherited-auth-dir.js";
 import { cloneConfigWithResolutionFacts } from "../config/resolution-facts.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import type { PluginManifestRegistry } from "../plugins/manifest-registry.js";
@@ -60,7 +65,7 @@ export function collectCandidateAgentDirs(
 ): string[] {
   const dirs = new Set<string>();
   dirs.add(resolveUserPath(resolveAgentDir(config, "main", env), env));
-  dirs.add(resolveUserPath(resolveLegacyInheritedAuthDir(config, env), env));
+  dirs.add(resolveUserPath(resolveLegacyInheritedAuthAgentDir(config, env), env));
   for (const agentId of listAgentIds(config)) {
     dirs.add(resolveUserPath(resolveAgentDir(config, agentId, env), env));
   }
@@ -131,10 +136,10 @@ function hasActiveRuntimeWebFetchProviderSurface(
   fetch: unknown,
   defaults: SecretDefaults | undefined,
 ): boolean {
-  if (!fetch || typeof fetch !== "object" || Array.isArray(fetch)) {
+  if (!isRecord(fetch)) {
     return false;
   }
-  const fetchConfig = fetch as Record<string, unknown>;
+  const fetchConfig = fetch;
   if (fetchConfig.enabled === false) {
     return false;
   }
@@ -148,13 +153,9 @@ function hasRuntimeWebToolConfigSurface(config: OpenClawConfig): boolean {
   const web = config.tools?.web;
   const defaults = config.secrets?.defaults;
   const fetchExplicitlyDisabled =
-    web &&
-    typeof web === "object" &&
-    !Array.isArray(web) &&
-    typeof (web as Record<string, unknown>).fetch === "object" &&
-    (web as { fetch?: { enabled?: unknown } }).fetch?.enabled === false;
-  if (web && typeof web === "object" && !Array.isArray(web)) {
-    const webRecord = web as Record<string, unknown>;
+    isRecord(web) && typeof web.fetch === "object" && web.fetch?.enabled === false;
+  if (isRecord(web)) {
+    const webRecord = web;
     if ("search" in webRecord) {
       return true;
     }
@@ -166,26 +167,21 @@ function hasRuntimeWebToolConfigSurface(config: OpenClawConfig): boolean {
     }
   }
   const entries = config.plugins?.entries;
-  if (!entries || typeof entries !== "object" || Array.isArray(entries)) {
+  if (!isRecord(entries)) {
     return false;
   }
   return Object.values(entries).some((entry) => {
-    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+    if (!isRecord(entry)) {
       return false;
     }
-    const pluginConfig = (entry as { config?: unknown }).config;
+    const pluginConfig = entry.config;
     return (
-      pluginConfig !== null &&
-      typeof pluginConfig === "object" &&
-      !Array.isArray(pluginConfig) &&
+      isRecord(pluginConfig) &&
       ("webSearch" in pluginConfig || (!fetchExplicitlyDisabled && "webFetch" in pluginConfig))
     );
   });
 }
 
-/**
- * Returns whether a snapshot can skip full SecretRef/web-tool resolution.
- */
 /** Returns whether current config/auth/plugin state allows skipping full secret preparation. */
 export function canUseSecretsRuntimeFastPath(params: {
   sourceConfig: OpenClawConfig;
@@ -219,6 +215,9 @@ export function prepareSecretsRuntimeFastPathSnapshot(params: {
 } | null {
   const runtimeEnv = mergeSecretsRuntimeEnv(params.env);
   const authStoreCredentialsRevision = getRuntimeAuthProfileStoreCredentialsRevision();
+  // Capture before store reads. A live mutation during preparation must advance past
+  // this watermark, or activation could overwrite it with the prepared candidate.
+  const authStoreSnapshotsRevision = getRuntimeAuthProfileStoreSnapshotsRevision();
   const sourceConfig = cloneConfigWithResolutionFacts(params.config);
   const resolvedConfig = cloneConfigWithResolutionFacts(params.config);
   const includeAuthStoreRefs = params.includeAuthStoreRefs ?? true;
@@ -257,8 +256,9 @@ export function prepareSecretsRuntimeFastPathSnapshot(params: {
   const snapshot = {
     sourceConfig,
     config: resolvedConfig,
-    authStores,
+    authStores: prepareRuntimeAuthProfileStoreSnapshots(authStores, runtimeEnv),
     authStoreCredentialsRevision,
+    authStoreSnapshotsRevision,
     warnings: [],
     degradedOwners: [],
     secretOwners: [],

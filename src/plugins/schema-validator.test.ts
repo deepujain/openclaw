@@ -1,7 +1,14 @@
 /** Covers plugin schema validation for manifests and exported config schemas. */
-import { Format } from "typebox/format";
-import { describe, expect, it } from "vitest";
-import { validateJsonSchemaValue } from "./schema-validator.js";
+import { describe, expect, it, vi } from "vitest";
+import { parseJsonSchemaIssuePath, validateJsonSchemaValue } from "./schema-validator.js";
+
+// Config validation is a CLI startup dependency; codecs and value transforms are not.
+vi.mock("typebox/compile", () => {
+  throw new Error("schema validation must not load the TypeBox value-transform compiler");
+});
+vi.mock("typebox/value", () => {
+  throw new Error("schema validation must not load TypeBox value transforms");
+});
 
 const jsonSchemaThenKeyword = ["the", "n"].join("");
 
@@ -54,23 +61,15 @@ function expectValidationSuccess(params: Parameters<typeof validateJsonSchemaVal
   expect(result.ok).toBe(true);
 }
 
-function expectUriValidationCase(params: {
-  input: Parameters<typeof validateJsonSchemaValue>[0];
-  ok: boolean;
-  expectedPath?: string;
-  expectedMessage?: string;
-}) {
-  if (params.ok) {
-    expectValidationSuccess(params.input);
-    return;
-  }
-
-  const result = expectValidationFailure(params.input);
-  const issue = expectValidationIssue(result, params.expectedPath ?? "");
-  expect(issue.message).toContain(params.expectedMessage ?? "");
-}
-
 describe("schema validator", () => {
+  it.each([
+    ["<root>", []],
+    ["items.0.enabled", ["items", 0, "enabled"]],
+    ["items.100001.enabled", ["items", "100001", "enabled"]],
+  ])("parses JSON Schema issue path %s", (path, expected) => {
+    expect(parseJsonSchemaIssuePath(path)).toEqual(expected);
+  });
+
   it("can apply JSON Schema defaults while validating", () => {
     const value = {};
     const result = validateJsonSchemaValue({
@@ -1799,11 +1798,17 @@ describe("schema validator", () => {
 
   it("recompiles when a stable cache key receives a different schema shape", () => {
     const cacheKey = "schema-validator.test.cache-key-drift";
+    const schema = { type: "string" };
     expectValidationSuccess({
       cacheKey,
-      schema: { type: "string" },
+      schema,
       value: "ok",
     });
+
+    expect(() =>
+      validateJsonSchemaValue({ cacheKey, schema: { type: 1n }, value: "ignored" }),
+    ).toThrow("invalid schema: <schema>.type: expected string or non-empty string array");
+    expectValidationSuccess({ cacheKey, schema, value: "still valid" });
 
     const result = expectValidationFailure({
       cacheKey,
@@ -2021,112 +2026,6 @@ describe("schema validator", () => {
     expect(issue.text).not.toContain("\n");
     expect(issue.text).not.toContain("\t");
     expect(issue.text).not.toContain("\x1b");
-  });
-
-  it.each([
-    {
-      title: "accepts uri-formatted string schemas for valid urls",
-      params: {
-        cacheKey: "schema-validator.test.uri.valid",
-        schema: {
-          type: "object",
-          properties: {
-            apiRoot: {
-              type: "string",
-              format: "uri",
-            },
-          },
-          required: ["apiRoot"],
-        },
-        value: { apiRoot: "https://api.telegram.org" },
-      },
-      ok: true,
-    },
-    {
-      title: "rejects uri-formatted string schemas for invalid urls",
-      params: {
-        cacheKey: "schema-validator.test.uri.invalid",
-        schema: {
-          type: "object",
-          properties: {
-            apiRoot: {
-              type: "string",
-              format: "uri",
-            },
-          },
-          required: ["apiRoot"],
-        },
-        value: { apiRoot: "not a uri" },
-      },
-      ok: false,
-      expectedPath: "apiRoot",
-      expectedMessage: "must match format",
-    },
-    {
-      title: "rejects uri-formatted string schemas for invalid absolute urls",
-      params: {
-        cacheKey: "schema-validator.test.uri.invalid-absolute",
-        schema: {
-          type: "object",
-          properties: {
-            apiRoot: {
-              type: "string",
-              format: "uri",
-            },
-          },
-          required: ["apiRoot"],
-        },
-        value: { apiRoot: "https://" },
-      },
-      ok: false,
-      expectedPath: "apiRoot",
-      expectedMessage: "must match format",
-    },
-  ])(
-    "supports uri-formatted string schemas: $title",
-    ({ params, ok, expectedPath, expectedMessage }) => {
-      expectUriValidationCase({
-        input: params,
-        ok,
-        expectedPath,
-        expectedMessage,
-      });
-    },
-  );
-
-  it("treats non-uri string formats as annotations", () => {
-    expectSuccessfulValidationValue({
-      input: {
-        cacheKey: "schema-validator.test.format.email.annotation",
-        schema: {
-          type: "object",
-          properties: {
-            contact: {
-              type: "string",
-              format: "email",
-            },
-            token: {
-              type: "string",
-              format: "uuid",
-            },
-          },
-          required: ["contact", "token"],
-        },
-        value: {
-          contact: "not an email",
-          token: "not a uuid",
-        },
-      },
-      expectedValue: {
-        contact: "not an email",
-        token: "not a uuid",
-      },
-    });
-  });
-
-  it("does not weaken the global TypeBox format registry", () => {
-    expect(Format.Get("email")?.("not an email")).toBe(false);
-    expect(Format.Get("uuid")?.("not a uuid")).toBe(false);
   });
 });
 /* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

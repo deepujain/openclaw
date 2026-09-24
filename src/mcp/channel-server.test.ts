@@ -47,27 +47,17 @@ function attachReadyGateway(
   bridge: OpenClawChannelBridge,
   gatewayRequest: ReturnType<typeof vi.fn>,
 ) {
-  (
-    bridge as unknown as {
-      gateway: { request: typeof gatewayRequest; stopAndWait: () => Promise<void> };
-      readySettled: boolean;
-      resolveReady: () => void;
-    }
-  ).gateway = {
+  const bridgeInternals = bridge as unknown as {
+    gateway: { request: typeof gatewayRequest; stopAndWait: () => Promise<void> };
+    readySettled: boolean;
+    resolveReady: () => void;
+  };
+  bridgeInternals.gateway = {
     request: gatewayRequest,
     stopAndWait: async () => {},
   };
-  (
-    bridge as unknown as {
-      readySettled: boolean;
-      resolveReady: () => void;
-    }
-  ).readySettled = true;
-  (
-    bridge as unknown as {
-      resolveReady: () => void;
-    }
-  ).resolveReady();
+  bridgeInternals.readySettled = true;
+  bridgeInternals.resolveReady();
 }
 
 async function flushMcpNotifications() {
@@ -203,37 +193,38 @@ describe("openclaw channel mcp server", () => {
         ).toBe(true);
       });
 
-      test("projects canonical persisted media from a text-only transcript message", async () => {
+      test("fetches canonical persisted media by message id without scanning recent history", async () => {
         const mcp = await connectMcpWithoutGateway({ claudeChannelMode: "off" });
         try {
-          attachReadyGateway(
-            mcp.bridge,
-            vi.fn(async (method: string) => {
-              if (method !== "sessions.get") {
-                throw new Error(`unexpected gateway method ${method}`);
-              }
+          const gatewayRequest = vi.fn(async (method: string, params: Record<string, unknown>) => {
+            if (method === "chat.message.get") {
+              expect(params).toEqual({
+                sessionKey: "agent:main:main",
+                messageId: "msg-canonical-media",
+              });
               return {
-                messages: [
-                  {
-                    id: "msg-canonical-media",
-                    role: "user",
-                    content: "text-only transcript content",
-                    __openclaw: {
-                      media: [
-                        {
-                          url: "media://inbound/photo.png",
-                          contentType: "image/png",
-                          kind: "image",
-                          fileName: "photo.png",
-                          sizeBytes: 123,
-                        },
-                      ],
-                    },
+                ok: true,
+                message: {
+                  id: "msg-canonical-media",
+                  role: "user",
+                  content: "text-only transcript content",
+                  __openclaw: {
+                    media: [
+                      {
+                        url: "media://inbound/photo.png",
+                        contentType: "image/png",
+                        kind: "image",
+                        fileName: "photo.png",
+                        sizeBytes: 123,
+                      },
+                    ],
                   },
-                ],
+                },
               };
-            }),
-          );
+            }
+            throw new Error(`unexpected gateway method ${method}`);
+          });
+          attachReadyGateway(mcp.bridge, gatewayRequest);
 
           const result = (await mcp.client.callTool({
             name: "attachments_fetch",
@@ -258,6 +249,7 @@ describe("openclaw channel mcp server", () => {
               },
             },
           ]);
+          expect(gatewayRequest).toHaveBeenCalledTimes(1);
         } finally {
           await mcp.close();
         }

@@ -1,48 +1,60 @@
 import {
-  assertDirectPluginRegistrationReplacement,
-  requireActivePluginRegistry,
-  resolveDirectPluginRegistrationOwner,
-} from "../plugins/runtime.js";
-// Tracks detached task runtime state and spawned process handles.
-import type {
-  DetachedTaskLifecycleRuntime,
-  DetachedTaskLifecycleRuntimeRegistration,
+  capturePluginLifecycleAuthority,
+  getPluginRecordRegistry,
+} from "../plugins/registry-lifecycle.js";
+import { getPluginRegistryForContext, requireActivePluginRegistry } from "../plugins/runtime.js";
+import { getPluginRuntimeGatewayRequestScope } from "../plugins/runtime/gateway-request-scope.js";
+import {
+  DetachedTaskRuntimeOwnerRetiredError,
+  type DetachedTaskLifecycleRuntime,
 } from "./detached-task-runtime-contract.js";
-
-const getRegistrations = () => requireActivePluginRegistry().detachedTaskRuntimes;
-
-/** Registers the active detached task lifecycle runtime implementation. */
-export function registerDetachedTaskLifecycleRuntime(
-  requestedPluginId: string,
-  runtime: DetachedTaskLifecycleRuntime,
-): void {
-  const registrations = getRegistrations();
-  const pluginId = resolveDirectPluginRegistrationOwner(requestedPluginId) ?? requestedPluginId;
-  if (registrations[0]) {
-    assertDirectPluginRegistrationReplacement(registrations[0].pluginId, "detached task runtime");
-  }
-  registrations.splice(0, registrations.length, { pluginId, runtime });
-}
-
-export function getDetachedTaskLifecycleRuntimeRegistration():
-  | DetachedTaskLifecycleRuntimeRegistration
-  | undefined {
-  const registration = getRegistrations()[0];
-  if (!registration) {
-    return undefined;
-  }
-  return {
-    pluginId: registration.pluginId,
-    runtime: registration.runtime,
-  };
-}
 
 export function getRegisteredDetachedTaskLifecycleRuntime():
   | DetachedTaskLifecycleRuntime
   | undefined {
-  return getRegistrations()[0]?.runtime;
+  return requireActivePluginRegistry().detachedTaskRuntimes[0]?.runtime;
 }
 
-export function clearDetachedTaskLifecycleRuntimeRegistration(): void {
-  getRegistrations().length = 0;
+/** Core creation retains its scoped owner; plugin work follows its exact live instance. */
+export function captureDetachedTaskRuntimeOwner(): {
+  runtime: DetachedTaskLifecycleRuntime | undefined;
+  assertCurrent: () => void;
+} {
+  const registry = requireActivePluginRegistry();
+  const registration = registry.detachedTaskRuntimes[0];
+  const runtime = registration?.runtime;
+  const pluginId = registration?.pluginId;
+  const record = registration
+    ? registry.plugins.find((candidate) => candidate.id === pluginId)
+    : undefined;
+  // Local runs own scoped handles without publishing a Gateway activation.
+  // Core handles retain that scope; plugin callbacks follow their exact instance.
+  const authority = capturePluginLifecycleAuthority(
+    record ? getPluginRecordRegistry(registry, record) : registry,
+    record,
+    { scopedRuntime: getPluginRuntimeGatewayRequestScope()?.pluginRegistry === registry },
+  );
+  return {
+    runtime,
+    assertCurrent() {
+      if (registration) {
+        const owner = record ? getPluginRecordRegistry(registry, record) : undefined;
+        if (
+          authority?.() &&
+          owner?.detachedTaskRuntimes.some(
+            (candidate) => candidate.pluginId === pluginId && candidate.runtime === runtime,
+          )
+        ) {
+          return;
+        }
+      } else if (
+        authority?.() &&
+        getPluginRegistryForContext() === registry &&
+        registry.detachedTaskRuntimes[0] === undefined
+      ) {
+        return;
+      }
+      throw new DetachedTaskRuntimeOwnerRetiredError();
+    },
+  };
 }

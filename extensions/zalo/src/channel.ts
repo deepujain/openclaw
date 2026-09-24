@@ -28,7 +28,10 @@ import {
   createAttachedChannelResultAdapter,
   createEmptyChannelResult,
 } from "openclaw/plugin-sdk/channel-send-result";
-import { buildTokenChannelStatusSummary } from "openclaw/plugin-sdk/channel-status";
+import {
+  buildTokenChannelStatusSummary,
+  PAIRING_APPROVED_MESSAGE,
+} from "openclaw/plugin-sdk/channel-status";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import { createStaticReplyToModeResolver } from "openclaw/plugin-sdk/conversation-runtime";
 import {
@@ -47,6 +50,7 @@ import {
 } from "openclaw/plugin-sdk/text-chunking";
 import {
   inspectZaloAccount,
+  isZaloAccountConfigured,
   listZaloAccountIds,
   resolveDefaultZaloAccountId,
   resolveZaloAccount,
@@ -98,6 +102,7 @@ async function sendZaloDelivery(ctx: {
   text: string;
   accountId?: string | null;
   mediaUrl?: string;
+  assertDirectAdapterHandoff?: () => void;
 }): Promise<{ messageId: string; receipt: MessageReceipt }> {
   const result = await (
     await loadZaloChannelRuntime()
@@ -107,6 +112,7 @@ async function sendZaloDelivery(ctx: {
     accountId: ctx.accountId ?? undefined,
     mediaUrl: ctx.mediaUrl,
     cfg: ctx.cfg,
+    assertDirectAdapterHandoff: ctx.assertDirectAdapterHandoff,
   });
   if (!result.ok) {
     throw new Error(result.error ?? `Failed to send Zalo ${ctx.mediaUrl ? "media" : "message"}`);
@@ -134,10 +140,6 @@ const zaloMessageAdapter = defineChannelMessageAdapter({
     media: sendZaloDelivery,
   },
 });
-
-function isZaloAccountConfigured(account: ResolvedZaloAccount): boolean {
-  return account.tokenStatus ? account.tokenStatus !== "missing" : Boolean(account.token?.trim());
-}
 
 const zaloConfigAdapter = createScopedChannelConfigAdapter<ResolvedZaloAccount>({
   sectionKey: "zalo",
@@ -195,7 +197,7 @@ const collectZaloSecurityWarnings = createOpenProviderGroupPolicyWarningCollecto
 const collectZaloOpenGroupFindings = createConditionalWarningCollector.findings({
   collectWarnings: collectZaloSecurityWarnings,
   checkId: "channels.zalo.groups.open",
-  severity: "critical",
+  severity: "warn",
   title: "Zalo security warning",
 });
 
@@ -299,10 +301,11 @@ export const zaloPlugin: ChannelPlugin<ResolvedZaloAccount, ZaloProbeResult> =
     pairing: {
       text: {
         idLabel: "zaloUserId",
-        message: "Your pairing request has been approved.",
+        message: PAIRING_APPROVED_MESSAGE,
         normalizeAllowEntry: (entry) => entry.trim().replace(/^(zalo|zl):/i, ""),
-        notify: async (params) =>
-          await (await loadZaloChannelRuntime()).notifyZaloPairingApproval(params),
+        notify: async (params) => {
+          await sendZaloDelivery({ ...params, to: params.id, text: params.message });
+        },
       },
     },
     threading: {

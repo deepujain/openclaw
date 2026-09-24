@@ -3,11 +3,7 @@ import {
   logInboundDrop,
   resolveChannelInboundRouteEnvelope,
 } from "openclaw/plugin-sdk/channel-inbound";
-import {
-  channelIngressRoutes,
-  createChannelIngressResolver,
-  defineStableChannelIngressIdentity,
-} from "openclaw/plugin-sdk/channel-ingress-runtime";
+import { channelIngressRoutes } from "openclaw/plugin-sdk/channel-ingress-runtime";
 import {
   bindIngressLifecycleToReplyOptions,
   resolveChannelStreamingBlockEnabled,
@@ -32,8 +28,9 @@ import {
   normalizeStringEntries,
 } from "openclaw/plugin-sdk/string-coerce-runtime";
 import type { ResolvedIrcAccount } from "./accounts.js";
+import { createIrcIngressSubject, ircIngressIdentity } from "./ingress-identity.js";
 import type { IrcIngressDispatchResult, IrcIngressLifecycle } from "./irc-ingress.js";
-import { buildIrcAllowlistCandidates, normalizeIrcAllowEntry } from "./normalize.js";
+import { normalizeIrcAllowEntry } from "./normalize.js";
 import { sanitizeIrcAssistantText } from "./outbound-base.js";
 import { resolveIrcGroupMatch, resolveIrcGroupRequireMention } from "./policy.js";
 import { getIrcRuntime } from "./runtime.js";
@@ -41,43 +38,7 @@ import { sendMessageIrc } from "./send.js";
 import type { CoreConfig, IrcInboundMessage } from "./types.js";
 
 const CHANNEL_ID = "irc" as const;
-const IRC_NICK_KIND = "plugin:irc-nick" as const;
 type IrcGroupPolicy = "open" | "allowlist" | "disabled";
-
-const ircIngressIdentity = defineStableChannelIngressIdentity({
-  key: "irc-id",
-  normalizeEntry: normalizeIrcStableEntry,
-  normalizeSubject: normalizeLowercaseStringOrEmpty,
-  sensitivity: "pii",
-  aliases: [
-    {
-      key: "irc-id-nick-user",
-      kind: "stable-id" as const,
-      normalizeEntry: normalizeIrcNickUserEntry,
-      normalizeSubject: normalizeLowercaseStringOrEmpty,
-      dangerous: true,
-      sensitivity: "pii" as const,
-    },
-    {
-      key: "irc-id-nick-host",
-      kind: "stable-id" as const,
-      normalizeEntry: () => null,
-      normalizeSubject: normalizeLowercaseStringOrEmpty,
-      sensitivity: "pii" as const,
-    },
-    {
-      key: "irc-nick",
-      kind: IRC_NICK_KIND,
-      normalizeEntry: normalizeIrcNickEntry,
-      normalizeSubject: normalizeLowercaseStringOrEmpty,
-      dangerous: true,
-      sensitivity: "pii",
-    },
-  ],
-  isWildcardEntry: (entry) => normalizeIrcAllowEntry(entry) === "*",
-  resolveEntryId: ({ entryIndex, fieldKey }) =>
-    `irc-entry-${entryIndex + 1}:${fieldKey === "irc-nick" ? "nick" : "id"}`,
-});
 
 const escapeIrcRegexLiteral = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 // IRC nicknames permit punctuation, so ASCII word boundaries lose valid leading/trailing chars.
@@ -102,60 +63,8 @@ function buildIrcNickMentionPattern(value: string): string {
   }).join("");
 }
 
-function isBareNick(value: string): boolean {
-  return !value.includes("!") && !value.includes("@");
-}
-
-function hasVerifiedHost(value: string): boolean {
-  return value.includes("@");
-}
-
-function isHostlessNickUser(value: string): boolean {
-  return value.includes("!") && !value.includes("@");
-}
-
-function normalizeIrcStableEntry(value: string): string | null {
-  const normalized = normalizeIrcAllowEntry(value);
-  if (!normalized || normalized === "*" || !hasVerifiedHost(normalized)) {
-    return null;
-  }
-  return normalized;
-}
-
-function normalizeIrcNickUserEntry(value: string): string | null {
-  const normalized = normalizeIrcAllowEntry(value);
-  if (!normalized || normalized === "*" || !isHostlessNickUser(normalized)) {
-    return null;
-  }
-  return normalized;
-}
-
-function normalizeIrcNickEntry(value: string): string | null {
-  const normalized = normalizeIrcAllowEntry(value);
-  if (!normalized || normalized === "*" || !isBareNick(normalized)) {
-    return null;
-  }
-  return normalized;
-}
-
 function hasEntries(entries: Array<string | number> | undefined): boolean {
   return normalizeStringEntries(entries).some((entry) => normalizeIrcAllowEntry(entry));
-}
-
-function createIrcIngressSubject(message: IrcInboundMessage) {
-  const candidates = buildIrcAllowlistCandidates(message, { allowNameMatching: true });
-  const stableCandidates = candidates.filter((candidate) => hasVerifiedHost(candidate));
-  const nick = normalizeLowercaseStringOrEmpty(message.senderNick);
-  return {
-    stableId: stableCandidates[stableCandidates.length - 1] ?? nick,
-    aliases: {
-      "irc-id-nick-user": candidates.find((candidate) => isHostlessNickUser(candidate)),
-      "irc-id-nick-host": stableCandidates.find(
-        (candidate) => !candidate.includes("!") && candidate.includes("@"),
-      ),
-      "irc-nick": nick,
-    },
-  };
 }
 
 function routeDescriptorsForIrcGroup(params: {
@@ -224,7 +133,7 @@ export async function handleIrcInbound(params: {
   message: IrcInboundMessage;
   account: ResolvedIrcAccount;
   config: CoreConfig;
-  runtime: RuntimeEnv;
+  runtime: Pick<RuntimeEnv, "error" | "log">;
   connectedNick?: string;
   turnAdoptionLifecycle?: IrcIngressLifecycle;
   sendReply?: (target: string, text: string, replyToId?: string) => Promise<void>;
@@ -321,57 +230,59 @@ export async function handleIrcInbound(params: {
       id: peerId,
     },
   });
-  const access = await createChannelIngressResolver({
-    channelId: CHANNEL_ID,
-    accountId: account.accountId,
-    identity: ircIngressIdentity,
-    cfg: config as OpenClawConfig,
-    readStoreAllowFrom: async () => await pairing.readAllowFromStore(),
-  }).message({
-    subject: createIrcIngressSubject(message),
-    conversation: {
-      kind: message.isGroup ? "group" : "direct",
-      id: message.target,
-    },
-    contextBinding: {
-      agentId: route.agentId,
-      sessionKey: route.sessionKey,
-      ...(message.messageId ? { messageId: message.messageId } : {}),
-      inboundEventKind: "user_request",
-    },
-    route: routeDescriptorsForIrcGroup({
-      isGroup: message.isGroup,
-      groupPolicy,
-      groupAllowed: groupMatch.allowed,
-      hasConfiguredGroups: groupMatch.hasConfiguredGroups,
-      groupEnabled:
-        groupMatch.groupConfig?.enabled !== false && groupMatch.wildcardConfig?.enabled !== false,
-      routeGroupAllowFrom,
-    }),
-    mentionFacts: message.isGroup
-      ? {
-          canDetectMention: true,
-          wasMentioned,
-          hasAnyMention: wasMentioned,
-        }
-      : undefined,
-    dmPolicy,
-    groupPolicy: accessGroupPolicy,
-    policy: {
-      groupAllowFromFallbackToAllowFrom: false,
-      mutableIdentifierMatching: allowNameMatching ? "enabled" : "disabled",
-      activation: {
-        requireMention: message.isGroup && requireMention,
-        allowTextCommands,
+  const access = await core.channel.inbound.ingress
+    .createResolver({
+      channelId: CHANNEL_ID,
+      accountId: account.accountId,
+      identity: ircIngressIdentity,
+      cfg: config as OpenClawConfig,
+      readStoreAllowFrom: async () => await pairing.readAllowFromStore(),
+    })
+    .message({
+      subject: createIrcIngressSubject(message),
+      conversation: {
+        kind: message.isGroup ? "group" : "direct",
+        id: message.target,
       },
-    },
-    allowFrom: account.config.allowFrom,
-    groupAllowFrom: account.config.groupAllowFrom,
-    command: {
-      allowTextCommands,
-      hasControlCommand,
-    },
-  });
+      contextBinding: {
+        agentId: route.agentId,
+        sessionKey: route.sessionKey,
+        ...(message.messageId ? { messageId: message.messageId } : {}),
+        inboundEventKind: "user_request",
+      },
+      route: routeDescriptorsForIrcGroup({
+        isGroup: message.isGroup,
+        groupPolicy,
+        groupAllowed: groupMatch.allowed,
+        hasConfiguredGroups: groupMatch.hasConfiguredGroups,
+        groupEnabled:
+          groupMatch.groupConfig?.enabled !== false && groupMatch.wildcardConfig?.enabled !== false,
+        routeGroupAllowFrom,
+      }),
+      mentionFacts: message.isGroup
+        ? {
+            canDetectMention: true,
+            wasMentioned,
+            hasAnyMention: wasMentioned,
+          }
+        : undefined,
+      dmPolicy,
+      groupPolicy: accessGroupPolicy,
+      policy: {
+        groupAllowFromFallbackToAllowFrom: false,
+        mutableIdentifierMatching: allowNameMatching ? "enabled" : "disabled",
+        activation: {
+          requireMention: message.isGroup && requireMention,
+          allowTextCommands,
+        },
+      },
+      allowFrom: account.config.allowFrom,
+      groupAllowFrom: account.config.groupAllowFrom,
+      command: {
+        allowTextCommands,
+        hasControlCommand,
+      },
+    });
   const commandAuthorized = access.commandAccess.authorized;
 
   if (access.ingress.admission === "pairing-required") {

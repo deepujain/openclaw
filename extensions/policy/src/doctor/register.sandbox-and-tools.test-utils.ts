@@ -359,16 +359,14 @@ describe("registerPolicyDoctorChecks", () => {
     );
   });
 
-  it("uses explicit agent sandbox scope before inherited legacy perSession", async () => {
-    // `perSession` is retired runtime config but remains raw doctor input so policy evidence can
-    // verify that an explicit modern scope wins over the legacy field.
+  it("uses explicit agent sandbox scope before inherited shared scope", async () => {
     const cfg = rawCfgWithPolicy({
       agents: {
         defaults: {
           sandbox: {
             mode: "all",
             backend: "docker",
-            perSession: false,
+            scope: "shared",
             docker: {
               network: "none",
             },
@@ -854,6 +852,32 @@ describe("registerPolicyDoctorChecks", () => {
     expect(result.findings).toEqual([]);
   });
 
+  it("accepts agent exec mode posture that matches policy", async () => {
+    const cfg = cfgWithPolicyOverrides({
+      agents: {
+        list: [{ id: "reviewer", tools: { exec: { mode: "ask" } } }],
+      },
+    });
+    const configPath = await writePolicyFixture({
+      scopes: {
+        reviewer: {
+          agentIds: ["reviewer"],
+          tools: {
+            exec: {
+              allowSecurity: ["allowlist"],
+              requireAsk: ["on-miss"],
+            },
+          },
+        },
+      },
+    });
+
+    registerPolicyDoctorChecks();
+    const result = await runDoctorLintChecks(ctx(configPath, cfg));
+
+    expect(result.findings).toEqual([]);
+  });
+
   it("reports global and agent-scoped tool claims independently", async () => {
     const cfg = cfgWithPolicyOverrides({
       tools: {
@@ -1059,7 +1083,17 @@ describe("registerPolicyDoctorChecks", () => {
   it("accepts omitted exec defaults and individual denies for required deny groups", async () => {
     const cfg = cfgWithPolicyOverrides({
       tools: {
-        deny: ["exec", "process", "code_execution", "read", "write", "edit", "apply_patch"],
+        deny: [
+          "exec",
+          "process",
+          "code_execution",
+          "secrets",
+          "ls",
+          "read",
+          "write",
+          "edit",
+          "apply_patch",
+        ],
       },
     });
     const configPath = await writePolicyFixture({

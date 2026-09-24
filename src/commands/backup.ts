@@ -1,24 +1,18 @@
 // CLI command wrapper for backup archive creation and optional verification.
 import {
   createBackupArchive,
-  formatBackupCreateSummary,
   type BackupCreateOptions,
   type BackupCreateResult,
 } from "../infra/backup-create.js";
 import { formatErrorMessage } from "../infra/errors.js";
+import { beginLifecycleWriteCustody } from "../infra/lifecycle-write-custody.js";
+import { withCommandProcessScope } from "../process/exec-spawn.js";
 import { type RuntimeEnv, writeRuntimeJson } from "../runtime.js";
-import { createLazyImportLoader } from "../shared/lazy-promise.js";
-import { recordBackupRunOutcome } from "../state/backup-run-records.js";
+import { createLazyPromise } from "../shared/lazy-promise.js";
+import { recordBackupOutcomeBestEffort } from "./backup-shared.js";
+import { formatBackupCreateSummary } from "./backup-summary.js";
 
-type BackupVerifyRuntime = typeof import("./backup-verify.js");
-
-const backupVerifyRuntimeLoader = createLazyImportLoader<BackupVerifyRuntime>(
-  () => import("./backup-verify.js"),
-);
-
-function loadBackupVerifyRuntime(): Promise<BackupVerifyRuntime> {
-  return backupVerifyRuntimeLoader.load();
-}
+const loadBackupVerifyRuntime = createLazyPromise(() => import("./backup-verify.js"));
 
 /** Create a backup archive, optionally verify it, and emit text or JSON output. */
 export async function backupCreateCommand(
@@ -26,11 +20,15 @@ export async function backupCreateCommand(
   opts: BackupCreateOptions = {},
 ): Promise<BackupCreateResult> {
   let archivePath = opts.output ?? process.cwd();
+  const releaseCustody = opts.dryRun ? undefined : beginLifecycleWriteCustody("backup");
+  let failure: unknown;
   try {
-    const result = await createBackupArchive({
-      ...opts,
-      log: opts.log ?? (opts.json ? undefined : (message: string) => runtime.log(message)),
-    });
+    const result = await withCommandProcessScope(() =>
+      createBackupArchive({
+        ...opts,
+        log: opts.log ?? (opts.json ? undefined : (message: string) => runtime.log(message)),
+      }),
+    );
     archivePath = result.archivePath;
     if (opts.verify && !opts.dryRun) {
       const { backupVerifyCommand } = await loadBackupVerifyRuntime();
@@ -44,7 +42,8 @@ export async function backupCreateCommand(
       result.verified = true;
     }
     if (!opts.dryRun) {
-      recordBackupOutcomeBestEffort(runtime, {
+      await recordBackupOutcomeBestEffort(runtime, {
+        kind: "archive",
         archivePath,
         status: "ok",
       });
@@ -56,26 +55,17 @@ export async function backupCreateCommand(
     }
     return result;
   } catch (error) {
+    failure = error;
     if (!opts.dryRun) {
-      recordBackupOutcomeBestEffort(runtime, {
+      await recordBackupOutcomeBestEffort(runtime, {
+        kind: "archive",
         archivePath,
         status: "failed",
         error: formatErrorMessage(error),
       });
     }
     throw error;
-  }
-}
-
-function recordBackupOutcomeBestEffort(
-  runtime: RuntimeEnv,
-  params: { archivePath: string; status: "ok" | "failed"; error?: string },
-): void {
-  try {
-    recordBackupRunOutcome({ kind: "archive", ...params });
-  } catch (error) {
-    runtime.error(
-      `Warning: the backup outcome could not be recorded: ${formatErrorMessage(error)}`,
-    );
+  } finally {
+    releaseCustody?.(failure);
   }
 }

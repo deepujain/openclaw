@@ -1,10 +1,10 @@
-// Qa Lab plugin module implements suite runtime agent behavior.
 export {
   createSession,
   readEffectiveTools,
   readRawQaSessionStore,
   readSessionTranscriptSummary,
   readSkillStatus,
+  seedQaSessionEntries,
   seedQaSessionTranscript,
 } from "./suite-runtime-agent-session.js";
 export {

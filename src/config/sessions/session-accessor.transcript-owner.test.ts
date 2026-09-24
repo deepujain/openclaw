@@ -9,37 +9,87 @@ import { loadTranscriptEvents, replaceSessionEntry } from "./session-accessor.js
 import { persistSessionTranscriptTurn } from "./session-accessor.transcript-turn.js";
 
 describe("transcript turn logical ownership", () => {
-  it("rejects a bare-key write for an ownerless explicit fleet", async () => {
+  it("completes committed custody before a queued cancellation can interrupt the receipt", async () => {
     await withTempHome(async (home) => {
-      const storePath = path.join(home, "sessions.json");
-      const cfg = {
-        agents: { ownership: "explicit", entries: { ops: {}, research: {} } },
-        session: { store: storePath },
-      } satisfies OpenClawConfig;
-
-      await expect(
-        persistSessionTranscriptTurn(
+      const scope = {
+        agentId: "main",
+        sessionId: "commit-callback-session",
+        sessionKey: "agent:main:main",
+        storePath: path.join(home, "sessions.json"),
+      };
+      await replaceSessionEntry(scope, { sessionId: scope.sessionId, updatedAt: 1 });
+      const controller = new AbortController();
+      const completed: string[] = [];
+      const turn = persistSessionTranscriptTurn(scope, {
+        config: { session: { store: scope.storePath } },
+        expectedSessionId: scope.sessionId,
+        messages: [
           {
-            sessionId: "ownerless-transcript-session",
-            sessionKey: "main",
-            storePath,
+            eventId: "committed-before-cancellation",
+            message: { role: "assistant", content: "Committed notification" },
+            shouldAppendInTransaction: () => {
+              // Cancellation runs at the first async boundary after SQLite commit.
+              queueMicrotask(() => controller.abort(new Error("cancelled after commit")));
+              return true;
+            },
           },
-          {
-            config: cfg,
-            messages: [{ message: { role: "user", content: "must not be attributed" } }],
-            updateMode: "none",
-          },
-        ),
-      ).rejects.toBeInstanceOf(AgentSelectionRequiredError);
+        ],
+        onMessageCommitted: ({ messageId }) => {
+          controller.signal.throwIfAborted();
+          completed.push(messageId);
+        },
+        updateMode: "none",
+      });
+      await expect(turn).resolves.toMatchObject({ appendedCount: 1 });
+      expect(controller.signal.aborted).toBe(true);
+      expect(completed).toEqual(["committed-before-cancellation"]);
+      expect(await loadTranscriptEvents(scope)).toContainEqual(
+        expect.objectContaining({ id: "committed-before-cancellation" }),
+      );
     });
   });
 
-  it("attributes a bare-key write to the retained compatibility owner", async () => {
+  it.each([undefined, "ops"])(
+    "rejects a bare-key write without a designation (provenance: %s)",
+    async (retainedOwner) => {
+      await withTempHome(async (home) => {
+        const storePath = path.join(home, "sessions.json");
+        const cfg = retainLegacyDefaultAgentId(
+          {
+            agents: { ownership: "explicit", entries: { ops: {}, research: {} } },
+            session: { store: storePath },
+          } satisfies OpenClawConfig,
+          retainedOwner,
+        );
+
+        await expect(
+          persistSessionTranscriptTurn(
+            {
+              sessionId: "ownerless-transcript-session",
+              sessionKey: "main",
+              storePath,
+            },
+            {
+              config: cfg,
+              messages: [{ message: { role: "user", content: "must not be attributed" } }],
+              updateMode: "none",
+            },
+          ),
+        ).rejects.toBeInstanceOf(AgentSelectionRequiredError);
+      });
+    },
+  );
+
+  it("attributes a bare-key write to the recorded default owner", async () => {
     await withTempHome(async (home) => {
       const storePath = path.join(home, "sessions.json");
       const cfg = retainLegacyDefaultAgentId(
         {
-          agents: { ownership: "explicit", entries: { ops: {}, research: {} } },
+          agents: {
+            ownership: "explicit",
+            defaults: { systemAgent: { agentId: "ops" } },
+            entries: { ops: {}, research: {} },
+          },
           session: { store: storePath },
         },
         "ops",
@@ -182,22 +232,24 @@ describe("transcript turn logical ownership", () => {
     });
   });
 
-  it("uses an explicit agent for a pathless injected session store", async () => {
-    await withTempHome(async (home) => {
-      const configuredStorePath = path.join(home, "shared-sessions.json");
-      const sessionEntry = { sessionId: "injected-research", updatedAt: 1 };
-      const sessionStore = { global: sessionEntry };
-      const cfg = {
-        agents: {
-          ownership: "explicit",
-          defaults: { sessionStore: { agentId: "ops" } },
-          entries: { ops: {}, research: {} },
-        },
-        session: { store: configuredStorePath },
-      } satisfies OpenClawConfig;
+  it.each([false, true])(
+    "completes a pathless injected write before a later failure: %s",
+    async (failSecondAppend) => {
+      await withTempHome(async (home) => {
+        const configuredStorePath = path.join(home, "shared-sessions.json");
+        const sessionEntry = { sessionId: "injected-research", updatedAt: 1 };
+        const sessionStore = { global: sessionEntry };
+        const cfg = {
+          agents: {
+            ownership: "explicit",
+            defaults: { sessionStore: { agentId: "ops" } },
+            entries: { ops: {}, research: {} },
+          },
+          session: { store: configuredStorePath },
+        } satisfies OpenClawConfig;
 
-      await expect(
-        persistSessionTranscriptTurn(
+        const completed: string[] = [];
+        const turn = persistSessionTranscriptTurn(
           {
             agentId: "research",
             sessionId: sessionEntry.sessionId,
@@ -206,13 +258,45 @@ describe("transcript turn logical ownership", () => {
           },
           {
             config: cfg,
-            messages: [{ message: { role: "user", content: "injected research" } }],
+            messages: [
+              {
+                eventId: "injected-first",
+                message: { role: "user", content: "injected research" },
+              },
+              ...(failSecondAppend
+                ? [
+                    {
+                      message: { role: "user", content: "cannot commit" },
+                      prepareMessageAfterIdempotencyCheck: () => {
+                        throw new Error("second append failed");
+                      },
+                    },
+                  ]
+                : []),
+            ],
+            onMessageCommitted: ({ messageId }) => {
+              completed.push(messageId);
+            },
             updateMode: "none",
           },
-        ),
-      ).resolves.toMatchObject({ appendedCount: 1 });
-    });
-  });
+        );
+        if (failSecondAppend) {
+          await expect(turn).rejects.toThrow("second append failed");
+        } else {
+          await expect(turn).resolves.toMatchObject({ appendedCount: 1 });
+        }
+        expect(completed).toEqual(["injected-first"]);
+        expect(
+          await loadTranscriptEvents({
+            agentId: "research",
+            sessionId: sessionEntry.sessionId,
+            sessionKey: "global",
+            storePath: configuredStorePath,
+          }),
+        ).toContainEqual(expect.objectContaining({ id: "injected-first" }));
+      });
+    },
+  );
 
   it("keeps a pathless injected session store ownerless without an explicit agent", async () => {
     await withTempHome(async (home) => {

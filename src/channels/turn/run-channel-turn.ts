@@ -51,13 +51,18 @@ function assertPreparedDispatchLifecycle<TDispatchResult>(
   turn: PreparedChannelTurn<TDispatchResult>,
   turnAdoptionLifecycle: RunChannelTurnParams<unknown>["turnAdoptionLifecycle"],
 ): void {
+  if (!turnAdoptionLifecycle) {
+    // Top-level lifecycle ownership is meaningful only when the caller supplied
+    // that owner.
+    return;
+  }
   const lifecycle = turn.runDispatchLifecycle;
   if (!lifecycle) {
     throw new Error(
       "runChannelInboundEvent prepared turns must declare runDispatchLifecycle when creating runDispatch",
     );
   }
-  if (turnAdoptionLifecycle && lifecycle.turnAdoptionLifecycle !== turnAdoptionLifecycle) {
+  if (lifecycle.turnAdoptionLifecycle !== turnAdoptionLifecycle) {
     throw new Error(
       "runChannelInboundEvent prepared turn runDispatchLifecycle must own the top-level turnAdoptionLifecycle",
     );
@@ -243,6 +248,18 @@ export async function runChannelTurn<
   });
 
   const admission = resolved.admission ?? preflightAdmission ?? ({ kind: "dispatch" } as const);
+  const emitFinalize = (event: { event: "done" | "error"; error?: unknown }) =>
+    emit({
+      ...params,
+      accountId: resolved.accountId ?? params.accountId,
+      event: {
+        stage: "finalize",
+        messageId: input.id,
+        sessionKey: resolved.routeSessionKey,
+        admission: admission.kind,
+        ...event,
+      },
+    });
   let result: ChannelTurnResult<TDispatchResult>;
   try {
     if ("runDispatch" in resolved) {
@@ -289,46 +306,15 @@ export async function runChannelTurn<
     } catch {
       // Preserve the original dispatch error.
     }
-    emit({
-      ...params,
-      accountId: resolved.accountId ?? params.accountId,
-      event: {
-        stage: "finalize",
-        event: "done",
-        messageId: input.id,
-        sessionKey: resolved.routeSessionKey,
-        admission: admission.kind,
-      },
-    });
+    emitFinalize({ event: "done" });
     throw err;
   }
 
   try {
     await params.adapter.onFinalize?.(result);
-    emit({
-      ...params,
-      accountId: resolved.accountId ?? params.accountId,
-      event: {
-        stage: "finalize",
-        event: "done",
-        messageId: input.id,
-        sessionKey: resolved.routeSessionKey,
-        admission: admission.kind,
-      },
-    });
+    emitFinalize({ event: "done" });
   } catch (err) {
-    emit({
-      ...params,
-      accountId: resolved.accountId ?? params.accountId,
-      event: {
-        stage: "finalize",
-        event: "error",
-        messageId: input.id,
-        sessionKey: resolved.routeSessionKey,
-        admission: admission.kind,
-        error: err,
-      },
-    });
+    emitFinalize({ event: "error", error: err });
     throw err;
   }
 

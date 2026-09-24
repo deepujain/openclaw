@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   GATEWAY_CLIENT_IDS,
   GATEWAY_CLIENT_MODES,
@@ -67,6 +67,9 @@ function deviceRuntime(params: {
   });
   if (params.listCurrentNodes) {
     runtime.bindNodeTransport({
+      async getCurrentNode(nodeId) {
+        return (await this.listCurrentNodes()).find((node) => node.nodeId === nodeId);
+      },
       listCurrentNodes: params.listCurrentNodes,
       hasCurrentRunner: () => true,
       ...(params.getIssue ? { getIssue: params.getIssue } : {}),
@@ -96,9 +99,10 @@ describe("device worker provider", () => {
     }).provider;
 
     expect(provider.supportedExecutionModes).toEqual(["worker-turn", "remote-exec"]);
-    const first = await provider.provision({ device: DEVICE_ID }, "operation-1");
-    const repeated = await provider.provision({ device: DEVICE_ID }, "operation-1");
-    const next = await provider.provision({ device: DEVICE_ID }, "operation-2");
+    const authority = { assertCurrent: () => {} };
+    const first = await provider.provision({ device: DEVICE_ID }, "operation-1", authority);
+    const repeated = await provider.provision({ device: DEVICE_ID }, "operation-1", authority);
+    const next = await provider.provision({ device: DEVICE_ID }, "operation-2", authority);
 
     expect(first).toEqual({
       leaseId: expect.stringMatching(/^device:[a-f0-9]{64}:[a-f0-9]{32}$/u),
@@ -107,6 +111,14 @@ describe("device worker provider", () => {
     });
     expect(repeated.leaseId).toBe(first.leaseId);
     expect(next.leaseId).not.toBe(first.leaseId);
+    const getPairedDevice = vi.fn(async () => null);
+    const listCurrentNodes = vi.fn(async () => []);
+    const disconnected = deviceRuntime({ getPairedDevice, listCurrentNodes }).provider;
+    const allocation = await disconnected.resolveAllocation({ device: DEVICE_ID }, "operation-1");
+    expect(allocation).toEqual({ leaseId: first.leaseId, sharedHost: true });
+    await disconnected.destroy({ leaseId: allocation.leaseId, profile: { device: DEVICE_ID } });
+    expect(getPairedDevice).not.toHaveBeenCalled();
+    expect(listCurrentNodes).not.toHaveBeenCalled();
   });
 
   it("keeps a connected paired host available when all worker slots are occupied", async () => {
@@ -118,7 +130,9 @@ describe("device worker provider", () => {
     await expect(runtime.resolveAvailability(DEVICE_ID)).resolves.toMatchObject({
       available: true,
     });
-    await expect(runtime.provider.provision({ device: DEVICE_ID }, "remote-exec")).resolves.toEqual(
+    await expect(
+      runtime.provider.provision({ device: DEVICE_ID }, "remote-exec", { assertCurrent: () => {} }),
+    ).resolves.toEqual(
       expect.objectContaining({ node: { deviceId: DEVICE_ID }, sharedHost: true }),
     );
   });
@@ -140,7 +154,9 @@ describe("device worker provider", () => {
     "rejects $name during provision",
     async ({ getPairedDevice, listCurrentNodes, expectedMessage }) => {
       const provider = deviceRuntime({ getPairedDevice, listCurrentNodes }).provider;
-      const provision = provider.provision({ device: DEVICE_ID }, "operation");
+      const provision = provider.provision({ device: DEVICE_ID }, "operation", {
+        assertCurrent: () => {},
+      });
 
       await expect(provision).rejects.toBeInstanceOf(WorkerProviderError);
       await expect(provision).rejects.toMatchObject({ message: expectedMessage });
@@ -154,7 +170,9 @@ describe("device worker provider", () => {
       getIssue: () => NODE_RUNNER_UPDATE_REQUIRED_ISSUE,
     }).provider;
 
-    await expect(provider.provision({ device: DEVICE_ID }, "operation")).rejects.toThrow(
+    await expect(
+      provider.provision({ device: DEVICE_ID }, "operation", { assertCurrent: () => {} }),
+    ).rejects.toThrow(
       `device worker node ${DEVICE_ID} requires an update before it can host sessions; run openclaw update, then reconnect it (for a headless node, run openclaw node restart)`,
     );
   });

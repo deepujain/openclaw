@@ -41,7 +41,7 @@ import {
   resolveAgentIdFromSessionKey,
 } from "../routing/session-key.js";
 import { type RuntimeEnv, writeRuntimeJson } from "../runtime.js";
-import { sessionDeliveryChannel } from "../utils/delivery-context.shared.js";
+import { sessionDeliveryChannel } from "../utils/delivery-context.read.js";
 import { INTERNAL_MESSAGE_CHANNEL } from "../utils/message-channel.js";
 
 type SandboxExplainOptions = {
@@ -174,7 +174,6 @@ export async function sandboxExplainCommand(
     session: opts.session,
   });
 
-  const sandboxCfg = resolveSandboxConfigForAgent(cfg, resolvedAgentId);
   const toolPolicy = resolveSandboxToolPolicyForAgent(cfg, resolvedAgentId);
   const sandboxRuntime = resolveSandboxRuntimeStatus({
     cfg,
@@ -182,6 +181,14 @@ export async function sandboxExplainCommand(
     agentId: resolvedAgentId,
     classificationAgentId: resolvedAgentId,
   });
+  const configuredSandbox = resolveSandboxConfigForAgent(cfg, resolvedAgentId);
+  const sandboxCfg = sandboxRuntime.sandboxRequired
+    ? {
+        ...configuredSandbox,
+        scope: "agent" as const,
+        workspaceAccess: sandboxRuntime.workspaceAccess,
+      }
+    : configuredSandbox;
   const mainSessionKey = sandboxRuntime.mainSessionKey;
   const sessionIsSandboxed = sandboxRuntime.sandboxed;
   const storePath = resolveSessionStorePathCore(cfg.session?.store, {
@@ -210,6 +217,7 @@ export async function sandboxExplainCommand(
   const workspaceLayout = resolveSandboxWorkspaceLayoutPaths({
     cfg: sandboxCfg,
     agentId: resolvedAgentId,
+    isolationSubject: sandboxRuntime.isolationSubject,
     rawSessionKey:
       sessionKey === "global"
         ? buildAgentMainSessionKey({

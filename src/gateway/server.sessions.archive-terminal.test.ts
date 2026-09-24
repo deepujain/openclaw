@@ -3,6 +3,7 @@ import { afterEach, expect, onTestFinished, test, vi } from "vitest";
 import { loadSessionEntry } from "../config/sessions/session-accessor.js";
 import { createDeferredCore } from "../shared/deferred.js";
 import { closeOpenClawStateDatabaseForTest } from "../state/openclaw-state-db.js";
+import { disposeSessionReadContexts } from "./server-methods/sessions-read-cache.test-support.js";
 import { TerminalSessionManager } from "./terminal/session-manager.js";
 import {
   agentTerminalOwner,
@@ -18,7 +19,8 @@ import {
 
 const { createSessionStoreDir } = setupGatewaySessionsHandlerTestHarness();
 
-afterEach(() => {
+afterEach(async () => {
+  await disposeSessionReadContexts();
   closeOpenClawStateDatabaseForTest();
 });
 
@@ -78,18 +80,15 @@ test("sessions.patch closes only the exact terminal session incarnation", async 
 
   expect(archived.ok).toBe(true);
   expect(manager.listAgent(oldOwner)).toEqual([]);
-  expect(manager.writeAgent(oldOwner, oldSession.sessionId, "stale")).toEqual({
-    ok: false,
-    code: "session_unavailable",
-  });
-  expect(manager.writeAgent(replacementOwner, replacementSession.sessionId, "replacement")).toEqual(
-    { ok: true },
+  expect(manager.snapshotAgent(oldOwner, oldSession.sessionId)).toBeUndefined();
+  replacementPty.emitData("replacement\n");
+  unrelatedPty.emitData("unrelated\n");
+  expect(manager.snapshotAgent(replacementOwner, replacementSession.sessionId)).toContain(
+    "replacement",
   );
-  expect(manager.writeAgent(unrelatedOwner, unrelatedSession.sessionId, "unrelated")).toEqual({
-    ok: true,
-  });
-  expect(replacementPty).toMatchObject({ killed: false, writes: ["replacement"] });
-  expect(unrelatedPty).toMatchObject({ killed: false, writes: ["unrelated"] });
+  expect(manager.snapshotAgent(unrelatedOwner, unrelatedSession.sessionId)).toContain("unrelated");
+  expect(replacementPty.killed).toBe(false);
+  expect(unrelatedPty.killed).toBe(false);
   expect(manager.size).toBe(2);
   expect(loadSessionEntry({ storePath, sessionKey })?.archivedAt).toEqual(expect.any(Number));
 });

@@ -1,11 +1,10 @@
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
+import type { PluginCommandReplyOptions } from "../../plugins/plugin-command-dispatch-contract.js";
 import {
   createPluginCommandRuntime,
   matchPluginCommandInvocation,
   PLUGIN_COMMAND_DISPATCH,
-  type PluginCommandCatalogDecision,
-  type PluginCommandExecutionReplyOptions,
 } from "../../plugins/plugin-command-runtime.js";
 import { isNativeCommandTurn, resolveCommandTurnContext } from "../command-turn-context.js";
 import {
@@ -15,13 +14,14 @@ import {
 } from "../commands-registry.js";
 import { shouldHandleTextCommands } from "../commands-text-routing.js";
 import type { FinalizedRuntimeMsgContext } from "../templating.js";
+import { resolveCommandChannel } from "./commands-context.js";
 import { resolveCommandContextText } from "./context-text.js";
 import { isExplicitSourceReplyCommand } from "./source-reply-delivery-mode.js";
 
 export function shouldBypassPluginOwnedBindingForCommand(
   ctx: FinalizedRuntimeMsgContext,
   cfg: OpenClawConfig,
-  replyOptions?: PluginCommandExecutionReplyOptions,
+  replyOptions?: PluginCommandReplyOptions,
 ): boolean {
   // Command authorization is a trust boundary. Reject malformed runtime context
   // before command-turn normalization can coerce a truthy value.
@@ -63,15 +63,13 @@ export function shouldBypassPluginOwnedBindingForCommand(
   if (planned) {
     return true;
   }
-  const channel = normalizeOptionalString(ctx.Surface ?? ctx.Provider) ?? "";
+  const channel = resolveCommandChannel(ctx);
   const match = matchPluginCommandInvocation(createPluginCommandRuntime(), commandBody, {
     channel,
   });
   if (match) {
     if (replyOptions) {
-      (replyOptions as { [PLUGIN_COMMAND_DISPATCH]?: PluginCommandCatalogDecision })[
-        PLUGIN_COMMAND_DISPATCH
-      ] = match.dispatch;
+      Object.assign(replyOptions, { [PLUGIN_COMMAND_DISPATCH]: match.dispatch });
     }
     return true;
   }

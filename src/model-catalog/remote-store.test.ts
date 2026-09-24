@@ -2,17 +2,18 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { requireNodeSqlite } from "../infra/node-sqlite.js";
-import {
-  closeOpenClawStateDatabaseForTest,
-  openOpenClawStateDatabase,
-} from "../state/openclaw-state-db.js";
+import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
+import { writeConfigMachineState } from "../state/config-machine-state-write.js";
+import { readConfigMachineState } from "../state/config-machine-state.js";
+import { closeOpenClawStateDatabaseForTest } from "../state/openclaw-state-db.js";
 import {
   markRemoteModelCatalogChecked,
   readRemoteModelCatalog,
   writeRemoteModelCatalog,
 } from "./remote-store.js";
 
+// Registered first so it removes directories after the database closes below.
+const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 const roots: string[] = [];
 afterEach(() => {
   closeOpenClawStateDatabaseForTest();
@@ -22,48 +23,26 @@ afterEach(() => {
 });
 
 describe("remote model catalog store", () => {
-  it("lazily adds the cache table to an existing current-schema database", () => {
-    const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-catalog-")));
-    roots.push(root);
-    const options = { path: path.join(root, "state.sqlite") };
-    openOpenClawStateDatabase(options);
-    closeOpenClawStateDatabaseForTest();
-
-    const { DatabaseSync } = requireNodeSqlite();
-    const preCatalog = new DatabaseSync(options.path);
-    preCatalog.exec("DROP TABLE model_catalog_remote;");
-    preCatalog.exec("DROP INDEX idx_task_runs_status;");
-    preCatalog.close();
-
-    const reopened = openOpenClawStateDatabase(options);
-    expect(
-      reopened.db
-        .prepare("SELECT name FROM sqlite_schema WHERE type = 'table' AND name = ?")
-        .get("model_catalog_remote"),
-    ).toBeUndefined();
-    expect(
-      reopened.db
-        .prepare("SELECT name FROM sqlite_schema WHERE type = 'index' AND name = ?")
-        .get("idx_task_runs_status"),
-    ).toEqual({ name: "idx_task_runs_status" });
-    closeOpenClawStateDatabaseForTest();
-
-    expect(readRemoteModelCatalog(options)).toBeUndefined();
-    const upgraded = new DatabaseSync(options.path, { readOnly: true });
-    expect(
-      upgraded
-        .prepare("SELECT name FROM sqlite_schema WHERE type = 'table' AND name = ?")
-        .get("model_catalog_remote"),
-    ).toEqual({ name: "model_catalog_remote" });
-    upgraded.close();
-  });
-
-  it("lazily ensures twice and upserts the single slot", () => {
+  it("stores one machine-state snapshot and rejects stale refreshes", () => {
     const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-catalog-")));
     roots.push(root);
     const options = { path: path.join(root, "state.sqlite") };
     expect(readRemoteModelCatalog(options)).toBeUndefined();
-    expect(readRemoteModelCatalog(options)).toBeUndefined();
+    expect(
+      markRemoteModelCatalogChecked(
+        1,
+        {
+          expected: {
+            source_url: "https://catalog.test/one",
+            generated_at: 1,
+            etag: null,
+            last_modified: null,
+          },
+        },
+        options,
+      ),
+    ).toBe(false);
+    expect(readConfigMachineState("modelCatalog.remote.v2", options)).toBeUndefined();
     writeRemoteModelCatalog(
       {
         bundle_json: '{"schemaVersion":1}',
@@ -124,7 +103,7 @@ describe("remote model catalog store", () => {
         {
           expected: {
             source_url: "https://catalog.test/two",
-            generated_at: 2,
+            generated_at: 3,
             etag: '"older"',
             last_modified: null,
           },
@@ -152,5 +131,76 @@ describe("remote model catalog store", () => {
       source_url: "https://catalog.test/two",
       checked_at: 6,
     });
+    expect(readConfigMachineState("modelCatalog.remote.v2", options)).toEqual({
+      bundle_json: '{"schemaVersion":1,"updated":true}',
+      generated_at: 3,
+      min_version: "2026.7.0",
+      source_url: "https://catalog.test/two",
+      etag: '"two"',
+      last_modified: null,
+      checked_at: 6,
+    });
+  });
+
+  it("serves an upgraded install from the older client's row without writing it", () => {
+    const options = { path: path.join(tempDirs.make("openclaw-catalog-"), "state.sqlite") };
+    const legacy = {
+      bundle_json: '{"schemaVersion":1,"legacy":true}',
+      generated_at: 100,
+      min_version: "2026.7.0",
+      source_url: "https://mirror.test/v1/catalog.json",
+      etag: '"legacy"',
+      last_modified: null,
+      checked_at: 10,
+    };
+    writeConfigMachineState("modelCatalog.remote", legacy, options);
+    // Offline or unchanged mirrors keep their catalog across the upgrade.
+    expect(readRemoteModelCatalog(options)).toEqual({ id: 1, ...legacy });
+    // A 304 revalidation adopts the row into this client's slot.
+    expect(
+      markRemoteModelCatalogChecked(
+        20,
+        { expected: legacy, etag: '"legacy"', lastModified: null },
+        options,
+      ),
+    ).toBe(true);
+    expect(readConfigMachineState("modelCatalog.remote.v2", options)).toEqual({
+      ...legacy,
+      checked_at: 20,
+    });
+    expect(readConfigMachineState("modelCatalog.remote", options)).toEqual(legacy);
+    // Once adopted, later writes by the older client no longer affect this client.
+    writeConfigMachineState("modelCatalog.remote", { ...legacy, generated_at: 200 }, options);
+    expect(readRemoteModelCatalog(options)?.generated_at).toBe(100);
+  });
+
+  it("leaves this client's slot empty when the older client's row no longer matches", () => {
+    const options = { path: path.join(tempDirs.make("openclaw-catalog-"), "state.sqlite") };
+    const legacy = {
+      bundle_json: '{"schemaVersion":1,"legacy":true}',
+      generated_at: 100,
+      min_version: null,
+      source_url: "https://mirror.test/v1/catalog.json",
+      etag: '"legacy"',
+      last_modified: null,
+      checked_at: 10,
+    };
+    // The older client refreshed between this client's read and its 304 check.
+    const newer = { ...legacy, generated_at: 200, etag: '"newer"' };
+    writeConfigMachineState("modelCatalog.remote", newer, options);
+    expect(
+      markRemoteModelCatalogChecked(
+        20,
+        { expected: legacy, etag: '"legacy"', lastModified: null },
+        options,
+      ),
+    ).toBe(false);
+    expect(readConfigMachineState("modelCatalog.remote.v2", options)).toBeUndefined();
+    // Until this client stores its own row, it keeps following the older client's slot.
+    expect(readRemoteModelCatalog(options)).toEqual({ id: 1, ...newer });
+    expect(readConfigMachineState("modelCatalog.remote", options)).toEqual(newer);
+    const latest = { ...newer, generated_at: 300, etag: '"latest"' };
+    writeConfigMachineState("modelCatalog.remote", latest, options);
+    expect(readRemoteModelCatalog(options)).toEqual({ id: 1, ...latest });
   });
 });

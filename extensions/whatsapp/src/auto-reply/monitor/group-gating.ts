@@ -1,7 +1,7 @@
-// Whatsapp plugin module implements group gating behavior.
 import type { BuildMentionRegexesOptions } from "openclaw/plugin-sdk/channel-mention-gating";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import { createDedupeCache } from "openclaw/plugin-sdk/dedupe-runtime";
+import { formatAudioTranscriptForAgent } from "openclaw/plugin-sdk/media-understanding-runtime";
 import type { HistoryMediaEntry } from "openclaw/plugin-sdk/reply-history";
 import { resolveWhatsAppGroupsConfigPath } from "../../group-config-path.js";
 import {
@@ -16,7 +16,6 @@ import { requireWhatsAppInboundAdmission } from "../../inbound/admission.js";
 import type { AdmittedWebInboundMessage } from "../../inbound/types.js";
 import type { MentionConfig } from "../mentions.js";
 import { buildMentionConfig, debugMention, resolveOwnerList } from "../mentions.js";
-import { formatWhatsAppAudioTranscriptForAgent } from "./audio-transcript.js";
 import { stripMentionsForCommand } from "./commands.js";
 import { resolveGroupActivationFor } from "./group-activation.js";
 import {
@@ -55,8 +54,8 @@ type ApplyGroupGatingParams = {
   selfChatMode?: boolean;
   logVerbose: (msg: string) => void;
   replyLogger: {
-    debug: (obj: unknown, msg: string) => void;
-    warn: (obj: unknown, msg: string) => void;
+    debug: (obj: object, msg: string) => void;
+    warn: (obj: object, msg: string) => void;
   };
 };
 
@@ -155,7 +154,7 @@ export async function applyGroupGating(params: ApplyGroupGatingParams) {
   const conversationGroupPolicy = inboundPolicy.resolveConversationGroupPolicy(conversationId);
   if (conversationGroupPolicy.allowlistEnabled && !conversationGroupPolicy.allowed) {
     const accountId = inboundPolicy.account.accountId;
-    const warnKey = `${accountId}:${conversationId}`;
+    const warnKey = JSON.stringify([accountId, conversationId, "group registry"]);
     if (shouldWarnForGroupDrop(warnKey)) {
       const groupsPath = resolveWhatsAppGroupsConfigPath({ cfg: params.cfg, accountId });
       params.replyLogger.warn(
@@ -270,11 +269,19 @@ export async function applyGroupGating(params: ApplyGroupGatingParams) {
       );
       return { shouldProcess: false, needsMentionText: true } as const;
     }
+    const accountId = inboundPolicy.account.accountId;
+    if (shouldWarnForGroupDrop(JSON.stringify([accountId, conversationId, "no mention"]))) {
+      const groupsPath = resolveWhatsAppGroupsConfigPath({ cfg: params.cfg, accountId });
+      params.replyLogger.warn(
+        { conversationId, accountId, groupsPath },
+        `WhatsApp group ${conversationId}: skipping messages without a mention. Mention patterns can be derived from the agent identity name. Use /activation always for this session, or set ${groupsPath}[${JSON.stringify(conversationId)}].requireMention=false for the default. Preserve existing groups entries; when adding the first groups map, include "*": {} to keep other chats admitted.`,
+      );
+    }
     // Mention matching needs raw STT text, but deferred history is model-visible later.
     const pendingHistoryBody =
       params.mentionText === undefined
         ? undefined
-        : formatWhatsAppAudioTranscriptForAgent(params.mentionText);
+        : formatAudioTranscriptForAgent(params.mentionText);
     return skipGroupMessageAndStoreHistory(
       params,
       `Group message stored for context (no mention detected) in ${conversationId}: ${mentionMsg.payload.body}`,

@@ -3,11 +3,12 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { withSuppressedNotes } from "../../../packages/terminal-core/src/note.js";
+import type { DoctorConfigPreflightResult } from "../../commands/doctor/shared/config-migration-result.js";
 import { readConfigFileSnapshot, setRuntimeConfigSnapshot } from "../../config/config.js";
 import { createInvalidConfigError } from "../../config/io.invalid-config.js";
 import type { ConfigSnapshotReadMeasure } from "../../config/io.js";
 import {
-  resolveIsNixMode,
+  resolveIsConfigReadOnly,
   resolveLegacyStateDirs,
   resolveOAuthDir,
   resolveStateDir,
@@ -15,7 +16,16 @@ import {
 import type { ConfigFileSnapshot } from "../../config/types.js";
 import { resolveExecApprovalsPath } from "../../infra/exec-approvals-config.js";
 import { resolveRequiredHomeDir } from "../../infra/home-dir.js";
+import {
+  adoptProcessPluginCache,
+  getPluginMetadataSnapshotCache,
+} from "../../plugins/plugin-cache.js";
 import { ExitError, type RuntimeEnv } from "../../runtime.js";
+import {
+  getExistingOpenClawStateSchemaPath,
+  isExistingOpenClawStateSchema,
+} from "../../state/openclaw-state-db-schema-policy.js";
+import { resolveOpenClawStateSqlitePath } from "../../state/openclaw-state-db.paths.js";
 import type { InvalidConfigRecoveryDeps } from "../invalid-config-recovery.js";
 
 const ALLOWED_INVALID_COMMANDS = new Set(["audit", "doctor", "logs", "health", "help", "status"]);
@@ -40,14 +50,6 @@ let configSnapshotPromise: Promise<Awaited<ReturnType<typeof readConfigFileSnaps
 function resetConfigGuardStateForTests() {
   didRunDoctorConfigFlow = false;
   configSnapshotPromise = null;
-}
-
-function fileOrDirExists(pathname: string): boolean {
-  try {
-    return fs.existsSync(pathname);
-  } catch {
-    return false;
-  }
 }
 
 function dirHasFile(dir: string, predicate: (name: string) => boolean): boolean {
@@ -78,16 +80,16 @@ function isLegacyTelegramStateFile(name: string): boolean {
 
 function hasLegacyIMessageStateFiles(stateDir: string): boolean {
   return (
-    fileOrDirExists(path.join(stateDir, "imessage", "reply-cache.jsonl")) ||
-    fileOrDirExists(path.join(stateDir, "imessage", "sent-echoes.jsonl")) ||
+    fs.existsSync(path.join(stateDir, "imessage", "reply-cache.jsonl")) ||
+    fs.existsSync(path.join(stateDir, "imessage", "sent-echoes.jsonl")) ||
     dirHasFile(path.join(stateDir, "imessage", "catchup"), (name) => name.endsWith(".json"))
   );
 }
 
 function hasBundledChannelLegacyStateMigrationInputs(stateDir: string, oauthDir: string): boolean {
   if (
-    fileOrDirExists(path.join(stateDir, "discord", "model-picker-preferences.json")) ||
-    fileOrDirExists(path.join(stateDir, "discord", "thread-bindings.json"))
+    fs.existsSync(path.join(stateDir, "discord", "model-picker-preferences.json")) ||
+    fs.existsSync(path.join(stateDir, "discord", "thread-bindings.json"))
   ) {
     return true;
   }
@@ -95,19 +97,12 @@ function hasBundledChannelLegacyStateMigrationInputs(stateDir: string, oauthDir:
     return true;
   }
   if (
-    fileOrDirExists(path.join(oauthDir, "telegram-allowFrom.json")) ||
+    fs.existsSync(path.join(oauthDir, "telegram-allowFrom.json")) ||
     dirHasFile(path.join(stateDir, "telegram"), isLegacyTelegramStateFile)
   ) {
     return true;
   }
   return dirHasFile(oauthDir, isLegacyWhatsAppAuthFile);
-}
-
-function hasPendingSqliteSidecarArchive(sourcePath: string): boolean {
-  return (
-    fileOrDirExists(`${sourcePath}.migrated`) &&
-    ["-shm", "-wal", "-journal"].some((suffix) => fileOrDirExists(`${sourcePath}${suffix}`))
-  );
 }
 
 function hasLegacyStateMigrationInputs(): boolean {
@@ -117,16 +112,11 @@ function hasLegacyStateMigrationInputs(): boolean {
   if (
     !process.env.OPENCLAW_STATE_DIR?.trim() &&
     resolveLegacyStateDirs(() => resolveRequiredHomeDir(process.env, os.homedir)).some(
-      fileOrDirExists,
+      fs.existsSync,
     )
   ) {
     return true;
   }
-  const sqliteSidecarPaths = [
-    path.join(stateDir, "flows", "registry.sqlite"),
-    path.join(stateDir, "plugin-state", "state.sqlite"),
-    path.join(stateDir, "tasks", "runs.sqlite"),
-  ];
   const legacyExecApprovalsPath = resolveExecApprovalsPath(process.env);
   return (
     [
@@ -139,11 +129,7 @@ function hasLegacyStateMigrationInputs(): boolean {
       path.join(stateDir, "restart-sentinel.json.doctor-importing"),
       path.join(stateDir, "sessions"),
       path.join(stateDir, "state", "openclaw.sqlite"),
-    ].some(fileOrDirExists) ||
-    sqliteSidecarPaths.some(
-      (sourcePath) => fileOrDirExists(sourcePath) || hasPendingSqliteSidecarArchive(sourcePath),
-    ) ||
-    hasBundledChannelLegacyStateMigrationInputs(stateDir, oauthDir)
+    ].some(fs.existsSync) || hasBundledChannelLegacyStateMigrationInputs(stateDir, oauthDir)
   );
 }
 
@@ -199,10 +185,6 @@ async function getConfigSnapshot(
       ...(measure ? { measure } : {}),
     });
   }
-  // Tests often mutate config fixtures; caching can make those flaky.
-  if (process.env.VITEST === "true") {
-    return readConfigFileSnapshot(measure ? { measure } : undefined);
-  }
   if (!configSnapshotPromise) {
     const pendingSnapshot = readConfigFileSnapshot(measure ? { measure } : undefined);
     configSnapshotPromise = pendingSnapshot;
@@ -232,11 +214,24 @@ export async function ensureConfigReady(
   const commandPath = params.commandPath ?? [];
   const commandName = commandPath[0];
   const subcommandName = commandPath[1];
+  const existingStatePath = getExistingOpenClawStateSchemaPath();
+  const isManagedNodeRuntime =
+    existingStatePath !== undefined &&
+    ((commandName === "node" && subcommandName === "run") || commandName === "connect");
+  if (existingStatePath !== undefined) {
+    if (!isManagedNodeRuntime) {
+      throw new Error("The managed node runtime cannot run shared-state maintenance commands.");
+    }
+    if (!isExistingOpenClawStateSchema(resolveOpenClawStateSqlitePath())) {
+      throw new Error("The managed node runtime state directory changed after launcher admission.");
+    }
+  }
   const isRestartController =
     (commandName === "gateway" || commandName === "daemon") && subcommandName === "restart";
-  let preflightSnapshot: Awaited<ReturnType<typeof readConfigFileSnapshot>> | null = null;
+  let preflightResult: DoctorConfigPreflightResult | null = null;
   const shouldConsiderStateMigration =
     !params.validateConfigOnly &&
+    !isManagedNodeRuntime &&
     commandName !== "config" &&
     commandName !== "health" &&
     commandName !== "logs" &&
@@ -258,7 +253,21 @@ export async function ensureConfigReady(
         ...(params.measure ? { measure: params.measure } : {}),
         ...(commandName === "status" ? { observe: false } : {}),
         ...(shouldRequireStartupMigrationCheckpoint(commandPath)
-          ? { requireStartupMigrationCheckpoint: true }
+          ? {
+              requireStartupMigrationCheckpoint: true,
+              validateStartupConfig: async (snapshot) => {
+                const { getGatewayStartGuardErrors } =
+                  await import("../gateway-cli/pre-bootstrap.js");
+                const errors = getGatewayStartGuardErrors({
+                  allowUnconfigured: params.allowInvalid,
+                  configExists: snapshot.exists,
+                  mode: snapshot.config.gateway?.mode,
+                });
+                if (errors.length > 0) {
+                  throw new Error(errors.join("\n"));
+                }
+              },
+            }
           : { requireStateMigrationCheckpoint: true }),
         ...(params.beforeStateMigrations
           ? { beforeStateMigrations: params.beforeStateMigrations }
@@ -272,9 +281,14 @@ export async function ensureConfigReady(
       });
     try {
       return !params.suppressDoctorStdout
-        ? (await runDoctorConfigPreflight()).snapshot
-        : (await withSuppressedNotes(runDoctorConfigPreflight)).snapshot;
+        ? await runDoctorConfigPreflight()
+        : await withSuppressedNotes(runDoctorConfigPreflight);
     } catch (error) {
+      if (shouldRequireStartupMigrationCheckpoint(commandPath)) {
+        await (
+          await import("../gateway-cli/startup-maintenance.js")
+        ).handleGatewayStartupMaintenance(error);
+      }
       if (error instanceof ExitError) {
         // The migration owner has unwound its lease and heartbeat before this handoff.
         params.runtime.exit(error.code);
@@ -287,32 +301,32 @@ export async function ensureConfigReady(
     shouldConsiderStateMigration &&
     (!requiresLegacyStateInput || hasLegacyStateMigrationInputs())
   ) {
-    preflightSnapshot = await runStateMigrationPreflight();
+    preflightResult = await runStateMigrationPreflight();
   }
 
   // Read-only diagnostics must not record config health. Core-only validation
   // also skips plugin metadata discovery, whose state reads create SQLite sidecars.
-  const configSnapshotOptions = params.validateConfigOnly
-    ? ({ observe: false, pluginValidation: "core-only" } as const)
-    : commandName === "logs"
+  const configSnapshotOptions =
+    params.validateConfigOnly || commandName === "logs"
       ? ({ observe: false, pluginValidation: "core-only" } as const)
-      : commandName === "status" ||
+      : isManagedNodeRuntime ||
+          commandName === "status" ||
           (commandName === "gateway" && subcommandName === "call") ||
           isRestartController
         ? ({ observe: false } as const)
         : undefined;
   let snapshot =
-    preflightSnapshot ?? (await getConfigSnapshot(configSnapshotOptions, params.measure));
+    preflightResult?.snapshot ?? (await getConfigSnapshot(configSnapshotOptions, params.measure));
   if (
-    !preflightSnapshot &&
+    !preflightResult &&
     !didRunDoctorConfigFlow &&
     shouldConsiderStateMigration &&
     requiresLegacyStateInput &&
     snapshot.valid &&
     snapshotHasConfiguredSessionStore(snapshot)
   ) {
-    preflightSnapshot = await runStateMigrationPreflight();
-    snapshot = preflightSnapshot;
+    preflightResult = await runStateMigrationPreflight();
+    snapshot = preflightResult.snapshot;
   }
   const isBareGatewayForegroundRun =
     commandName === "gateway" && (subcommandName === undefined || subcommandName.trim() === "");
@@ -340,8 +354,15 @@ export async function ensureConfigReady(
   const invalid = snapshot.exists && !snapshot.valid;
   if (!invalid) {
     setRuntimeConfigSnapshot(snapshot.runtimeConfig ?? snapshot.config, snapshot.sourceConfig);
-  }
-  if (!invalid) {
+    if (
+      shouldRequireStartupMigrationCheckpoint(commandPath) &&
+      preflightResult?.pluginMetadataSnapshot
+    ) {
+      // Carry verified package facts into the final config reread without publishing Gateway policy.
+      adoptProcessPluginCache(
+        getPluginMetadataSnapshotCache(preflightResult.pluginMetadataSnapshot),
+      );
+    }
     return;
   }
 
@@ -376,16 +397,16 @@ export async function ensureConfigReady(
   }
   params.runtime.error("");
   const isPluginPackagingFailure = isPluginPackagingRuntimeOutputInvalidConfigSnapshot(snapshot);
-  const isNixManagedConfig = resolveIsNixMode();
+  const isReadOnlyConfig = resolveIsConfigReadOnly();
   const isGatewayStartup = isGatewayStartupCommand(commandPath);
   const mustBlockInvalid = !allowInvalid || (isGatewayStartup && params.allowInvalid !== true);
   const shouldOfferRecovery =
-    mustBlockInvalid && !params.suppressDoctorStdout && !isNixManagedConfig;
-  if (isPluginPackagingFailure || isNixManagedConfig || !shouldOfferRecovery) {
+    mustBlockInvalid && !params.suppressDoctorStdout && !isReadOnlyConfig && !isManagedNodeRuntime;
+  if (isPluginPackagingFailure || isReadOnlyConfig || !shouldOfferRecovery) {
     const fixHint = isPluginPackagingFailure
       ? formatPluginPackagingRuntimeOutputRecoveryHint()
-      : isNixManagedConfig
-        ? new (await import("../../config/nix-mode-write-guard.js")).NixModeConfigMutationError({
+      : isReadOnlyConfig
+        ? (await import("../../config/config-write-guard.js")).createConfigMutationError({
             configPath: snapshot.path,
           }).message
         : commandText(formatCliCommand("openclaw doctor --fix"));
@@ -399,6 +420,13 @@ export async function ensureConfigReady(
       "Audit, status, health, logs, tasks list/audit, and doctor commands still run with invalid config.",
     ),
   );
+  if (
+    mustBlockInvalid &&
+    (await import("../json-output-mode.js")).isJsonOutputModeActive(process.argv)
+  ) {
+    const { writeInvalidConfigCliJson } = await import("../config-validation-output.js");
+    writeInvalidConfigCliJson(params.runtime, snapshot);
+  }
   if (isPluginPackagingFailure && isGatewayStartup) {
     params.runtime.exit(78);
     return;

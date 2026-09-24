@@ -1,6 +1,34 @@
 import Foundation
 import OpenClawProtocol
 
+func gatewayErrorDetails(_ error: ErrorShape?) -> [String: OpenClawProtocol.AnyCodable] {
+    var details: [String: OpenClawProtocol.AnyCodable] = [:]
+    if let nested = error?.details?.value as? [String: OpenClawProtocol.AnyCodable] {
+        details.merge(nested) { _, nestedValue in nestedValue }
+    }
+    if let error {
+        if details["code"] == nil {
+            details["code"] = OpenClawProtocol.AnyCodable(error.code)
+        } else {
+            details["errorCode"] = OpenClawProtocol.AnyCodable(error.code)
+        }
+        details["message"] = OpenClawProtocol.AnyCodable(error.message)
+        if let retryable = error.retryable {
+            details["retryable"] = OpenClawProtocol.AnyCodable(retryable)
+        }
+        if let retryAfterMs = error.retryafterms {
+            details["retryAfterMs"] = OpenClawProtocol.AnyCodable(retryAfterMs)
+        }
+    }
+    return details
+}
+
+/// A route lease became stale before its request touched the channel. Unlike
+/// a socket cancellation, this proves the payload was never dispatched.
+public enum GatewayNodeSessionRequestError: Error, Sendable {
+    case routeChangedBeforeDispatch
+}
+
 public enum GatewayConnectAuthDetailCode: String, Sendable {
     case authRequired = "AUTH_REQUIRED"
     case authUnauthorized = "AUTH_UNAUTHORIZED"
@@ -18,6 +46,7 @@ public enum GatewayConnectAuthDetailCode: String, Sendable {
     case authTailscaleProxyMissing = "AUTH_TAILSCALE_PROXY_MISSING"
     case authTailscaleWhoisFailed = "AUTH_TAILSCALE_WHOIS_FAILED"
     case authTailscaleIdentityMismatch = "AUTH_TAILSCALE_IDENTITY_MISMATCH"
+    case authVerifiedUserRequired = "AUTH_VERIFIED_USER_REQUIRED"
     case pairingRequired = "PAIRING_REQUIRED"
     case protocolMismatch = "PROTOCOL_MISMATCH"
     case controlUiDeviceIdentityRequired = "CONTROL_UI_DEVICE_IDENTITY_REQUIRED"
@@ -173,6 +202,14 @@ public struct GatewayConnectAuthError: LocalizedError, Sendable {
         self.message
     }
 
+    public func isProtocolMismatch(supportedProtocols: ClosedRange<Int>) -> Bool {
+        // Published protocol-3 gateways only send INVALID_REQUEST + expectedProtocol.
+        // Compare the advertised role range: node clients still accept protocol 3.
+        self.detail == .protocolMismatch ||
+            (self.detailCode == "INVALID_REQUEST" &&
+                self.expectedProtocol.map { !supportedProtocols.contains($0) } == true)
+    }
+
     public var isNonRecoverable: Bool {
         switch self.detail {
         case .authTokenMissing,
@@ -183,6 +220,7 @@ public struct GatewayConnectAuthError: LocalizedError, Sendable {
              .authPasswordNotConfigured,
              .authRateLimited,
              .authScopeMismatch,
+             .authVerifiedUserRequired,
              .pairingRequired,
              .protocolMismatch,
              .controlUiDeviceIdentityRequired,

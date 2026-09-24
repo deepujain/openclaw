@@ -4,8 +4,10 @@ import { truncateUtf16Safe } from "@openclaw/normalization-core/utf16-slice";
 import { extractAssistantPhaseText } from "../shared/chat-message-content.js";
 import { stripEnvelope } from "./chat-sanitize.js";
 import { isSuppressedControlReplyText } from "./control-reply-text.js";
+import type { SessionPreviewItem } from "./session-utils.types.js";
 
-const SESSION_LAST_MESSAGE_PREVIEW_MAX_CHARS = 240;
+const SESSION_LAST_MESSAGE_PREVIEW_DEFAULT_CHARS = 240;
+const SESSION_DISPLAY_PROJECTION_MAX_CHARS = 800;
 
 type SessionDisplayProjection = {
   role: "user" | "assistant";
@@ -14,6 +16,7 @@ type SessionDisplayProjection = {
 
 type SessionDisplayProjectionOptions = {
   flattenMarkdown?: boolean;
+  view?: "display" | "model-context";
   maxChars?: number;
 };
 
@@ -39,13 +42,13 @@ function extractUserText(message: Record<string, unknown>): string | undefined {
   return typeof message.text === "string" ? message.text : undefined;
 }
 
-/** Projects one transcript row onto the bounded text shared by session-list consumers. */
+/** Projects text after model-context selection, or applies ordinary display visibility. */
 export function projectSessionDisplayMessage(
   message: unknown,
   options: SessionDisplayProjectionOptions = {},
 ): SessionDisplayProjection | null {
   const entry = readRecord(message);
-  if (!entry) {
+  if (!entry || (options.view !== "model-context" && entry.display === false)) {
     return null;
   }
   const role = typeof entry.role === "string" ? entry.role.toLowerCase() : "";
@@ -67,12 +70,32 @@ export function projectSessionDisplayMessage(
   if (!text) {
     return null;
   }
+  const requestedMaxChars = options.maxChars ?? SESSION_LAST_MESSAGE_PREVIEW_DEFAULT_CHARS;
   const limit = Math.min(
-    SESSION_LAST_MESSAGE_PREVIEW_MAX_CHARS,
-    Math.max(20, Math.floor(options.maxChars ?? SESSION_LAST_MESSAGE_PREVIEW_MAX_CHARS)),
+    SESSION_DISPLAY_PROJECTION_MAX_CHARS,
+    Math.max(20, Math.floor(requestedMaxChars)),
   );
   return {
     role,
     text: text.length <= limit ? text : `${truncateUtf16Safe(text, limit - 3)}...`,
   };
+}
+
+export function buildSessionPreviewItems(
+  messages: readonly unknown[],
+  maxItems: number,
+  maxChars: number,
+  view: "display" | "model-context" = "display",
+): SessionPreviewItem[] {
+  const items: SessionPreviewItem[] = [];
+  // Rejected rows do not consume the limit; older text cannot affect a full preview.
+  for (let index = messages.length - 1; index >= 0 && items.length < maxItems; index -= 1) {
+    const projected = projectSessionDisplayMessage(messages[index], { maxChars, view });
+    if (!projected) {
+      continue;
+    }
+    items.push(projected);
+  }
+
+  return items.toReversed();
 }

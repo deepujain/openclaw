@@ -10,6 +10,7 @@ import {
   patchSessionEntryCore as patchInternalSessionEntry,
   replaceSessionEntry as replaceInternalSessionEntry,
 } from "../config/sessions/session-accessor.js";
+import { observeSessionMaintenanceCompletion } from "../config/sessions/session-accessor.sqlite-maintenance.test-support.js";
 import type * as ConfigSessionTypes from "../config/sessions/types.js";
 import {
   cleanupSessionLifecycleArtifacts,
@@ -56,11 +57,10 @@ describe("session-store-runtime compatibility surface", () => {
   });
 
   async function seedSessionEntry(sessionKey: string, entry: SessionEntry): Promise<void> {
-    await upsertSessionEntry({
-      agentId: "main",
-      sessionKey,
-      storePath,
-      entry,
+    await patchInternalSessionEntry({ agentId: "main", sessionKey, storePath }, () => entry, {
+      fallbackEntry: entry,
+      replaceEntry: true,
+      skipMaintenance: true,
     });
   }
 
@@ -816,25 +816,21 @@ describe("session-store-runtime compatibility surface", () => {
   });
 
   it.each([
-    { pruneAfterMs: 7 * DAY_MS, staleSessionPresent: false },
-    { pruneAfterMs: 0, staleSessionPresent: true },
-    { pruneAfterMs: -DAY_MS, staleSessionPresent: true },
+    { pruneAfterMs: 7 * DAY_MS, archivedAt: expect.any(Number) },
+    { pruneAfterMs: 0, archivedAt: undefined },
+    { pruneAfterMs: -DAY_MS, archivedAt: undefined },
   ])(
     "applies age retention $pruneAfterMs through entry patches",
-    async ({ pruneAfterMs, staleSessionPresent }) => {
+    async ({ pruneAfterMs, archivedAt }) => {
       const staleSessionKey = "agent:main:stale";
       const activeSessionKey = "agent:main:active";
       const now = Date.now();
-      await seedSessionEntry(staleSessionKey, {
-        sessionId: "session-stale",
-        updatedAt: now - 8 * DAY_MS,
-      });
-      await seedSessionEntry(activeSessionKey, {
-        sessionId: "session-active",
-        updatedAt: now,
-      });
+      const staleEntry = { sessionId: "session-stale", updatedAt: now - 8 * DAY_MS };
+      await seedSessionEntry(staleSessionKey, staleEntry);
+      await seedSessionEntry(activeSessionKey, { sessionId: "session-active", updatedAt: now });
       assignOwner(staleSessionKey);
 
+      const done = observeSessionMaintenanceCompletion(path.join(tempDir, "openclaw-agent.sqlite"));
       await patchSessionEntry({
         sessionKey: activeSessionKey,
         storePath,
@@ -850,9 +846,13 @@ describe("session-store-runtime compatibility surface", () => {
         update: () => ({ model: "gpt-5.5" }),
       });
 
-      expect(getSessionEntry({ sessionKey: staleSessionKey, storePath }) != null).toBe(
-        staleSessionPresent,
-      );
+      await done;
+      const retainedEntry = getSessionEntry({ sessionKey: staleSessionKey, storePath });
+      expect(retainedEntry?.archivedAt).toEqual(archivedAt);
+      expect(retainedEntry).toMatchObject(staleEntry);
+      const activeEntry = getSessionEntry({ sessionKey: activeSessionKey, storePath });
+      expect(activeEntry).toMatchObject({ sessionId: "session-active", model: "gpt-5.5" });
+      expect(activeEntry?.archivedAt).toBeUndefined();
     },
   );
 

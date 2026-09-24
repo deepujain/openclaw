@@ -2,7 +2,7 @@ import { accessSync, constants, statSync } from "node:fs";
 import path from "node:path";
 import process from "node:process";
 import { resolveAcpSessionAvailability } from "openclaw/plugin-sdk/acp-runtime";
-import { resolveSessionAgentIds } from "openclaw/plugin-sdk/agent-runtime";
+import { resolveSessionAgentIdsStrict } from "openclaw/plugin-sdk/agent-scope-runtime";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import { resolveNodeHostExecutable } from "openclaw/plugin-sdk/node-host";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/plugin-entry";
@@ -169,7 +169,7 @@ async function createAdoptedOpenCodeSession(params: {
     key: sessionCatalogAdoptedSessionKey(OPENCODE_ADOPTED_SESSION_KEY_PREFIX, params.threadId),
     agentId: params.agentId,
     recoverMatchingInitialEntry: true,
-    ...(params.session.name ? { label: params.session.name } : {}),
+    ...(params.session.name ? { displayName: params.session.name } : {}),
     ...(params.session.cwd ? { spawnedCwd: params.session.cwd } : {}),
     initialEntry: {
       acpBackendId: ACPX_BACKEND_ID,
@@ -211,6 +211,7 @@ function createOpenCodeNodeHostBindings(api: OpenClawPluginApi) {
     terminalCommand: OPENCODE_TERMINAL_RESUME_COMMAND,
     sessionIdPattern: SESSION_ID_PATTERN,
     executable: "opencode",
+    hasActiveWork: () => false,
     args: (threadId) => ["--session", threadId],
     listAvailable: available,
     terminalAvailable: available,
@@ -302,7 +303,7 @@ export function registerOpenCodeSessionCatalog(api: OpenClawPluginApi): void {
       },
       continuation: {
         resolveAgentId: (agentId) =>
-          resolveSessionAgentIds({ config: api.config, agentId }).sessionAgentId,
+          resolveSessionAgentIdsStrict({ config: api.config, agentId }).sessionAgentId,
         availability: () =>
           resolveAcpSessionAvailability({
             config: currentOpenCodeCatalogConfig(api),
@@ -320,6 +321,7 @@ export function registerOpenCodeSessionCatalog(api: OpenClawPluginApi): void {
       },
       terminal: {
         executable: "opencode",
+        uploadPathStyle: "native",
         args: (threadId) => ["--session", threadId],
         title: (threadId) => `opencode --session ${threadId.slice(0, 12)}…`,
         requireLocalSession: requireLocalOpenCodeSession,

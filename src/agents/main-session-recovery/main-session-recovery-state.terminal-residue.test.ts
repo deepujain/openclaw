@@ -8,6 +8,7 @@ import type {
 } from "../../config/sessions.js";
 import { loadSessionEntry, replaceSessionEntry } from "../../config/sessions/session-accessor.js";
 import type { GatewayRecoveryRuntime } from "../../gateway/server-instance-runtime.types.js";
+import { cleanupSessionStateForTest } from "../../test-utils/session-state-cleanup.js";
 import { transitionMainSessionRecovery } from "./main-session-recovery-state.js";
 import { markStartupOrphanedMainSessionsForRecovery } from "./main-session-restart-recovery-marking.js";
 import { recoverStore } from "./main-session-restart-recovery-store.js";
@@ -19,6 +20,9 @@ import { recoverStore } from "./main-session-restart-recovery-store.js";
 
 const sessionKey = "agent:main:main";
 const unusedGatewayRuntime: GatewayRecoveryRuntime = {
+  dispatchSessionMethod: async () => {
+    throw new Error("terminal residue must not dispatch session methods");
+  },
   dispatchAgent: async () => {
     throw new Error("terminal residue must not dispatch");
   },
@@ -135,15 +139,16 @@ describe("main session recovery terminal-only residue", () => {
           activeSessionIds: [],
           activeSessionKeys: [],
           gatewayRuntime: unusedGatewayRuntime,
-          resumedSessionKeys: new Set(),
+          handledSessionKeys: new Set(),
           storePath,
         }),
-      ).resolves.toEqual({ recovered: 0, failed: 0, skipped: 1 });
+      ).resolves.toEqual({ started: 0, settled: 0, failed: 0, skipped: 1 });
 
       const entry = loadSessionEntry({ readConsistency: "latest", sessionKey, storePath });
       expect(entry?.mainRestartRecovery).toBeUndefined();
       expect(entry?.restartRecoveryRuns).toBeUndefined();
     } finally {
+      await cleanupSessionStateForTest({ stateDir: tempDir });
       await fs.rm(tempDir, { force: true, recursive: true });
     }
   });
@@ -196,6 +201,7 @@ describe("main session recovery terminal-only residue", () => {
         restartRecoveryRuns: [{ runId: "live-run" }],
       });
     } finally {
+      await cleanupSessionStateForTest({ stateDir: tempDir });
       await fs.rm(tempDir, { force: true, recursive: true });
     }
   });

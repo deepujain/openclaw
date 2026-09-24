@@ -21,12 +21,16 @@ function createSlackFileActionSchema(): Record<string, TSchema> {
   };
 }
 
-function createSlackReactionEmojiSchema(): Record<string, TSchema> {
+function createSlackReactionEmojiSchema(emojiListAvailable: boolean): Record<string, TSchema> {
+  const discoveryHint = emojiListAvailable
+    ? ' Discover workspace custom emoji with action:"emoji-list".'
+    : "";
   return {
     emoji: Type.Optional(
       Type.String({
         description:
-          'Slack emoji shortcode name (for example "white_check_mark" or "+1") or common emoji character (for example "✅"). Colons are optional around shortcodes.',
+          'Slack standard or workspace custom emoji shortcode (for example "white_check_mark" or "+1") or common emoji character (for example "✅"). Colons are optional.' +
+          discoveryHint,
       }),
     ),
   };
@@ -91,6 +95,23 @@ export function describeSlackMessageTool({
   const actions = listSlackMessageActions(cfg, accountId);
   const capabilities = new Set<"presentation">();
   const schema: ChannelMessageToolSchemaContribution[] = [];
+  if (actions.includes("conversation-open")) {
+    schema.push({
+      actions: ["conversation-open"],
+      visibility: "all-configured",
+      properties: {
+        userIds: Type.Optional(
+          Type.Array(Type.String({ pattern: "^[UW][A-Z0-9]+$" }), {
+            minItems: 1,
+            maxItems: 8,
+            uniqueItems: true,
+            description:
+              'Slack conversation-open: 1-8 other member IDs. One opens a DM; multiple open or reuse a group DM. Exclude the calling account. Use the returned target with action="send". teamId defaults to the trusted current workspace for the selected account; detached Enterprise operations require it.',
+          }),
+        ),
+      },
+    });
+  }
   if (actions.includes("send")) {
     capabilities.add("presentation");
   }
@@ -114,7 +135,7 @@ export function describeSlackMessageTool({
   }
   if (actions.includes("react")) {
     schema.push({
-      properties: createSlackReactionEmojiSchema(),
+      properties: createSlackReactionEmojiSchema(actions.includes("emoji-list")),
       actions: ["react", "reactions"],
     });
   }

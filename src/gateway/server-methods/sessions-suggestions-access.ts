@@ -3,10 +3,12 @@ import {
   errorShape,
   type SessionSuggestionEvent,
 } from "../../../packages/gateway-protocol/src/index.js";
+import { hasOperatorBoundary } from "../operator-role-policy.js";
 import { resolveRequestedSessionAgentId } from "../session-request-agent.js";
 import {
   authorizeIncognitoSessionTarget,
   authorizeSessionSharingTarget,
+  createSessionListEntryFilter,
   resolveSessionSharingRole,
   resolveSessionSharingTarget,
   resolveSessionVisibility,
@@ -14,12 +16,14 @@ import {
 import type { GatewayClient, GatewayRequestContext, RespondFn } from "./types.js";
 
 export function requireSuggestionTarget(params: {
+  client: GatewayClient | null;
   context: GatewayRequestContext;
   sessionKey: string;
   agentId?: string;
   respond: RespondFn;
 }) {
   const cfg = params.context.getRuntimeConfig();
+  const policyConfig = params.context.getCommittedRuntimeConfig?.() ?? cfg;
   const requestedAgent = resolveRequestedSessionAgentId(cfg, params.sessionKey, params.agentId);
   if (!requestedAgent.ok) {
     params.respond(false, undefined, requestedAgent.error);
@@ -30,7 +34,14 @@ export function requireSuggestionTarget(params: {
     sessionKey: params.sessionKey,
     agentId: requestedAgent.agentId,
   });
-  if (!target) {
+  if (
+    !target ||
+    (hasOperatorBoundary(params.client, policyConfig) &&
+      createSessionListEntryFilter({ client: params.client, cfg: policyConfig })?.(
+        target.storeKey,
+        target.entry,
+      ) === false)
+  ) {
     params.respond(
       false,
       undefined,
@@ -42,12 +53,17 @@ export function requireSuggestionTarget(params: {
 }
 
 export function requireVisibleSuggestionRole(params: {
+  cfg: ReturnType<GatewayRequestContext["getRuntimeConfig"]>;
   client: GatewayClient | null;
   sessionKey: string;
   target: NonNullable<ReturnType<typeof resolveSessionSharingTarget>>;
   respond: RespondFn;
 }) {
-  const role = resolveSessionSharingRole({ client: params.client, target: params.target });
+  const role = resolveSessionSharingRole({
+    client: params.client,
+    cfg: params.cfg,
+    target: params.target,
+  });
   const incognitoError = authorizeIncognitoSessionTarget({
     client: params.client,
     sessionKey: params.sessionKey,
@@ -60,7 +76,11 @@ export function requireVisibleSuggestionRole(params: {
   if (resolveSessionVisibility(params.target.entry) !== "draft") {
     return role;
   }
-  const error = authorizeSessionSharingTarget({ client: params.client, target: params.target });
+  const error = authorizeSessionSharingTarget({
+    client: params.client,
+    cfg: params.cfg,
+    target: params.target,
+  });
   if (!error) {
     return role;
   }

@@ -7,23 +7,25 @@ import { colorize, isRich, theme } from "../../../packages/terminal-core/src/the
 import type { HealthSummary } from "../../commands/health.js";
 import { formatErrorMessage } from "../../infra/errors.js";
 import type { CostUsageSummary } from "../../infra/session-cost-usage.js";
-import type {
-  DiagnosticStabilityBundle,
-  ReadDiagnosticStabilityBundleResult,
-} from "../../logging/diagnostic-stability-bundle.js";
+import type { DiagnosticStabilityBundle } from "../../logging/diagnostic-stability-bundle.js";
 import type {
   DiagnosticStabilityEventRecord,
   DiagnosticStabilitySnapshot,
 } from "../../logging/diagnostic-stability.js";
 import type { WriteDiagnosticSupportExportResult } from "../../logging/diagnostic-support-export.js";
 import { defaultRuntime } from "../../runtime.js";
-import { createLazyImportLoader } from "../../shared/lazy-promise.js";
+import { createLazyPromise } from "../../shared/lazy-promise.js";
 import { inheritOptionFromParent } from "../command-options.js";
 import { addGatewayServiceCommands } from "../daemon-cli/register-service-commands.js";
-import { rethrowExpectedCliError } from "../failure-output.js";
-import { parseGatewayPortOption } from "../gateway-port-option.js";
-import { addGatewayClientOptions, callGatewayFromCliWithTransport } from "../gateway-rpc.js";
+import { formatCliJsonFailure, rethrowExpectedCliError } from "../failure-output.js";
+import {
+  addGatewayClientOptions,
+  callGatewayFromCliWithTransport,
+  resolveGatewayRpcOptions,
+  resolveGatewayRpcOptionsWithLocalPort,
+} from "../gateway-rpc.js";
 import { formatHelpExamples } from "../help-format.js";
+import { parseTimeoutMsWithFallback } from "../parse-timeout.js";
 import { setCommandJsonMode } from "../program/json-mode.js";
 import type { GatewayDiscoverOpts } from "./discover.js";
 import { isGatewayMachineOutput } from "./output-mode.js";
@@ -33,28 +35,26 @@ import { runGatewayResume, runGatewaySuspend } from "./suspend-cli.js";
 
 type GatewayRpcOpts = Parameters<typeof callGatewayFromCliWithTransport>[1];
 
-const configModuleLoader = createLazyImportLoader(
+const loadConfigModule = createLazyPromise(
   () => import("../../config/read-best-effort-config.runtime.js"),
 );
-const gatewayStatusModuleLoader = createLazyImportLoader(
-  () => import("../../commands/gateway-status.js"),
-);
-const gatewayHealthModuleLoader = createLazyImportLoader(() => import("../../commands/health.js"));
-const bonjourDiscoveryModuleLoader = createLazyImportLoader(
+const loadGatewayStatusModule = createLazyPromise(() => import("../../commands/gateway-status.js"));
+const loadGatewayHealthModule = createLazyPromise(() => import("../../commands/health.js"));
+const loadBonjourDiscoveryModule = createLazyPromise(
   () => import("../../infra/bonjour-discovery.js"),
 );
-const wideAreaDnsModuleLoader = createLazyImportLoader(() => import("../../infra/widearea-dns.js"));
-const healthStyleModuleLoader = createLazyImportLoader(
+const loadWideAreaDnsModule = createLazyPromise(() => import("../../infra/widearea-dns.js"));
+const loadHealthStyleModule = createLazyPromise(
   () => import("../../../packages/terminal-core/src/health-style.js"),
 );
-const usageFormatModuleLoader = createLazyImportLoader(() => import("../../utils/usage-format.js"));
-const stabilityBundleModuleLoader = createLazyImportLoader(
+const loadUsageFormatModule = createLazyPromise(() => import("../../utils/usage-format.js"));
+const loadStabilityBundleModule = createLazyPromise(
   () => import("../../logging/diagnostic-stability-bundle.js"),
 );
-const supportExportModuleLoader = createLazyImportLoader(
+const loadSupportExportModule = createLazyPromise(
   () => import("../../logging/diagnostic-support-export.js"),
 );
-const daemonStatusGatherModuleLoader = createLazyImportLoader(
+const loadDaemonStatusGatherModule = createLazyPromise(
   () => import("../daemon-cli/status.gather.js"),
 );
 
@@ -64,46 +64,6 @@ type GatewayCliDependencies = {
   loadGatewayHealthModule?: typeof loadGatewayHealthModule;
   loadHealthStyleModule?: typeof loadHealthStyleModule;
 };
-
-function loadConfigModule() {
-  return configModuleLoader.load();
-}
-
-function loadGatewayStatusModule() {
-  return gatewayStatusModuleLoader.load();
-}
-
-function loadGatewayHealthModule() {
-  return gatewayHealthModuleLoader.load();
-}
-
-function loadBonjourDiscoveryModule() {
-  return bonjourDiscoveryModuleLoader.load();
-}
-
-function loadWideAreaDnsModule() {
-  return wideAreaDnsModuleLoader.load();
-}
-
-function loadHealthStyleModule() {
-  return healthStyleModuleLoader.load();
-}
-
-function loadUsageFormatModule() {
-  return usageFormatModuleLoader.load();
-}
-
-function loadStabilityBundleModule() {
-  return stabilityBundleModuleLoader.load();
-}
-
-function loadSupportExportModule() {
-  return supportExportModuleLoader.load();
-}
-
-function loadDaemonStatusGatherModule() {
-  return daemonStatusGatherModuleLoader.load();
-}
 
 function gatewayCallOpts(cmd: Command, defaultTimeoutMs = DEFAULT_GATEWAY_RPC_TIMEOUT_MS): Command {
   return addGatewayClientOptions(cmd, { timeoutMs: defaultTimeoutMs }).option(
@@ -146,15 +106,14 @@ async function runGatewayCommand(
         formatGatewayClientRequestErrorJson,
         formatGatewayTransportErrorJson,
       } = await import("../../gateway/call.js");
-      const payload =
+      defaultRuntime.writeJson(
         formatGatewayAuthErrorJson(err) ??
-        formatGatewayClientRequestErrorJson(err) ??
-        formatGatewayTransportErrorJson(err);
-      if (payload) {
-        defaultRuntime.writeJson(payload);
-        defaultRuntime.exit(1);
-        return;
-      }
+          formatGatewayClientRequestErrorJson(err) ??
+          formatGatewayTransportErrorJson(err) ??
+          formatCliJsonFailure(err),
+      );
+      defaultRuntime.exit(1);
+      return;
     }
     const message = formatErrorMessage(err);
     defaultRuntime.error(label ? `${label}: ${message}` : message);
@@ -166,57 +125,17 @@ function parseDaysOption(raw: unknown, fallback = 30): number {
   if (typeof raw === "number" && Number.isFinite(raw)) {
     return Math.max(1, Math.floor(raw));
   }
-  if (typeof raw === "string" && raw.trim() !== "") {
+  if (typeof raw === "string") {
     const parsed = parseStrictPositiveInteger(raw);
     if (parsed !== undefined) {
       return parsed;
     }
+    // A present-but-unparseable value (including an explicit empty one) is
+    // operator error; the main RPC path rejects malformed --timeout the same
+    // way instead of silently defaulting.
+    throw new Error(`Invalid --days. Use a positive integer, e.g. --days 30. Received: "${raw}".`);
   }
   return fallback;
-}
-
-function parseGatewayRpcTimeoutOption(raw: unknown, fallback = 10_000): number {
-  if (typeof raw === "number" && Number.isFinite(raw) && raw > 0) {
-    return Math.floor(raw);
-  }
-  if (typeof raw === "string" && raw.trim() !== "") {
-    const parsed = parseStrictPositiveInteger(raw);
-    if (parsed !== undefined) {
-      return parsed;
-    }
-  }
-  return fallback;
-}
-
-function resolveGatewayRpcOptions<T extends { token?: string; password?: string }>(
-  opts: T,
-  command?: Command,
-): T {
-  const parentToken = inheritOptionFromParent<string>(command, "token");
-  const parentPassword = inheritOptionFromParent<string>(command, "password");
-  return {
-    ...opts,
-    token: opts.token ?? parentToken,
-    password: opts.password ?? parentPassword,
-  };
-}
-
-function resolveGatewayRpcOptionsWithLocalPort(
-  opts: GatewayRpcOpts & { port?: unknown },
-  command?: Command,
-): GatewayRpcOpts {
-  const rpcOpts = resolveGatewayRpcOptions(opts, command);
-  const port = parseGatewayPortOption(opts.port ?? inheritOptionFromParent(command, "port"));
-  if (port === undefined) {
-    return rpcOpts;
-  }
-  if (typeof opts.url === "string" && opts.url.trim()) {
-    throw new Error("Use either --url or --port, not both.");
-  }
-  return {
-    ...rpcOpts,
-    localPortOverride: port,
-  };
 }
 
 async function renderCostUsageSummaryAsync(
@@ -225,12 +144,13 @@ async function renderCostUsageSummaryAsync(
   rich: boolean,
 ): Promise<string[]> {
   const { formatMissingCostEntries } = await import("../../infra/session-cost-usage-totals.js");
-  const { formatTokenCount, formatUsd } = await loadUsageFormatModule();
+  const { formatCostUsageCachePrefix, formatTokenCount, formatUsd } = await loadUsageFormatModule();
   const totalCost = formatUsd(summary.totals.totalCost) ?? "$0.00";
   const totalTokens = formatTokenCount(summary.totals.totalTokens) ?? "0";
+  const cachePrefix = formatCostUsageCachePrefix(summary.cacheStatus);
   const lines = [
     colorize(rich, theme.heading, `Usage cost (${days} days)`),
-    `${colorize(rich, theme.muted, "Total:")} ${totalCost} · ${totalTokens} tokens`,
+    `${cachePrefix}${colorize(rich, theme.muted, "Total:")} ${totalCost} · ${totalTokens} tokens`,
   ];
 
   if (summary.totals.missingCostEntries > 0) {
@@ -355,26 +275,6 @@ function normalizeStabilityBundleTarget(raw: unknown): string | null {
   return value === "" ? "latest" : value;
 }
 
-function formatBundleError(result: ReadDiagnosticStabilityBundleResult): string {
-  if (result.status === "missing") {
-    return `No stability bundles found in ${result.dir}`;
-  }
-  if (result.status === "failed") {
-    return result.error instanceof Error ? result.error.message : String(result.error);
-  }
-  return "Unexpected stability bundle read result";
-}
-
-async function readStabilityBundleTarget(
-  bundleTarget: string,
-): Promise<ReadDiagnosticStabilityBundleResult> {
-  const { readDiagnosticStabilityBundleFileSync, readLatestDiagnosticStabilityBundleSync } =
-    await loadStabilityBundleModule();
-  return bundleTarget === "latest"
-    ? readLatestDiagnosticStabilityBundleSync()
-    : readDiagnosticStabilityBundleFileSync(bundleTarget);
-}
-
 function renderStabilityBundleSummary(params: {
   bundle: DiagnosticStabilityBundle;
   path: string;
@@ -471,7 +371,7 @@ function resolveSupportExportRpcOptions(
 }
 
 function parseOptionalPositiveIntegerOption(raw: unknown, label: string): number | undefined {
-  if (raw === undefined || raw === null || raw === "") {
+  if (raw === undefined) {
     return undefined;
   }
   const parsed = parseStrictPositiveInteger(raw);
@@ -567,6 +467,10 @@ export function registerGatewayCli(program: Command, deps: GatewayCliDependencie
       .command("call")
       .description("Call a Gateway method")
       .argument("<method>", "Method name (health/status/system-presence/cron.*)")
+      .option(
+        "--expect-url <url>",
+        "Fail if the resolved Gateway URL differs; preserves configured authentication",
+      )
       .option("--params <json>", "JSON object string for params", "{}")
       .action(async (method, opts, command) => {
         await runGatewayCommand(
@@ -700,7 +604,9 @@ export function registerGatewayCli(program: Command, deps: GatewayCliDependencie
                 error,
                 config: rpcOpts.config ?? (await readNonObservingHealthConfig()),
                 runtime: defaultRuntime,
-                timeoutMs: parseGatewayRpcTimeoutOption(rpcOpts.timeout),
+                timeoutMs: parseTimeoutMsWithFallback(rpcOpts.timeout, 10_000, {
+                  invalidType: "error",
+                }),
                 token: rpcOpts.token,
                 password: rpcOpts.password,
                 localPortOverride: rpcOpts.localPortOverride,
@@ -777,9 +683,21 @@ export function registerGatewayCli(program: Command, deps: GatewayCliDependencie
               return;
             }
             if (bundleTarget) {
-              const result = await readStabilityBundleTarget(bundleTarget);
-              if (result.status !== "found") {
-                throw new Error(formatBundleError(result));
+              const {
+                readDiagnosticStabilityBundleFileSync,
+                readLatestDiagnosticStabilityBundleSync,
+              } = await loadStabilityBundleModule();
+              const result =
+                bundleTarget === "latest"
+                  ? readLatestDiagnosticStabilityBundleSync()
+                  : readDiagnosticStabilityBundleFileSync(bundleTarget);
+              if (result.status === "missing") {
+                throw new Error(`No stability bundles found in ${result.dir}`);
+              }
+              if (result.status === "failed") {
+                throw new Error(
+                  result.error instanceof Error ? result.error.message : String(result.error),
+                );
               }
               const snapshot = selectDiagnosticStabilitySnapshot(result.bundle.snapshot, query);
               if (rpcOpts.json) {
@@ -907,15 +825,9 @@ export function registerGatewayCli(program: Command, deps: GatewayCliDependencie
         async () => {
           const [
             { readSourceConfigBestEffort },
-            { discoverGatewayBeacons },
+            { discoverGatewayBeacons, resolveGatewayDiscoveryEndpoint },
             { resolveWideAreaDiscoveryDomain },
-            {
-              dedupeBeacons,
-              parseDiscoverTimeoutMs,
-              pickBeaconHost,
-              pickGatewayPort,
-              renderBeaconLines,
-            },
+            { dedupeBeacons, renderBeaconLines },
             { withProgress },
           ] = await Promise.all([
             loadConfigModule(),
@@ -928,7 +840,9 @@ export function registerGatewayCli(program: Command, deps: GatewayCliDependencie
           const wideAreaDomain = resolveWideAreaDiscoveryDomain({
             configDomain: cfg.discovery?.wideArea?.domain,
           });
-          const timeoutMs = parseDiscoverTimeoutMs(opts.timeout, 2000);
+          const timeoutMs = parseTimeoutMsWithFallback(opts.timeout, 2000, {
+            invalidType: "error",
+          });
           const domains = ["local.", ...(wideAreaDomain ? [wideAreaDomain] : [])];
           const beacons = await withProgress(
             {
@@ -945,12 +859,10 @@ export function registerGatewayCli(program: Command, deps: GatewayCliDependencie
           );
 
           if (opts.json) {
-            const enriched = deduped.map((b) => {
-              const host = pickBeaconHost(b);
-              const port = pickGatewayPort(b);
-              const scheme = b.gatewayTls === true ? "wss" : "ws";
-              return { ...b, wsUrl: host ? `${scheme}://${host}:${port}` : null };
-            });
+            const enriched = deduped.map((beacon) => ({
+              ...beacon,
+              wsUrl: resolveGatewayDiscoveryEndpoint(beacon)?.wsUrl ?? null,
+            }));
             defaultRuntime.writeJson({
               timeoutMs,
               domains,

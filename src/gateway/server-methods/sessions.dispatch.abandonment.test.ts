@@ -1,4 +1,5 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
+import { sessionChanges } from "../../sessions/session-row-changes.js";
 import { createWorkerPlacementMoveService } from "../worker-environments/placement-move-service.js";
 import type { WorkerSessionPlacementRecord } from "../worker-environments/placement-store.js";
 import {
@@ -63,29 +64,21 @@ describe("sessions.move abandonment", () => {
     void remoteSettlement.then(() => {
       remoteSettlementObserved = true;
     });
+    const intent = {
+      operationId: "move:v1:rpc-abandon",
+      sessionId,
+      source,
+      target: { kind: "gateway" as const },
+      abandonSource: true,
+      lastError: null,
+      createdAtMs: 1,
+      updatedAtMs: 1,
+    };
     const moves = createWorkerPlacementMoveService({
       placements: {
-        preparePlacementMove: async (_request: unknown, prepareNew: () => Promise<void>) => {
-          if (!joined) {
-            await prepareNew();
-          }
-          return {
-            intent: {
-              operationId: "move:v1:rpc-abandon",
-              sessionId,
-              source,
-              target: { kind: "gateway" },
-              abandonSource: true,
-              lastError: null,
-              createdAtMs: 1,
-              updatedAtMs: 1,
-            },
-            placement: draining,
-            joined,
-          };
-        },
+        beginPlacementMove: () => ({ intent, placement: draining, joined }),
         get: () => existing,
-        getPlacementMove: () => undefined,
+        getPlacementMove: () => (joined ? intent : undefined),
         recordPlacementMoveError,
       } as never,
       environments: { get: () => undefined },
@@ -103,16 +96,29 @@ describe("sessions.move abandonment", () => {
       resolveDestination: vi.fn(),
     });
 
-    const respond = await invokeSessionMove(
-      makeDispatchTestContext({
-        getSessionEventSubscriberConnIds: () => new Set(),
-        workerPlacementDispatchService: { dispatch: vi.fn(), move: moves.move } as never,
-        workerSessionPlacementService: {
-          getMany: () => new Map([[sessionId, existing]]),
-        },
+    const context = makeDispatchTestContext({
+      getSessionEventSubscriberConnIds: () => {
+        throw new Error("session subscribers unavailable");
+      },
+      workerPlacementDispatchService: { dispatch: vi.fn(), move: moves.move } as never,
+      workerSessionPlacementService: {
+        getMany: () => new Map([[sessionId, existing]]),
+      },
+    });
+    const changes = vi.fn();
+    onTestFinished(
+      sessionChanges.subscribe((change) => {
+        // Placement ownership also publishes qualified changes; these are the broadcaster receipts.
+        if ("sessionKey" in change && change.agentId === undefined) {
+          changes(change);
+        }
       }),
-      { expected: source, target: { kind: "gateway" }, abandonSource: true },
     );
+    const respond = await invokeSessionMove(context, {
+      expected: source,
+      target: { kind: "gateway" },
+      abandonSource: true,
+    });
 
     expect(respond).toHaveBeenCalledWith(
       true,
@@ -125,6 +131,7 @@ describe("sessions.move abandonment", () => {
       undefined,
     );
     expect(validateAbandonSource).toHaveBeenCalledTimes(joined ? 0 : 1);
+    expect(changes.mock.calls).toEqual([[{ sessionKey }], [{ sessionKey }]]);
     expect(recordPlacementMoveError).not.toHaveBeenCalled();
     expect(remoteSettlementObserved).toBe(false);
   });

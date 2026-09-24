@@ -1,4 +1,3 @@
-// Whatsapp plugin module implements process message behavior.
 import {
   logAckFailure,
   removeAckReactionHandleAfterReply,
@@ -6,6 +5,7 @@ import {
 } from "openclaw/plugin-sdk/channel-feedback";
 import {
   type buildChannelInboundEventContext,
+  type ChannelInboundTurnPlan,
   formatMediaPlaceholderText,
   runChannelInboundEvent,
 } from "openclaw/plugin-sdk/channel-inbound";
@@ -19,6 +19,7 @@ import {
   toPluginMessageReceivedEvent,
   triggerInternalHook,
 } from "openclaw/plugin-sdk/hook-runtime";
+import { formatAudioTranscriptForAgent } from "openclaw/plugin-sdk/media-understanding-runtime";
 import { getGlobalHookRunner } from "openclaw/plugin-sdk/plugin-runtime";
 import { resolveBatchedReplyThreadingPolicy } from "openclaw/plugin-sdk/reply-reference";
 import { getPrimaryIdentityId, getSelfIdentity, getSenderIdentity } from "../../identity.js";
@@ -39,7 +40,6 @@ import { deliverWebReply } from "../deliver-reply.js";
 import { whatsappInboundLog } from "../loggers.js";
 import { elide } from "../util.js";
 import { maybeSendAckReaction } from "./ack-reaction.js";
-import { formatWhatsAppAudioTranscriptForAgent } from "./audio-transcript.js";
 import {
   resolveVisibleWhatsAppGroupHistory,
   resolveVisibleWhatsAppReplyContext,
@@ -83,6 +83,22 @@ const WHATSAPP_MESSAGE_RECEIVED_HOOK_LIMITS = {
   maxQueue: 128,
   timeoutMs: 2_000,
 };
+
+function mapWhatsAppIngressToTurnAdmission(
+  ingress: ReturnType<typeof requireWhatsAppInboundAdmission>["ingress"],
+) {
+  const reason = ingress.reasonCode;
+  if (ingress.admission === "dispatch") {
+    return { kind: "dispatch" as const, reason };
+  }
+  if (ingress.admission === "observe") {
+    return { kind: "observeOnly" as const, reason };
+  }
+  if (ingress.admission === "skip") {
+    return { kind: "handled" as const, reason };
+  }
+  return { kind: "drop" as const, reason, recordHistory: false };
+}
 
 type WhatsAppMessageReceivedHookConfig = {
   pluginHooks?: {
@@ -214,6 +230,7 @@ export async function processMessage(params: {
    * - undefined (omitted) → caller did not attempt preflight; run internal STT as normal */
   preflightAudioTranscript?: string | null;
   buildContext?: typeof buildChannelInboundEventContext;
+  dispatchReplyFromConfig?: NonNullable<ChannelInboundTurnPlan["dispatchReplyFromConfig"]>;
 }) {
   const admission = requireWhatsAppInboundAdmission(params.msg);
   if (admission.ingress.admission !== "dispatch" && admission.ingress.admission !== "observe") {
@@ -299,7 +316,7 @@ export async function processMessage(params: {
           ...params.msg,
           payload: {
             ...params.msg.payload,
-            body: formatWhatsAppAudioTranscriptForAgent(audioTranscript),
+            body: formatAudioTranscriptForAgent(audioTranscript),
           },
         }
       : params.msg;
@@ -312,14 +329,11 @@ export async function processMessage(params: {
   });
 
   let combinedBody = buildInboundLine({
-    cfg: params.cfg,
     msg: msgForAgent,
-    agentId: params.route.agentId,
     previousTimestamp,
     envelope: envelopeOptions,
     visibleReplyTo,
   });
-  let shouldClearGroupHistory = false;
   const visibleGroupHistory =
     conversationKind === "group"
       ? resolveVisibleWhatsAppGroupHistory({
@@ -359,7 +373,6 @@ export async function processMessage(params: {
         },
       });
     }
-    shouldClearGroupHistory = !(params.suppressGroupHistoryClear ?? false);
   }
 
   // When statusReactions.enabled, a StatusReactionController takes over lifecycle
@@ -501,6 +514,11 @@ export async function processMessage(params: {
     suppressMessageReceivedHooks: true,
   });
   const { inbound, turnInput, ctxPayload } = prepared;
+  const turnAdmission = mapWhatsAppIngressToTurnAdmission(
+    inbound.channelIngress?.ingress ?? admission.ingress,
+  );
+  const shouldClearGroupHistory =
+    conversationKind === "group" && params.suppressGroupHistoryClear !== true;
   const transport = buildWhatsAppInboundTransportContext(params.msg);
   const ingressLifecycle = resolveWhatsAppIngressLifecycle(params.msg);
   const turnAdoptionLifecycle = ingressLifecycle
@@ -536,24 +554,13 @@ export async function processMessage(params: {
     ...(turnAdoptionLifecycle ? { turnAdoptionLifecycle } : {}),
     adapter: {
       ingest: () => turnInput,
-      preflight: () => {
-        const reason = admission.ingress.reasonCode;
-        if (admission.ingress.admission === "dispatch") {
-          return { admission: { kind: "dispatch", reason } };
+      preflight: () => ({ admission: turnAdmission }),
+      onFinalize: (result) => {
+        // The shared history option also clears during failure cleanup. WhatsApp keeps pending
+        // context when dispatch fails so a later message can retry it.
+        if (result.dispatched && turnAdmission.kind === "dispatch" && shouldClearGroupHistory) {
+          params.groupHistories.set(params.groupHistoryKey, []);
         }
-        if (admission.ingress.admission === "observe") {
-          return { admission: { kind: "observeOnly", reason } };
-        }
-        if (admission.ingress.admission === "skip") {
-          return { admission: { kind: "handled", reason } };
-        }
-        return {
-          admission: {
-            kind: "drop",
-            reason,
-            recordHistory: false,
-          },
-        };
       },
       resolveTurn: () => {
         const { finalize, ...replyPlan } = createWhatsAppReplyPlan({
@@ -561,8 +568,6 @@ export async function processMessage(params: {
           connectionId: params.connectionId,
           context: ctxPayload,
           deliverReply: deliverWebReply,
-          groupHistories: params.groupHistories,
-          groupHistoryKey: params.groupHistoryKey,
           maxMediaBytes: params.maxMediaBytes,
           maxMediaTextChunkLimit: params.maxMediaTextChunkLimit,
           inbound,
@@ -574,7 +579,6 @@ export async function processMessage(params: {
           },
           replyResolver: params.replyResolver,
           route: params.route,
-          shouldClearGroupHistory,
           statusReactionController,
           transport,
           turnAdoptionLifecycle,
@@ -586,6 +590,7 @@ export async function processMessage(params: {
           accountId: params.route.accountId,
           route: { agentId: params.route.agentId, sessionKey: params.route.sessionKey },
           ctxPayload,
+          dispatchReplyFromConfig: params.dispatchReplyFromConfig,
           record: {
             onRecordError: (err) => {
               params.replyLogger.warn(

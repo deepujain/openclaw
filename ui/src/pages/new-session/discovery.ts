@@ -6,6 +6,7 @@ import {
 } from "@openclaw/normalization-core/string-normalization";
 import type {
   EnvironmentStatus,
+  RequiredNodeCommand,
   RuntimeTargetIssue,
   WorkerExecutionMode,
   WorkerSlotSummary,
@@ -16,10 +17,14 @@ export type DraftBranches = {
   branches: Array<{ name: string; kind: "local" | "remote" }>;
   defaultBranch?: string;
   headBranch?: string;
+  branchesUnavailable?: boolean;
 };
 
 export type DraftRepositoryState =
   | { kind: "idle" }
+  // Selected GitHub projects offer isolation before checkout exists. Local first
+  // turns prepare after admission; remote placement clones on its selected runner.
+  | { kind: "pending-clone"; cloneUrl: string }
   | { kind: "checking"; repoRoot: string }
   | ({ kind: "git" } & DraftBranches)
   | { kind: "direct"; repoRoot: string }
@@ -28,14 +33,24 @@ export type DraftRepositoryState =
 export type DraftCloudProfile = {
   id: string;
   providerId: string;
+  providerDisplayId?: string;
   trust?: "persistent" | "disposable";
-  executionMode?: WorkerExecutionMode;
+  executionModes?: readonly WorkerExecutionMode[];
   machines?: DraftMachineOption[];
+  operatingSystems?: DraftOperatingSystem[];
+};
+
+export type DraftOperatingSystem = {
+  id: string;
+  label: string;
+  default?: boolean;
+  disabledReason?: string;
 };
 
 export type DraftMachineOption = {
   id: string;
   label: string;
+  os?: string;
   cpu?: number;
   memoryGb?: number;
   default?: boolean;
@@ -56,10 +71,9 @@ export type DraftEnvironment = {
   trust?: "persistent" | "disposable";
   capabilities?: string[];
   invocableCommands?: string[];
+  requiredNodeCommand?: RequiredNodeCommand;
   issues?: RuntimeTargetIssue[];
 };
-
-export type BrowserTarget = { nodeId: string; label: string };
 
 function normalizeTimestamp(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) && value >= 0
@@ -88,6 +102,25 @@ function readRuntimeTargetIssues(value: unknown): RuntimeTargetIssue[] | undefin
   return issues.length > 0 ? issues : undefined;
 }
 
+function readDraftCloudProfileExecutionModes(value: unknown): readonly WorkerExecutionMode[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  if (value.length === 1 && (value[0] === "worker-turn" || value[0] === "remote-exec")) {
+    return [value[0]];
+  }
+  return value.length === 2 && value[0] === "worker-turn" && value[1] === "remote-exec"
+    ? ["worker-turn", "remote-exec"]
+    : [];
+}
+
+export function draftCloudProfileSupportsExecutionMode(
+  profile: DraftCloudProfile,
+  executionMode: WorkerExecutionMode,
+): boolean {
+  return profile.executionModes?.includes(executionMode) === true;
+}
+
 export function readDraftCloudProfiles(value: unknown): DraftCloudProfile[] {
   return (Array.isArray(value) ? value : [])
     .flatMap<DraftCloudProfile>((raw) => {
@@ -97,9 +130,11 @@ export function readDraftCloudProfiles(value: unknown): DraftCloudProfile[] {
       const profile = raw as {
         id?: unknown;
         providerId?: unknown;
+        providerDisplayId?: unknown;
         trust?: unknown;
-        executionMode?: unknown;
+        executionModes?: unknown;
         machines?: unknown;
+        operatingSystems?: unknown;
       };
       const id = normalizeOptionalString(profile.id);
       const providerId = normalizeOptionalString(profile.providerId);
@@ -110,13 +145,24 @@ export function readDraftCloudProfiles(value: unknown): DraftCloudProfile[] {
         profile.trust === "persistent" || profile.trust === "disposable"
           ? profile.trust
           : undefined;
-      const executionMode: WorkerExecutionMode | undefined =
-        profile.executionMode === "worker-turn" || profile.executionMode === "remote-exec"
-          ? profile.executionMode
-          : undefined;
       const machines = readDraftMachineOptions(profile.machines);
+      const operatingSystems = readDraftOperatingSystems(profile.operatingSystems);
       return [
-        { id, providerId, trust, executionMode, ...(machines.length > 0 ? { machines } : {}) },
+        {
+          id,
+          providerId,
+          ...(typeof profile.providerDisplayId === "string" &&
+          /^[a-z][a-z0-9-]{0,63}$/.test(profile.providerDisplayId) &&
+          profile.providerDisplayId.trim() === profile.providerDisplayId
+            ? { providerDisplayId: profile.providerDisplayId }
+            : {}),
+          trust,
+          ...(Object.hasOwn(profile, "executionModes")
+            ? { executionModes: readDraftCloudProfileExecutionModes(profile.executionModes) }
+            : {}),
+          ...(machines.length > 0 ? { machines } : {}),
+          ...(operatingSystems.length > 0 ? { operatingSystems } : {}),
+        },
       ];
     })
     .toSorted((left, right) => left.id.localeCompare(right.id));
@@ -124,26 +170,80 @@ export function readDraftCloudProfiles(value: unknown): DraftCloudProfile[] {
 
 function readDraftMachineOptions(value: unknown): DraftMachineOption[] {
   const options = new Map<string, DraftMachineOption>();
-  for (const raw of (Array.isArray(value) ? value : []).slice(0, 32)) {
+  for (const raw of (Array.isArray(value) ? value : []).slice(0, 64)) {
     if (!isRecord(raw)) {
       continue;
     }
     const id = normalizeOptionalString(raw.id);
     const label = normalizeOptionalString(raw.label);
-    if (!id || id.length > 128 || !label || label.length > 128 || options.has(id)) {
+    const os = normalizeOptionalString(raw.os);
+    const key = JSON.stringify([os, id]);
+    if (
+      !id ||
+      id.length > 128 ||
+      !label ||
+      label.length > 128 ||
+      options.has(key) ||
+      (raw.os !== undefined && (!os || os.length > 64))
+    ) {
       continue;
     }
     const cpu = normalizeMachineSize(raw.cpu);
     const memoryGb = normalizeMachineSize(raw.memoryGb);
-    options.set(id, {
+    options.set(key, {
       id,
       label,
+      ...(os ? { os } : {}),
       ...(cpu === undefined ? {} : { cpu }),
       ...(memoryGb === undefined ? {} : { memoryGb }),
       ...(typeof raw.default === "boolean" ? { default: raw.default } : {}),
     });
   }
   return [...options.values()];
+}
+
+function readDraftOperatingSystems(value: unknown): DraftOperatingSystem[] {
+  const options = new Map<string, DraftOperatingSystem>();
+  for (const raw of (Array.isArray(value) ? value : []).slice(0, 8)) {
+    if (!isRecord(raw)) {
+      continue;
+    }
+    const id = normalizeOptionalString(raw.id);
+    const label = normalizeOptionalString(raw.label);
+    const disabledReason = normalizeOptionalString(raw.disabledReason)?.slice(0, 256);
+    if (!id || id.length > 64 || !label || label.length > 64 || options.has(id)) {
+      continue;
+    }
+    options.set(id, {
+      id,
+      label,
+      ...(typeof raw.default === "boolean" ? { default: raw.default } : {}),
+      ...(disabledReason ? { disabledReason } : {}),
+    });
+  }
+  return [...options.values()];
+}
+
+export function defaultCloudOs(profile: DraftCloudProfile): string {
+  return (
+    profile.operatingSystems?.find((os) => os.default)?.id ??
+    profile.operatingSystems?.[0]?.id ??
+    profile.machines?.find((machine) => machine.os)?.os ??
+    ""
+  );
+}
+
+export function cloudMachinesForOs(profile: DraftCloudProfile, os: string): DraftMachineOption[] {
+  return (profile.machines ?? []).filter((machine) => !machine.os || machine.os === os);
+}
+
+/** Providers that omit a marked default still present their first catalog choice as the default. */
+export function defaultCloudMachine(
+  profile: DraftCloudProfile,
+  os = defaultCloudOs(profile),
+): DraftMachineOption | undefined {
+  const machines = cloudMachinesForOs(profile, os);
+  return machines.find((machine) => machine.default) ?? machines[0];
 }
 
 const ENVIRONMENT_STATUSES = new Set<EnvironmentStatus>([
@@ -178,6 +278,22 @@ function readWorkerSlots(value: unknown): WorkerSlotSummary | undefined {
     : undefined;
 }
 
+function readRequiredNodeCommand(value: unknown): RequiredNodeCommand | undefined {
+  if (!isRecord(value) || Object.keys(value).some((key) => key !== "command" && key !== "state")) {
+    return undefined;
+  }
+  const command = normalizeOptionalString(value.command);
+  const state = value.state;
+  return command &&
+    command.length <= 128 &&
+    (state === "invocable" ||
+      state === "pending-approval" ||
+      state === "undeclared" ||
+      state === "unauthorized")
+    ? { command, state }
+    : undefined;
+}
+
 export function readDraftEnvironments(value: unknown): DraftEnvironment[] {
   return (Array.isArray(value) ? value : [])
     .flatMap<DraftEnvironment>((raw) => {
@@ -199,6 +315,7 @@ export function readDraftEnvironments(value: unknown): DraftEnvironment[] {
         trust?: unknown;
         capabilities?: unknown;
         invocableCommands?: unknown;
+        requiredNodeCommand?: unknown;
         issues?: unknown;
       };
       const id = normalizeOptionalString(environment.id);
@@ -223,6 +340,7 @@ export function readDraftEnvironments(value: unknown): DraftEnvironment[] {
             .filter((command) => command.length <= 128)
             .slice(0, 128)
         : undefined;
+      const requiredNodeCommand = readRequiredNodeCommand(environment.requiredNodeCommand);
       const lastConnectedAtMs = normalizeTimestamp(environment.lastConnectedAtMs);
       const lastDisconnectedAtMs = normalizeTimestamp(environment.lastDisconnectedAtMs);
       const lastSeenAtMs = normalizeTimestamp(environment.lastSeenAtMs);
@@ -247,6 +365,7 @@ export function readDraftEnvironments(value: unknown): DraftEnvironment[] {
           ...(trust ? { trust } : {}),
           ...(capabilities ? { capabilities } : {}),
           ...(invocableCommands ? { invocableCommands } : {}),
+          ...(requiredNodeCommand ? { requiredNodeCommand } : {}),
           ...(issues ? { issues } : {}),
         },
       ];

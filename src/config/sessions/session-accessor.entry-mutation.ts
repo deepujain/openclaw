@@ -1,27 +1,33 @@
 import { isDeepStrictEqual } from "node:util";
-import type { MsgContext } from "../../auto-reply/templating.js";
+import { isMainThread } from "node:worker_threads";
 import { formatErrorMessage } from "../../infra/errors.js";
-import type { ChannelRouteRef } from "../../plugin-sdk/channel-route.js";
 import { resolveAgentIdFromSessionKey } from "../../routing/session-key.js";
-import type { DeliveryContext } from "../../utils/delivery-context.types.js";
+import {
+  openOpenClawAgentDatabase,
+  runOpenClawAgentWriteTransaction,
+} from "../../state/openclaw-agent-db.js";
+import { supportsOpenClawAgentDatabaseExecution } from "../../state/openclaw-agent-execution.js";
 import {
   resolveAccessStorePath,
   loadSessionEntry,
-  listSessionEntriesCore,
   patchSessionEntryCore,
-  resolveSessionEntryFromStore,
 } from "./session-accessor.entry.js";
 import { applySessionEntryLifecycleMutation } from "./session-accessor.lifecycle.js";
+import { readSessionCreationSnapshotInDatabase } from "./session-accessor.sqlite-creation-read.js";
+import { createSessionEntryWithTranscriptInWorker } from "./session-accessor.sqlite-creation-worker.js";
+import { hasPreparedNativeSessionDeletion } from "./session-accessor.sqlite-deletion.js";
+import { replaceSessionOwnerInTransaction } from "./session-accessor.sqlite-owner.js";
+import "./session-accessor.sqlite-entry.js";
+import { forkSessionTranscriptFromParent } from "./session-accessor.sqlite-parent-session.js";
 import {
-  recordInboundSessionMeta,
-  updateSessionLastRoute,
-} from "./session-accessor.sqlite-entry.js";
-import {
-  forkSessionEntryFromParentTarget,
-  forkSessionTranscriptFromParent,
-  resolveSessionParentForkDecision,
-} from "./session-accessor.sqlite-parent-session.js";
-import { appendTranscriptEvent } from "./session-accessor.sqlite-transcript-write.js";
+  captureLifecycleDatabaseScope,
+  resolveSqliteScope,
+  prepareSqliteScope,
+  resolveSqliteTranscriptScope,
+  runExclusiveSqliteSessionWrite,
+  toDatabaseOptions,
+} from "./session-accessor.sqlite-scope.js";
+import { ensureTranscriptHeader } from "./session-accessor.sqlite-transcript-header.js";
 import type {
   SessionAccessScope,
   SessionEntryUpdateOptions,
@@ -37,21 +43,22 @@ import type {
   SessionEntryCreateWithTranscriptOptions,
 } from "./session-accessor.types.js";
 import { normalizeStoreSessionKey } from "./store-entry.js";
-import { createSessionTranscriptHeader } from "./transcript-header.js";
-import type { GroupKeyResolution, InternalSessionEntry as SessionEntry } from "./types.js";
+import { captureSessionTranscriptStorageEnvironment } from "./transcript-target-binding.js";
+import type { InternalSessionEntry as SessionEntry } from "./types.js";
+export {
+  recordInboundSessionMeta,
+  updateSessionLastRoute,
+} from "./session-accessor.sqlite-entry.js";
+export {
+  forkSessionEntryFromParentTarget,
+  resolveSessionParentForkDecision,
+} from "./session-accessor.sqlite-parent-session.js";
 
 export async function forkSessionFromParentTranscript(
   params: ForkSessionFromParentTranscriptParams,
 ): Promise<ForkSessionFromParentTranscriptResult> {
   return await forkSessionTranscriptFromParent(params);
 }
-
-export {
-  forkSessionEntryFromParentTarget,
-  recordInboundSessionMeta,
-  resolveSessionParentForkDecision,
-  updateSessionLastRoute,
-};
 
 /**
  * Creates or updates one session entry and initializes its transcript header as
@@ -67,55 +74,100 @@ export async function createSessionEntryWithTranscript<TError = string>(
     | SessionEntryCreateWithTranscriptPrepareResult<TError>,
   options: SessionEntryCreateWithTranscriptOptions = {},
 ): Promise<SessionEntryCreateWithTranscriptResult<TError>> {
-  const storePath = resolveAccessStorePath(scope);
+  const captured = {
+    ...scope,
+    env: captureSessionTranscriptStorageEnvironment(scope.env ?? process.env),
+  };
+  const storePath = resolveAccessStorePath(captured);
   const agentId = scope.agentId ?? resolveAgentIdFromSessionKey(scope.sessionKey);
-  const store = Object.fromEntries(
-    listSessionEntriesCore({ agentId, storePath }).map(({ sessionKey, entry }) => [
-      sessionKey,
-      entry,
-    ]),
+  const target = { ...captured, agentId, storePath };
+  const resolved = captureLifecycleDatabaseScope(
+    isMainThread ? await prepareSqliteScope(target) : resolveSqliteScope(target),
   );
-  const resolved = resolveSessionEntryFromStore({ store, sessionKey: scope.sessionKey });
-  const created = await createEntry({
-    existingEntry: resolved.existing ? { ...resolved.existing } : undefined,
-    sessionEntries: cloneSessionEntries(store),
-  });
+  if (
+    isMainThread &&
+    supportsOpenClawAgentDatabaseExecution(toDatabaseOptions(resolved)) &&
+    !hasPreparedNativeSessionDeletion()
+  ) {
+    return createSessionEntryWithTranscriptInWorker(resolved, createEntry, options);
+  }
+  // Process-held, already executing, maintenance, and native rollback scopes keep their kernels.
+  const storeScope = { agentId, env: resolved.env, storePath: resolved.path };
+  // The resolved path is a physical locator, not the original logical store selector.
+  // Re-resolving a missing custom-agent suffix as a shared store would assign it to main.
+  const creationDatabase = openOpenClawAgentDatabase(toDatabaseOptions(resolved));
+  const { normalizedKey, legacyKeys, labels, ...context } = readSessionCreationSnapshotInDatabase(
+    creationDatabase,
+    scope.sessionKey,
+  );
+  const created = await createEntry({ ...context, isLabelInUse: (label) => labels.has(label) });
   if (!created.ok) {
     return { ok: false, error: created.error, phase: "entry" };
   }
+  const ownerAssignment = options.resolveOwnerAssignment?.();
+  const { cwd, commitGuard, withCommit, onLifecycleCommitted } = options;
 
-  try {
-    await appendTranscriptEvent(
-      {
-        agentId,
+  const initializeTranscript = async (assertSourceCurrent?: () => void) => {
+    try {
+      const transcriptScope = resolveSqliteTranscriptScope({
+        ...storeScope,
         sessionId: created.entry.sessionId,
-        sessionKey: resolved.normalizedKey,
-        storePath,
-      },
-      createSessionTranscriptHeader({ cwd: options.cwd, sessionId: created.entry.sessionId }),
-      options.commitGuard ? { beforeCommitInTransaction: options.commitGuard } : undefined,
-    );
-  } catch (err) {
-    // Preserve authority errors from the commit guard instead of projecting
-    // them as transcript failures at the Gateway boundary.
-    options.commitGuard?.();
+        sessionKey: normalizedKey,
+      });
+      await runExclusiveSqliteSessionWrite(
+        transcriptScope,
+        async () => {
+          runOpenClawAgentWriteTransaction((database) => {
+            commitGuard?.();
+            assertSourceCurrent?.();
+            ensureTranscriptHeader(database, transcriptScope, cwd);
+          }, toDatabaseOptions(transcriptScope));
+        },
+        "session.entry.create-with-transcript",
+      );
+      return undefined;
+    } catch (err) {
+      // Reassert while source custody is still held; acquisition and unwind errors
+      // must escape instead of becoming ordinary transcript failures.
+      commitGuard?.();
+      assertSourceCurrent?.();
+      return formatErrorMessage(err);
+    }
+  };
+  const transcriptError = withCommit
+    ? await withCommit(initializeTranscript)
+    : await initializeTranscript();
+  if (transcriptError !== undefined) {
     return {
       ok: false,
-      error: formatErrorMessage(err),
+      error: transcriptError,
       phase: "transcript",
     };
   }
 
   const entry = created.entry;
   await applySessionEntryLifecycleMutation({
-    agentId,
-    storePath,
-    removals: resolved.legacyKeys.map((sessionKey) => ({ sessionKey })),
-    upserts: [{ sessionKey: resolved.normalizedKey, entry }],
+    ...storeScope,
+    removals: legacyKeys.map((sessionKey) => ({ sessionKey })),
+    upserts: [{ sessionKey: normalizedKey, entry }],
     skipMaintenance: true,
-    ...(options.commitGuard ? { beforeCommitInTransaction: options.commitGuard } : {}),
+    ...(commitGuard ? { beforeCommitInTransaction: commitGuard } : {}),
+    ...(withCommit ? { withCommit } : {}),
+    ...(ownerAssignment
+      ? {
+          afterFreshUpsertsInTransaction: (database) => {
+            if (!replaceSessionOwnerInTransaction(database, normalizedKey, ownerAssignment)) {
+              throw new Error(`Session owner assignment lost its target: ${normalizedKey}`);
+            }
+          },
+        }
+      : {}),
+    ...(onLifecycleCommitted ? { onLifecycleCommitted: () => onLifecycleCommitted(entry) } : {}),
+    ...(options.afterCommitted
+      ? { afterCommitted: (source) => options.afterCommitted!(entry, source) }
+      : {}),
   });
-  return { ok: true, entry, sessionFile: resolved.normalizedKey };
+  return { ok: true, entry, sessionFile: normalizedKey };
 }
 
 export function cloneSessionEntries(
@@ -127,43 +179,18 @@ export function cloneSessionEntries(
 }
 
 function collectSessionEntryKeys(...entries: SessionEntry[]): Array<keyof SessionEntry> {
-  const keys = new Set<keyof SessionEntry>();
-  for (const entry of entries) {
-    for (const key of Object.keys(entry) as Array<keyof SessionEntry>) {
-      keys.add(key);
-    }
-  }
-  return [...keys];
+  return [...new Set(entries.flatMap((entry) => Object.keys(entry) as Array<keyof SessionEntry>))];
 }
 
-function sessionEntryFieldEqual(
-  left: SessionEntry[keyof SessionEntry],
-  right: SessionEntry[keyof SessionEntry],
+function sessionEntryFieldUnchanged(
+  left: SessionEntry,
+  right: SessionEntry,
+  key: keyof SessionEntry,
 ): boolean {
-  return Object.is(left, right) || isDeepStrictEqual(left, right);
-}
-
-function sessionEntryFieldUnset(
-  hasValue: boolean,
-  value: SessionEntry[keyof SessionEntry],
-): boolean {
-  return !hasValue || value === undefined;
-}
-
-function sessionEntryFieldUnchanged(params: {
-  leftHasValue: boolean;
-  leftValue: SessionEntry[keyof SessionEntry];
-  rightHasValue: boolean;
-  rightValue: SessionEntry[keyof SessionEntry];
-}): boolean {
-  const { leftHasValue, leftValue, rightHasValue, rightValue } = params;
-  if (
-    sessionEntryFieldUnset(leftHasValue, leftValue) &&
-    sessionEntryFieldUnset(rightHasValue, rightValue)
-  ) {
-    return true;
-  }
-  return leftHasValue === rightHasValue && sessionEntryFieldEqual(leftValue, rightValue);
+  return isDeepStrictEqual(
+    Object.hasOwn(left, key) ? left[key] : undefined,
+    Object.hasOwn(right, key) ? right[key] : undefined,
+  );
 }
 
 // Background activity can mutate non-identity fields after the initialization
@@ -185,27 +212,11 @@ export function mergeConcurrentReplySessionMetadata(params: {
     Record<keyof SessionEntry, SessionEntry[keyof SessionEntry]>
   >;
   for (const key of collectSessionEntryKeys(currentEntry, preparedEntry, snapshotEntry)) {
-    const currentHasValue = Object.hasOwn(currentEntry, key);
-    const snapshotHasValue = Object.hasOwn(snapshotEntry, key);
-    const preparedHasValue = Object.hasOwn(preparedEntry, key);
-    const currentValue = currentEntry[key];
-    const snapshotValue = snapshotEntry[key];
-    const preparedValue = preparedEntry[key];
-    const currentChanged = !sessionEntryFieldUnchanged({
-      leftHasValue: currentHasValue,
-      leftValue: currentValue,
-      rightHasValue: snapshotHasValue,
-      rightValue: snapshotValue,
-    });
-    const preparedKeptSnapshot = sessionEntryFieldUnchanged({
-      leftHasValue: preparedHasValue,
-      leftValue: preparedValue,
-      rightHasValue: snapshotHasValue,
-      rightValue: snapshotValue,
-    });
+    const currentChanged = !sessionEntryFieldUnchanged(currentEntry, snapshotEntry, key);
+    const preparedKeptSnapshot = sessionEntryFieldUnchanged(preparedEntry, snapshotEntry, key);
     if (currentChanged && preparedKeptSnapshot) {
-      if (currentHasValue) {
-        mergedFields[key] = currentValue;
+      if (Object.hasOwn(currentEntry, key)) {
+        mergedFields[key] = currentEntry[key];
       } else {
         delete mergedFields[key];
       }
@@ -214,11 +225,7 @@ export function mergeConcurrentReplySessionMetadata(params: {
   return merged;
 }
 
-export function createReplySessionInitializationRevision(params: {
-  entry: SessionEntry | undefined;
-  storePath: string;
-}): string {
-  const { entry } = params;
+export function createReplySessionInitializationRevision(entry: SessionEntry | undefined): string {
   if (!entry) {
     return JSON.stringify(null);
   }
@@ -226,15 +233,6 @@ export function createReplySessionInitializationRevision(params: {
   // activity/context writes are merged below; comparing them here would reject
   // before the merge can preserve the concurrent metadata.
   return JSON.stringify({ sessionId: entry.sessionId });
-}
-
-export function resolveInitializedReplySessionEntry(params: {
-  agentId: string;
-  currentEntry?: SessionEntry;
-  sessionEntry: SessionEntry;
-  storePath: string;
-}): SessionEntry {
-  return params.sessionEntry;
 }
 
 /** Updates an existing entry only; returns null when the session is absent. */
@@ -247,44 +245,6 @@ export async function updateSessionEntry(
 ): Promise<SessionEntry | null> {
   return await patchSessionEntryCore(scope, update, options);
 }
-
-export type RecordInboundSessionMetaParams = {
-  /** Set false to only patch existing entries; missing sessions stay absent. */
-  createIfMissing?: boolean;
-  /** Inbound message context whose stable metadata is derived and persisted. */
-  ctx: MsgContext;
-  /** Group routing resolution for group-owned session keys. */
-  groupResolution?: GroupKeyResolution | null;
-  /** Canonical or alias session key for the inbound conversation. */
-  sessionKey: string;
-  /** Explicit store target for file-backed stores and SQLite migration adapters. */
-  storePath: string;
-};
-
-export type UpdateSessionLastRouteParams = {
-  /** Account owning the delivery route when the channel is multi-account. */
-  accountId?: string;
-  /** Delivery channel id persisted as the last route channel. */
-  channel?: string;
-  /** Set false to only patch existing entries; missing sessions stay absent. */
-  createIfMissing?: boolean;
-  /** Optional inbound context whose session metadata is derived alongside the route. */
-  ctx?: MsgContext;
-  /** Explicit delivery context merged over the persisted session fallback. */
-  deliveryContext?: DeliveryContext;
-  /** Group routing resolution for group-owned session keys. */
-  groupResolution?: GroupKeyResolution | null;
-  /** Canonical channel route persisted as the session route slot. */
-  route?: ChannelRouteRef;
-  /** Canonical or alias session key for the routed conversation. */
-  sessionKey: string;
-  /** Explicit store target for file-backed stores and SQLite migration adapters. */
-  storePath: string;
-  /** Thread/topic id for the delivery route, when the transport has one. */
-  threadId?: string | number;
-  /** Delivery target persisted as the last route recipient. */
-  to?: string;
-};
 
 /** Resolves one abort target identity without exposing the mutable store. */
 export function resolveSessionAbortTarget(
@@ -306,6 +266,7 @@ export function resolveSessionAbortTarget(
  * storage-sized operation. Runtime abort side effects remain with callers.
  */
 export async function markSessionAbortTarget(params: {
+  isCurrent?: () => boolean;
   resolveAbortCutoff?: (context: SessionAbortTargetContext) => SessionAbortTargetCutoff | undefined;
   scope: SessionAccessScope;
   now?: () => number;
@@ -316,6 +277,9 @@ export async function markSessionAbortTarget(params: {
     const updated = await patchSessionEntryCore(
       params.scope,
       (currentEntry) => {
+        if (params.isCurrent?.() === false) {
+          return null;
+        }
         resolution.target = {
           entry: { ...currentEntry },
           persisted: false,
@@ -339,9 +303,16 @@ export async function markSessionAbortTarget(params: {
       {
         replaceEntry: true,
         skipMaintenance: true,
+        // The patch callback yields before BEGIN; the conversation can move without
+        // changing this session row, so its snapshot comparison cannot fence Stop.
+        assertCommitAllowed: () => {
+          if (resolution.target && params.isCurrent?.() === false) {
+            throw new Error("The selected session changed before it could be stopped.");
+          }
+        },
       },
     );
-    return updated
+    return updated && resolution.target
       ? {
           entry: { ...updated },
           persisted: true,

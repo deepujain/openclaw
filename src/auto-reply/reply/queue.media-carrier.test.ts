@@ -1,5 +1,5 @@
 // Prompt metadata carrier tests cover collect batching, deferral, and retry identity.
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { createChannelParticipantAdmissionEvidence } from "../../../test/helpers/channel-admission-evidence.js";
 import { createDeferred } from "../../../test/helpers/promise.js";
 import {
@@ -8,17 +8,22 @@ import {
 } from "../../agents/tool-policy.js";
 import {
   compareChannelAdmissionParticipants,
-  configureChannelAdmissionEvidenceCollection,
+  createChannelAdmissionAudit,
   consumeChannelAdmissionEvidence,
 } from "../../channels/message-access/admission-evidence.js";
+import { createUserTurnTranscriptRecorder } from "../../sessions/user-turn-transcript.js";
+import { runActiveReplySteer } from "./agent-runner-steer-adoption.js";
 import type { FollowupRun, QueueSettings } from "./queue.js";
 import { enqueueFollowupRun, FollowupRunDeferredError, scheduleFollowupDrain } from "./queue.js";
 import { createQueueTestRun } from "./queue.test-helpers.js";
 import {
   createOverflowSummaryRetrySource,
   resolveFollowupDeliveryContextKey,
-} from "./queue/drain.js";
+} from "./queue/delivery-context.js";
 import { clearFollowupQueue } from "./queue/state.js";
+import { createReplyOperation } from "./reply-run-registry.js";
+import { createMockTypingController } from "./test-helpers.js";
+import { createTypingSignaler } from "./typing-mode.js";
 
 const queueKeys = new Set<string>();
 const evidenceCleanups = new Set<() => void>();
@@ -87,9 +92,94 @@ afterEach(() => {
 });
 
 describe("followup prompt metadata carrier", () => {
+  it("drains the complete parked image turn after active steering rejects it", async () => {
+    const key = "agent:main:parked-media-fallback";
+    queueKeys.add(key);
+    const run = createQueueTestRun({
+      prompt: "  preserve this caption\n",
+      messageId: "media-fallback",
+    });
+    run.images = [{ type: "image", data: "inline-png", mimeType: "image/png" }];
+    run.imageOrder = ["offloaded", "inline"];
+    run.media = [{ path: "/tmp/stored.png", contentType: "image/png" }, { kind: "image" }];
+    const recorder = createUserTurnTranscriptRecorder({
+      input: { text: run.prompt, media: run.media },
+      target: () => undefined,
+    });
+    run.userTurnTranscriptRecorder = recorder;
+    const persist = vi.spyOn(recorder, "persistApproved");
+    const operation = createReplyOperation({
+      sessionKey: key,
+      sessionId: run.run.sessionId,
+      resetTriggered: false,
+    });
+    operation.bindToolAuthoritySnapshot({
+      fingerprint: () => "media-authority",
+      project: () => "media-authority",
+    });
+    const reject = vi.fn(async () => {
+      throw new Error("no active turn to steer");
+    });
+    operation.attachBackend({
+      kind: "embedded",
+      supportsQueueMessageImages: true,
+      toolAuthorityFingerprint: "media-authority",
+      cancel: vi.fn(),
+      messageInjection: { isAvailable: () => true, queueMessage: reject },
+    });
+    operation.setPhase("running");
+    const delivered = createDeferred<FollowupRun>();
+    const runFollowup = vi.fn(async (queued: FollowupRun) => {
+      delivered.resolve(queued);
+    });
+    const typing = createMockTypingController();
+    try {
+      await expect(
+        runActiveReplySteer({
+          followupRun: run,
+          opts: undefined,
+          providedReplyOperation: operation,
+          queueKey: key,
+          releaseAdmissionTicket: vi.fn(),
+          replyOperationRunState: undefined,
+          resolvedQueue: { mode: "steer", debounceMs: 0 },
+          restartRecoverySourceTurnId: "media-fallback",
+          runFollowup,
+          sessionCtx: {},
+          sessionKey: key,
+          touchActiveSessionEntry: async () => {},
+          typing,
+          typingSignals: createTypingSignaler({ typing, mode: "never", isHeartbeat: false }),
+          toolAuthorityFingerprint: "media-authority",
+        }),
+      ).resolves.toBe("handled");
+      expect(reject).toHaveBeenCalledOnce();
+      expect(persist).not.toHaveBeenCalled();
+      operation.complete();
+      await vi.waitFor(() => expect(runFollowup).toHaveBeenCalledOnce());
+      const fallback = await delivered.promise;
+      expect({
+        text: fallback.prompt,
+        images: fallback.images,
+        imageOrder: fallback.imageOrder,
+        media: fallback.media,
+      }).toEqual({
+        text: "  preserve this caption\n",
+        images: [{ type: "image", data: "inline-png", mimeType: "image/png" }],
+        imageOrder: ["offloaded", "inline"],
+        media: [{ path: "/tmp/stored.png", contentType: "image/png" }, { kind: "image" }],
+      });
+      expect(fallback.userTurnTranscriptRecorder).toBe(recorder);
+      expect(recorder.hasPersisted()).toBe(false);
+    } finally {
+      operation.complete();
+      persist.mockRestore();
+    }
+  });
+
   it("keeps participant evidence out of sender-scoped collect routing", () => {
-    const clearCollection = configureChannelAdmissionEvidenceCollection(true);
-    evidenceCleanups.add(clearCollection);
+    const audit = createChannelAdmissionAudit({ enabled: true });
+    evidenceCleanups.add(() => audit.close());
     const runs = ["person-1", "person-2"].map((senderId) => {
       const item = createQueueTestRun({
         prompt: `from ${senderId}`,
@@ -97,6 +187,7 @@ describe("followup prompt metadata carrier", () => {
         originatingTo: "channel:A",
       });
       item.channelAdmissionEvidence = createChannelParticipantAdmissionEvidence({
+        audit,
         channelId: "slack",
         accountId: "default",
         participantId: senderId,
@@ -115,8 +206,8 @@ describe("followup prompt metadata carrier", () => {
     );
   });
   it("keeps collected prompt bytes and ordered facts stable across deferred admission", async () => {
-    const clearCollection = configureChannelAdmissionEvidenceCollection(true);
-    evidenceCleanups.add(clearCollection);
+    const audit = createChannelAdmissionAudit({ enabled: true });
+    evidenceCleanups.add(() => audit.close());
     const key = `prompt-media-collect-${Date.now()}`;
     queueKeys.add(key);
     const settings: QueueSettings = { mode: "collect", debounceMs: 0 };
@@ -149,6 +240,7 @@ describe("followup prompt metadata carrier", () => {
         { name: sharedSkillName, path: "/tmp/skills/shared/SKILL.md" },
       ];
       run.channelAdmissionEvidence = createChannelParticipantAdmissionEvidence({
+        audit,
         channelId: "test",
         participantId: "person-1",
       });
@@ -215,9 +307,65 @@ describe("followup prompt metadata carrier", () => {
     });
   });
 
+  it.each([
+    { name: "trace", first: { traceLevelOverride: "off" }, second: { traceLevelOverride: "raw" } },
+    { name: "thinking", first: { thinkLevel: "low" }, second: { thinkLevel: "high" } },
+    {
+      name: "original thinking",
+      first: { thinkLevel: "off", thinkLevelOverride: "high" },
+      second: { thinkLevel: "off", thinkLevelOverride: "off" },
+    },
+    { name: "fast", first: { fastMode: false }, second: { fastMode: true } },
+    {
+      name: "fast preference source",
+      first: { fastMode: true, fastModeOverride: false },
+      second: { fastMode: true, fastModeOverride: true },
+    },
+    {
+      name: "fast auto duration source",
+      first: { fastMode: "auto", fastModeAutoOnSeconds: 30, fastModeAutoOnSecondsOverride: false },
+      second: { fastMode: "auto", fastModeAutoOnSeconds: 30, fastModeAutoOnSecondsOverride: true },
+    },
+    {
+      name: "fast auto duration",
+      first: { fastMode: "auto", fastModeAutoOnSeconds: 30, fastModeAutoOnSecondsOverride: true },
+      second: { fastMode: "auto", fastModeAutoOnSeconds: 120, fastModeAutoOnSecondsOverride: true },
+    },
+    { name: "verbose", first: { verboseLevel: "off" }, second: { verboseLevel: "on" } },
+    { name: "reasoning", first: { reasoningLevel: "off" }, second: { reasoningLevel: "on" } },
+  ] as const)(
+    "keeps conflicting turn $name choices in separate collected replies",
+    async ({ name, first, second }) => {
+      const key = `turn-choice-collect-${name}`;
+      queueKeys.add(key);
+      const done = createDeferred();
+      const calls: FollowupRun[] = [];
+      for (const [index, settings] of [first, second, second, first].entries()) {
+        const run = createQueueTestRun({ prompt: `task ${index}`, messageId: `choice-${index}` });
+        run.run = { ...run.run, traceAuthorized: true, ...settings };
+        enqueueFollowupRun(key, run, { mode: "collect", debounceMs: 0 });
+      }
+      scheduleFollowupDrain(key, async (run) => {
+        calls.push(run);
+        if (run.prompt.includes("task 3")) {
+          done.resolve();
+        }
+      });
+      await done.promise;
+      expect(calls).toHaveLength(3);
+      expect(calls[0]?.run).toMatchObject(first);
+      expect(calls[1]?.run).toMatchObject(second);
+      expect(calls[2]?.run).toMatchObject(first);
+      expect(calls[0]?.prompt).toContain("task 0");
+      expect(calls[1]?.prompt).toContain("task 1");
+      expect(calls[1]?.prompt).toContain("task 2");
+      expect(calls[2]?.prompt).toContain("task 3");
+    },
+  );
+
   it("removes sender authority when collected evidence identifies mixed participants", async () => {
-    const clearCollection = configureChannelAdmissionEvidenceCollection(true);
-    evidenceCleanups.add(clearCollection);
+    const audit = createChannelAdmissionAudit({ enabled: true });
+    evidenceCleanups.add(() => audit.close());
     const key = `prompt-metadata-mixed-${Date.now()}`;
     queueKeys.add(key);
     const done = createDeferred();
@@ -237,6 +385,7 @@ describe("followup prompt metadata carrier", () => {
         { name: skillName, path: `/tmp/skills/${skillName}/SKILL.md` },
       ];
       run.channelAdmissionEvidence = createChannelParticipantAdmissionEvidence({
+        audit,
         channelId: "test",
         participantId,
       });
@@ -281,8 +430,8 @@ describe("followup prompt metadata carrier", () => {
   });
 
   it("preserves facts when an overflow source is rebuilt for retry", () => {
-    const clearCollection = configureChannelAdmissionEvidenceCollection(true);
-    evidenceCleanups.add(clearCollection);
+    const audit = createChannelAdmissionAudit({ enabled: true });
+    evidenceCleanups.add(() => audit.close());
     const source = createQueueTestRun({
       prompt: "[media attached: /tmp/retry.png (image/png)]\nretry me",
     });
@@ -292,6 +441,7 @@ describe("followup prompt metadata carrier", () => {
     source.media = [{ path: "/tmp/retry.png", contentType: "image/png" }];
     source.explicitSkillSelections = [{ name: "retry", path: "/tmp/skills/retry/SKILL.md" }];
     source.channelAdmissionEvidence = createChannelParticipantAdmissionEvidence({
+      audit,
       channelId: "test",
       participantId: "person-1",
     });

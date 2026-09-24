@@ -3,6 +3,8 @@
  *
  * Builds stable receipts from platform send results and nested adapter receipt data.
  */
+import { asOptionalRecord } from "@openclaw/normalization-core/record-coerce";
+import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import { normalizeUniqueStringEntries } from "@openclaw/normalization-core/string-normalization";
 import type {
   MessageReceipt,
@@ -17,7 +19,52 @@ type MessageReceiptInputResult = MessageReceiptSourceResult & {
 const normalizeIdentity = (value: string | undefined): string | undefined =>
   value?.trim() || undefined;
 
+/** Reads reported recipients, including every physical part of an aggregate receipt. */
+export function listMessageReceiptSourceTargets(value: unknown): string[] {
+  const targets = new Set<string>();
+  const seen = new Set<object>();
+  const pending = [value];
+  for (const entry of pending) {
+    if (!entry || typeof entry !== "object" || seen.has(entry)) {
+      continue;
+    }
+    seen.add(entry);
+    if (Array.isArray(entry)) {
+      pending.push(...entry);
+      continue;
+    }
+    const record = asOptionalRecord(entry);
+    if (!record || record.outcome === "not_sent") {
+      continue;
+    }
+    const target = asOptionalRecord(record.target);
+    const ids = [
+      target?.id,
+      ...(
+        [
+          "chatId",
+          "channelId",
+          "roomId",
+          "conversationId",
+          "toJid",
+        ] as const satisfies readonly (keyof MessageReceiptSourceResult)[]
+      ).map((key) => record[key]),
+    ];
+    for (const id of ids) {
+      const normalized = normalizeOptionalString(id);
+      if (normalized) {
+        targets.add(normalized);
+      }
+    }
+    pending.push(record.receipt, record.raw, record.parts);
+  }
+  return [...targets];
+}
+
 export function resolveReceiptSourceId(result: MessageReceiptInputResult): string | undefined {
+  if (result.outcome === "not_sent") {
+    return undefined;
+  }
   return (
     normalizeIdentity(result.messageId) ??
     (result.receipt ? resolveMessageReceiptPrimaryId(result.receipt) : undefined) ??
@@ -40,9 +87,10 @@ export function createMessageReceiptFromOutboundResults(params: {
   replyToId?: string;
   sentAt?: number;
 }): MessageReceipt {
+  const sentResults = params.results.filter((result) => result.outcome !== "not_sent");
   const requestedThreadId = normalizeIdentity(params.threadId);
   const providerThreadIds = normalizeUniqueStringEntries(
-    params.results.flatMap(({ receipt }) =>
+    sentResults.flatMap(({ receipt }) =>
       receipt?.parts.length
         ? receipt.parts.flatMap(
             (part) => normalizeIdentity(part.threadId) ?? normalizeIdentity(receipt.threadId) ?? [],
@@ -52,7 +100,7 @@ export function createMessageReceiptFromOutboundResults(params: {
   );
   const aggregateThreadId =
     providerThreadIds.length > 1 ? undefined : (providerThreadIds[0] ?? requestedThreadId);
-  const parts = params.results.flatMap((result, resultIndex) => {
+  const parts = sentResults.flatMap((result, resultIndex) => {
     if (result.receipt) {
       const receiptThreadId = normalizeIdentity(result.receipt.threadId) ?? requestedThreadId;
       if (result.receipt.parts.length === 0) {
@@ -94,7 +142,7 @@ export function createMessageReceiptFromOutboundResults(params: {
     ];
   });
   const platformMessageIds: string[] = [];
-  for (const result of params.results) {
+  for (const result of sentResults) {
     if (result.receipt) {
       appendUnique(platformMessageIds, result.receipt.primaryPlatformMessageId);
       for (const platformMessageId of result.receipt.platformMessageIds) {
@@ -107,7 +155,7 @@ export function createMessageReceiptFromOutboundResults(params: {
     }
     appendUnique(platformMessageIds, resolveReceiptSourceId(result));
   }
-  const firstNestedReceipt = params.results.find((result) => result.receipt)?.receipt;
+  const firstNestedReceipt = sentResults.find((result) => result.receipt)?.receipt;
   return {
     ...(platformMessageIds[0] ? { primaryPlatformMessageId: platformMessageIds[0] } : {}),
     platformMessageIds,

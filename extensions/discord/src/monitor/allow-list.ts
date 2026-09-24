@@ -1,4 +1,3 @@
-// Discord plugin module implements allow list behavior.
 import {
   type AllowlistMatch,
   resolveAllowlistMatchByCandidates,
@@ -9,7 +8,7 @@ import {
   resolveChannelMatchConfig,
   type ChannelMatchSource,
 } from "openclaw/plugin-sdk/channel-targets";
-import type { DiscordGuildEntry, OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
+import type { DiscordGuildEntry } from "openclaw/plugin-sdk/config-contracts";
 import {
   normalizeLowercaseStringOrEmpty,
   normalizeOptionalString,
@@ -27,28 +26,16 @@ type DiscordAllowListMatch = AllowlistMatch<"wildcard" | "id" | "name" | "tag">;
 
 const DISCORD_OWNER_ALLOWLIST_PREFIXES = ["discord:", "user:", "pk:"];
 
-type DiscordChannelOverrideConfig = {
-  requireMention?: boolean;
-  ignoreOtherMentions?: boolean;
-  skills?: string[];
-  enabled?: boolean;
-  users?: string[];
-  roles?: string[];
-  systemPrompt?: string;
-  includeThreadStarter?: boolean;
-  autoThread?: boolean;
-  autoThreadName?: "message" | "generated";
-  autoArchiveDuration?: "60" | "1440" | "4320" | "10080" | 60 | 1440 | 4320 | 10080;
-};
+type DiscordChannelOverrideConfig = Omit<
+  NonNullable<DiscordGuildEntry["channels"]>[string],
+  "tools" | "toolsBySender"
+>;
 
-export type DiscordGuildEntryResolved = Pick<DiscordGuildEntry, "presenceEvents"> & {
+export type DiscordGuildEntryResolved = Omit<
+  DiscordGuildEntry,
+  "tools" | "toolsBySender" | "channels"
+> & {
   id?: string;
-  slug?: string;
-  requireMention?: boolean;
-  ignoreOtherMentions?: boolean;
-  reactionNotifications?: "off" | "own" | "all" | "allowlist";
-  users?: string[];
-  roles?: string[];
   channels?: Record<string, DiscordChannelOverrideConfig>;
 };
 
@@ -128,18 +115,11 @@ export function allowListMatches(
   candidate: { id?: string; name?: string; tag?: string },
   params?: { allowNameMatching?: boolean },
 ) {
-  if (list.allowAll) {
-    return true;
-  }
-  if (candidate.id && list.ids.has(candidate.id)) {
-    return true;
-  }
-  if (params?.allowNameMatching === true) {
-    if (resolveDiscordAllowListNameMatch(list, candidate)) {
-      return true;
-    }
-  }
-  return false;
+  return resolveDiscordAllowListMatch({
+    allowList: list,
+    candidate,
+    allowNameMatching: params?.allowNameMatching,
+  }).allowed;
 }
 
 export function resolveDiscordAllowListMatch(params: {
@@ -290,55 +270,18 @@ export function resolveDiscordOwnerAccess(params: {
   ownerAllowList: DiscordAllowList | null;
   ownerAllowed: boolean;
 } {
-  const ownerAllowFrom = params.allowFrom?.filter(
-    (entry) => (normalizeOptionalString(entry) ?? "") !== "*",
-  );
   const ownerAllowList = normalizeDiscordAllowList(
-    ownerAllowFrom && ownerAllowFrom.length > 0 ? ownerAllowFrom : undefined,
+    params.allowFrom?.filter((entry) => (normalizeOptionalString(entry) ?? "") !== "*"),
     DISCORD_OWNER_ALLOWLIST_PREFIXES,
   );
-  const ownerAllowed = ownerAllowList
-    ? allowListMatches(
-        ownerAllowList,
-        {
-          id: params.sender.id,
-          name: params.sender.name,
-          tag: params.sender.tag,
-        },
-        { allowNameMatching: params.allowNameMatching },
-      )
-    : false;
-  return { ownerAllowList, ownerAllowed };
-}
-
-export function resolveDiscordCommandOwnerAllowFrom(cfg: OpenClawConfig): string[] | undefined {
-  const raw = cfg.commands?.ownerAllowFrom;
-  if (!Array.isArray(raw) || raw.length === 0) {
-    return undefined;
-  }
-  const entries: string[] = [];
-  for (const entry of raw) {
-    const trimmed = normalizeOptionalString(String(entry ?? "")) ?? "";
-    if (!trimmed) {
-      continue;
-    }
-    const separatorIndex = trimmed.indexOf(":");
-    if (separatorIndex > 0) {
-      const prefix = trimmed.slice(0, separatorIndex).toLowerCase();
-      if (prefix === "discord") {
-        const remainder = normalizeOptionalString(trimmed.slice(separatorIndex + 1)) ?? "";
-        if (remainder) {
-          entries.push(remainder);
-        }
-        continue;
-      }
-      if (prefix !== "user" && prefix !== "pk") {
-        continue;
-      }
-    }
-    entries.push(trimmed);
-  }
-  return entries.length > 0 ? entries : undefined;
+  return {
+    ownerAllowList,
+    ownerAllowed:
+      ownerAllowList !== null &&
+      allowListMatches(ownerAllowList, params.sender, {
+        allowNameMatching: params.allowNameMatching,
+      }),
+  };
 }
 
 export function resolveDiscordCommandAuthorized(params: {
@@ -462,18 +405,12 @@ export function resolveDiscordChannelConfig(params: {
   channelName?: string;
   channelSlug: string;
 }): DiscordChannelConfigResolved | null {
-  const { guildInfo, channelId, channelName, channelSlug } = params;
-  const channels = guildInfo?.channels;
-  if (!hasConfiguredDiscordChannels(channels)) {
-    return null;
-  }
-  const match = resolveDiscordChannelEntryMatch(channels, {
-    id: channelId,
-    name: channelName,
-    slug: channelSlug,
+  return resolveDiscordChannelConfigWithFallback({
+    guildInfo: params.guildInfo,
+    channelId: params.channelId,
+    channelName: params.channelName,
+    channelSlug: params.channelSlug,
   });
-  const resolved = resolveChannelMatchConfig(match, resolveDiscordChannelConfigEntry);
-  return resolved ?? { allowed: false };
 }
 
 export function resolveDiscordChannelConfigWithFallback(params: {

@@ -4,7 +4,7 @@ import {
 } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { CLAUDE_LOCAL_SESSION_HOST_ID } from "./session-catalog-adoption.js";
 import { isExactClaudeSessionCursor } from "./session-catalog-cursor.js";
-import { MAX_STRING_LENGTH, parsePullRequestSummary } from "./session-catalog-discovery.js";
+import { MAX_STRING_LENGTH, parsePullRequestSummary } from "./session-catalog-desktop.js";
 import { ClaudeCatalogParamsError } from "./session-catalog-shared.js";
 import type {
   ClaudeSessionCatalogPage,
@@ -13,7 +13,7 @@ import type {
 
 const DEFAULT_PAGE_LIMIT = 50;
 export const MAX_PAGE_LIMIT = 100;
-export const DEFAULT_TRANSCRIPT_LIMIT = 20;
+const DEFAULT_TRANSCRIPT_LIMIT = 20;
 export const MAX_TRANSCRIPT_LIMIT = 50;
 export const MAX_HOSTS = 100;
 const MAX_SEARCH_LENGTH = 500;
@@ -93,19 +93,15 @@ export function readListParams(value: unknown): {
   };
 }
 
-export function readTranscriptParams(
-  value: unknown,
-  options: { includeHostId?: boolean } = {},
-): { threadId: string; cursor?: string; limit: number } {
+export function readTranscriptParams(value: unknown): {
+  threadId: string;
+  cursor?: string;
+  limit: number;
+} {
   if (!isRecord(value)) {
     throw new ClaudeCatalogParamsError("Claude session read parameters must be an object");
   }
-  const allowed = new Set([
-    "threadId",
-    "cursor",
-    "limit",
-    ...(options.includeHostId ? ["hostId"] : []),
-  ]);
+  const allowed = new Set(["threadId", "cursor", "limit"]);
   const unknown = Object.keys(value).find((key) => !allowed.has(key));
   if (unknown) {
     throw new ClaudeCatalogParamsError(`unknown Claude session read parameter: ${unknown}`);
@@ -188,6 +184,7 @@ export function parseCatalogPage(value: unknown): ClaudeSessionCatalogPage {
       name = parseStringField("name", 500);
     }
     const cwd = parseStringField("cwd");
+    const color = parseStringField("color");
     const createdAt = parseNumberField("createdAt") as number | undefined;
     const updatedAt = parseNumberField("updatedAt") as number | undefined;
     const recencyAt = parseNumberField("recencyAt", true);
@@ -201,6 +198,7 @@ export function parseCatalogPage(value: unknown): ClaudeSessionCatalogPage {
       modelProvider: "anthropic",
       archived: false,
       ...(name !== undefined ? { name } : {}),
+      ...(color ? { color } : {}),
       ...(cwd ? { cwd } : {}),
       ...(createdAt !== undefined ? { createdAt } : {}),
       ...(updatedAt !== undefined ? { updatedAt } : {}),

@@ -1,4 +1,3 @@
-// Whatsapp plugin module implements targets runtime behavior.
 import fs from "node:fs";
 import path from "node:path";
 import { normalizeE164 } from "openclaw/plugin-sdk/account-resolution";
@@ -139,14 +138,9 @@ const DIRECT_LID_JID_RE = /^(\d+)(?::\d+)?@(lid|hosted\.lid)$/i;
 
 function addEquivalentDirectChatCandidate(target: string[], jid: string | null | undefined): void {
   addUniqueString(target, jid);
-  const pnMatch = jid?.match(DIRECT_PN_JID_RE);
-  if (pnMatch) {
-    addUniqueString(target, `${pnMatch[1]}@${pnMatch[2]}`);
-    return;
-  }
-  const lidMatch = jid?.match(DIRECT_LID_JID_RE);
-  if (lidMatch) {
-    addUniqueString(target, `${lidMatch[1]}@${lidMatch[2]}`);
+  const match = jid?.match(DIRECT_PN_JID_RE) ?? jid?.match(DIRECT_LID_JID_RE);
+  if (match) {
+    addUniqueString(target, `${match[1]}@${match[2]}`);
   }
 }
 
@@ -274,10 +268,7 @@ export function jidToE164(jid: string, opts?: JidToE164Options): string | null {
   if (!lid) {
     return null;
   }
-  const phone = readLidReverseMapping({
-    lid,
-    opts,
-  });
+  const phone = readLidReverseMapping({ lid, opts });
   if (phone) {
     return phone;
   }
@@ -440,10 +431,9 @@ export function markdownToWhatsAppChunks(
   }
   const { ir, escapedMarkers } = prepareWhatsAppMarkdown(text, tableMode);
   const render = (chunk: MarkdownIR) => renderWhatsAppMarkdownIR(chunk, escapedMarkers);
-  const rendered = render(ir);
   let chunks =
     ir.styles.length === 0 && ir.links.length === 0
-      ? chunkMarkdownTextWithMode(rendered, limit, chunkMode)
+      ? chunkMarkdownTextWithMode(render(ir), limit, chunkMode)
       : splitWhatsAppIRForChunkMode(ir, limit, chunkMode).flatMap((source) =>
           renderMarkdownIRChunksWithinLimit({
             ir: source,

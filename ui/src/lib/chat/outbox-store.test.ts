@@ -1,16 +1,16 @@
 /* @vitest-environment jsdom */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createStorageMock } from "../../test-helpers/storage.ts";
+import { captureChatOutboxRecoveryDestination, readChatOutboxRecovery } from "./outbox-recovery.ts";
+import { createStoredChatOutboxReader, listStoredChatOutboxes } from "./outbox-store-projection.ts";
+import { retireStoredComposerDrafts } from "./outbox-store-retirement.ts";
 import {
-  listStoredChatOutboxes,
-  listStoredDraftScopes,
-  summarizeStoredChatOutboxes,
-} from "./outbox-store-projection.ts";
-import {
-  resolveStoredChatOutboxScope,
-  retireStoredComposerDrafts,
+  readProjectedOutboxStore,
+  readStoredOutboxStore,
   storedChatOutboxScopeKey,
+  storageTargetForGateway,
   subscribeStoredChatOutboxChanges,
+  writeStoredOutboxStore,
 } from "./outbox-store.ts";
 
 beforeEach(() => {
@@ -23,15 +23,496 @@ afterEach(() => {
 });
 
 describe("stored outbox summaries", () => {
-  it("keeps the exact aliased scope when sessionStorage retirement fails", () => {
+  it.each(["raw", "cleared"])(
+    "keeps newer legacy bytes published during %s source retirement",
+    (input) => {
+      const target = storageTargetForGateway("ws://reentrant-retirement.test");
+      const scopeKey = storedChatOutboxScopeKey({
+        sessionKey: "agent:main:dashboard:incognito-reentrant",
+      });
+      const source = (id: string) =>
+        JSON.stringify({
+          version: 3,
+          gatewayOwner: target.gatewayOwner,
+          sessions: {
+            [scopeKey]: {
+              draft: "Private legacy input",
+              queue: [{ id, text: id, createdAt: 1 }],
+              updatedAt: 1,
+            },
+          },
+        });
+      sessionStorage.setItem(target.blobKey, source("submitted"));
+      if (input === "cleared") {
+        const removal = vi.spyOn(sessionStorage, "removeItem").mockImplementation(() => {});
+        readStoredOutboxStore(sessionStorage, target);
+        expect(sessionStorage.getItem(target.blobKey)).toBe("");
+        removal.mockRestore();
+      }
+      const replacement = source("newer-submission");
+      const remove = sessionStorage.removeItem.bind(sessionStorage);
+      vi.spyOn(sessionStorage, "removeItem").mockImplementation((key) => {
+        if (key === target.blobKey) {
+          sessionStorage.setItem(key, replacement);
+          throw new Error("Source changed during removal");
+        }
+        remove(key);
+      });
+      const migrated = readStoredOutboxStore(sessionStorage, target);
+      expect(sessionStorage.getItem(target.blobKey)).toBe(replacement);
+      expect(migrated.sessions[scopeKey]?.queue).toMatchObject([{ id: "submitted" }]);
+    },
+  );
+
+  it.each([1, 2, 3])(
+    "retires acknowledged v%i private input after source deletion fails without reimporting queues",
+    (version) => {
+      const target = storageTargetForGateway("ws://acknowledged-private.test");
+      const sourceKey =
+        version === 1 ? target.legacyKey : version === 2 ? target.previousKey : target.blobKey;
+      const scopeKey = storedChatOutboxScopeKey({
+        sessionKey: "agent:main:dashboard:incognito-acknowledged",
+      });
+      const source = JSON.stringify({
+        version,
+        ...(version !== 1 ? { gatewayOwner: target.gatewayOwner } : {}),
+        sessions: {
+          [scopeKey]: {
+            draft: "@Alex private legacy input",
+            draftMentions: [{ profileId: "alex", start: 0, end: 5 }],
+            goalMode: { action: "start", sessionId: "private-goal" },
+            queue: [{ id: "submitted", text: "Submitted message", createdAt: 1 }],
+            updatedAt: 1,
+          },
+          "main\u0000agent:main": { draft: "Ambiguous input", updatedAt: 1 },
+        },
+      });
+      sessionStorage.setItem(sourceKey, source);
+      const remove = sessionStorage.removeItem.bind(sessionStorage);
+      let sourceRemovalBlocked = true;
+      vi.spyOn(sessionStorage, "removeItem").mockImplementation((key) => {
+        if (key === sourceKey && sourceRemovalBlocked) {
+          throw new Error("Source deletion unavailable");
+        }
+        remove(key);
+      });
+      const write = sessionStorage.setItem.bind(sessionStorage);
+      let sourceWritesBlocked = true;
+      vi.spyOn(sessionStorage, "setItem").mockImplementation((key, value) => {
+        if (key === sourceKey && sourceWritesBlocked) {
+          throw new Error("Source writes unavailable");
+        }
+        write(key, value);
+      });
+      const migrated = readStoredOutboxStore(sessionStorage, target);
+      expect(sessionStorage.getItem(sourceKey)).toBe(source);
+      expect(migrated.sessions[scopeKey]?.queue).toMatchObject([
+        { id: "submitted", text: "Submitted message" },
+      ]);
+      expect(Object.values(migrated.recovery)[0]?.session.draft).toBe("Ambiguous input");
+      sourceWritesBlocked = false;
+      expect(readStoredOutboxStore(sessionStorage, target)).toEqual(migrated);
+      const retained = sessionStorage.getItem(sourceKey) ?? "";
+      expect(retained).not.toContain("private legacy input");
+      expect(retained).not.toContain("profileId");
+      expect(retained).not.toContain("private-goal");
+      expect(readStoredOutboxStore(sessionStorage, target)).toEqual(migrated);
+      sourceRemovalBlocked = false;
+      expect(readStoredOutboxStore(sessionStorage, target)).toEqual(migrated);
+      expect(sessionStorage.getItem(sourceKey)).toBeNull();
+    },
+  );
+
+  it.each([1, 2, 3])(
+    "retires private input in a deferred v%i source without changing queued or ambiguous data",
+    (version) => {
+      const target = storageTargetForGateway("ws://deferred-private.test");
+      const sourceKey =
+        version === 1 ? target.legacyKey : version === 2 ? target.previousKey : target.blobKey;
+      const scopeKey = storedChatOutboxScopeKey({
+        sessionKey: "agent:main:dashboard:incognito-deferred",
+      });
+      const queued = { id: "submitted", text: "Submitted private message", createdAt: 1 };
+      const privateRow = {
+        draft: "@Alex private legacy input",
+        draftMentions: [{ profileId: "alex", start: 0, end: 5 }],
+        goalMode: { action: "start", sessionId: "private-session" },
+        draftRevision: 7,
+        queue: [queued],
+        updatedAt: 1,
+        unknownMetadata: "preserve",
+      };
+      const source = {
+        version,
+        ...(version !== 1 ? { gatewayOwner: target.gatewayOwner } : {}),
+        sessions: {
+          [scopeKey]: privateRow,
+          "agent:main:dashboard:incognito-draft-only\u0000agent:main": {
+            draft: "Private draft without an explicit revision",
+            updatedAt: 2,
+          },
+          "agent:main:dashboard:incognito-goal-only\u0000agent:main": {
+            goalMode: { action: "start", sessionId: "private-goal" },
+            updatedAt: 3,
+          },
+          "main\u0000agent:main": { draft: "Ambiguous input", updatedAt: 1 },
+        },
+      };
+      sessionStorage.setItem(sourceKey, JSON.stringify(source));
+      const store = {
+        version: 4,
+        gatewayOwner: target.gatewayOwner,
+        sessions: {},
+        recovery: Object.fromEntries(
+          Array.from({ length: 80 }, (_, index) => [
+            `existing-${index}`,
+            {
+              sourceVersion: 4,
+              sourceScopeKey: "main\u0000agent:main",
+              session: { draft: `Existing ${index}`, updatedAt: 1 },
+            },
+          ]),
+        ),
+      };
+      sessionStorage.setItem(target.key, JSON.stringify(store));
+      expect(readStoredOutboxStore(sessionStorage, target).recoveryBlocked).toBe(true);
+      expect(() => readStoredOutboxStore(sessionStorage, target)).not.toThrow();
+      const retained = JSON.parse(sessionStorage.getItem(sourceKey)!);
+      const { draft: _draft, draftMentions: _mentions, goalMode: _goal, ...preserved } = privateRow;
+      expect(retained).toEqual({
+        ...source,
+        sessions: {
+          [scopeKey]: preserved,
+          "main\u0000agent:main": source.sessions["main\u0000agent:main"],
+        },
+      });
+      expect(JSON.parse(sessionStorage.getItem(target.key)!)).toEqual(store);
+      expect(readStoredOutboxStore(sessionStorage, target).recoveryBlocked).toBe(true);
+      expect(JSON.parse(sessionStorage.getItem(sourceKey)!)).toEqual(retained);
+      sessionStorage.setItem(target.key, JSON.stringify({ ...store, recovery: {} }));
+      const remove = sessionStorage.removeItem.bind(sessionStorage);
+      vi.spyOn(sessionStorage, "removeItem").mockImplementation((key) => {
+        if (key !== sourceKey) {
+          remove(key);
+        }
+      });
+      const migrated = readStoredOutboxStore(sessionStorage, target);
+      expect(
+        Object.values(migrated.recovery).flatMap((entry) => entry.session.queue ?? []),
+      ).toEqual([queued]);
+      expect(Object.values(migrated.recovery)).toHaveLength(2);
+      expect(sessionStorage.getItem(sourceKey)).not.toBeNull();
+      expect(readStoredOutboxStore(sessionStorage, target)).toEqual(migrated);
+    },
+  );
+
+  it("retires private recovery input and rejects private destinations before roster metadata", () => {
+    const target = storageTargetForGateway("ws://private-recovery.test");
+    const sessionKey = "agent:main:dashboard:incognito-recovery";
+    const scopeKey = storedChatOutboxScopeKey({ sessionKey });
+    sessionStorage.setItem(
+      target.key,
+      JSON.stringify({
+        version: 4,
+        gatewayOwner: target.gatewayOwner,
+        sessions: {},
+        recovery: {
+          legacy: {
+            sourceVersion: 4,
+            sourceScopeKey: scopeKey,
+            session: {
+              draft: "private recovery input",
+              draftRevision: 4,
+              updatedAt: 1,
+              queue: [
+                { id: "submitted", text: "Submitted message", createdAt: 1, sendState: "held" },
+              ],
+            },
+          },
+        },
+      }),
+    );
+    const state = {
+      settings: { gatewayUrl: target.gatewayOwner },
+      agentsList: { defaultId: "main", mainKey: "main" },
+    };
+    const entries = readChatOutboxRecovery(state).entries;
+    expect(entries[0]?.session).toEqual({
+      draftRevision: 4,
+      updatedAt: 1,
+      queue: [{ id: "submitted", text: "Submitted message", createdAt: 1, sendState: "held" }],
+    });
+    expect(sessionStorage.getItem(target.key)).not.toContain("private recovery input");
+    expect(captureChatOutboxRecoveryDestination(state, { sessionKey })).toBeNull();
+  });
+
+  it("restores selected recipients with their exact draft and queued text", () => {
+    const target = storageTargetForGateway("ws://mention-outbox.test");
+    const scopeKey = storedChatOutboxScopeKey({ sessionKey: "agent:main:mentions" });
+    const mentions = [{ profileId: "profile-alex", start: 0, end: 5 }];
+    const store = readStoredOutboxStore(sessionStorage, target);
+    store.sessions[scopeKey] = {
+      draft: "@Alex draft",
+      draftMentions: mentions,
+      queue: [
+        {
+          id: "mention-send",
+          text: "@Alex queued",
+          mentions,
+          createdAt: 1,
+          sendRunId: "mention-run",
+          sendState: "waiting-reconnect",
+        },
+      ],
+      updatedAt: 1,
+    };
+
+    writeStoredOutboxStore(sessionStorage, target, store);
+    mentions[0]!.profileId = "later-selection";
+    const restored = readStoredOutboxStore(sessionStorage, target).sessions[scopeKey];
+
+    expect(restored).toMatchObject({
+      draft: "@Alex draft",
+      draftMentions: [{ profileId: "profile-alex", start: 0, end: 5 }],
+      queue: [
+        {
+          text: "@Alex queued",
+          mentions: [{ profileId: "profile-alex", start: 0, end: 5 }],
+          sendRunId: "mention-run",
+          sendState: "waiting-reconnect",
+        },
+      ],
+    });
+  });
+
+  it.each([
+    { reason: "out-of-range token", mentions: [{ profileId: "profile-alex", start: 0, end: 50 }] },
+    {
+      reason: "missing mention prefix",
+      mentions: [{ profileId: "profile-alex", start: 1, end: 5 }],
+    },
+    { reason: "malformed annotations", mentions: "profile-alex" },
+  ])("parks a queued row with $reason", ({ mentions }) => {
+    const target = storageTargetForGateway("ws://mention-recovery.test");
+    const scopeKey = storedChatOutboxScopeKey({ sessionKey: "agent:main:mentions" });
+    sessionStorage.setItem(
+      target.key,
+      JSON.stringify({
+        version: 4,
+        gatewayOwner: target.gatewayOwner,
+        recovery: {},
+        sessions: {
+          [scopeKey]: {
+            queue: [
+              {
+                id: "corrupt-mention",
+                text: "@Alex review",
+                mentions,
+                createdAt: 1,
+                sendState: "waiting-reconnect",
+              },
+            ],
+            updatedAt: 1,
+          },
+        },
+      }),
+    );
+
+    const restored = readStoredOutboxStore(sessionStorage, target).sessions[scopeKey]?.queue?.[0];
+
+    expect(restored).toMatchObject({ text: "@Alex review", sendState: "failed" });
+    expect(restored?.mentions).toBeUndefined();
+    expect(restored?.sendError).toBeTruthy();
+  });
+
+  it("normalizes an unchanged projection once and refreshes after an external write", () => {
+    const reader = createStoredChatOutboxReader();
+    const changed = vi.fn();
+    const unsubscribe = reader.subscribe(changed);
     const gatewayUrl = "ws://gateway.test/control";
-    const storageKey = `openclaw.control.chatComposer.v2:${encodeURIComponent(gatewayUrl)}`;
+    const state = { settings: { gatewayUrl } };
+    const storageKey = `openclaw.control.chatComposer.v4:${encodeURIComponent(gatewayUrl)}`;
+    sessionStorage.setItem(
+      storageKey,
+      JSON.stringify({ version: 4, recovery: {}, gatewayOwner: gatewayUrl, sessions: {} }),
+    );
+    const target = {
+      gatewayOwner: gatewayUrl,
+      key: storageKey,
+      legacyKey: "unused",
+      previousKey: "unused-v2",
+      blobKey: "unused-v3",
+      legacyOwnerIsUnambiguous: true,
+    };
+    const first = readProjectedOutboxStore(sessionStorage, target);
+    expect(readProjectedOutboxStore(sessionStorage, target)).toBe(first);
+    const summary = reader.read(state);
+    expect(reader.read({ settings: { gatewayUrl } })).toBe(summary);
+
     sessionStorage.setItem(
       storageKey,
       JSON.stringify({
-        version: 2,
+        version: 4,
+        recovery: {},
         gatewayOwner: gatewayUrl,
-        mainAlias: { key: "workspace", agentId: "work" },
+        sessions: { "agent:main:summary\u0000agent:main": { draft: "new", updatedAt: 1 } },
+      }),
+    );
+    const storageEvent = new StorageEvent("storage", { key: storageKey });
+    Object.defineProperty(storageEvent, "storageArea", { value: sessionStorage });
+    window.dispatchEvent(storageEvent);
+    expect(readProjectedOutboxStore(sessionStorage, target)).not.toBe(first);
+    expect(changed).toHaveBeenCalledOnce();
+    const refreshed = reader.read(state);
+    expect(refreshed).not.toBe(summary);
+    expect(refreshed.hasSessionDraft("agent:main:summary")).toBe(true);
+    expect(
+      reader
+        .read({ settings: { gatewayUrl: "ws://other.test" } })
+        .hasSessionDraft("agent:main:summary"),
+    ).toBe(false);
+    expect(reader.read(state).hasSessionDraft("agent:main:summary")).toBe(true);
+    const reconnected = reader.read(state);
+    reader.invalidate();
+    expect(reader.read(state)).not.toBe(reconnected);
+    unsubscribe();
+  });
+
+  it.each([1, 2])("refreshes a retained v%i projection after an external write", (version) => {
+    const unsubscribe = subscribeStoredChatOutboxChanges(() => undefined);
+    const gatewayUrl = "ws://gateway.test/control";
+    const legacyKey = `openclaw.control.chatComposer.v${version}:${encodeURIComponent(gatewayUrl)}`;
+    const stored = (ids: string[]) =>
+      JSON.stringify({
+        version,
+        ...(version === 2 ? { gatewayOwner: gatewayUrl } : {}),
+        sessions: {
+          "thread\u0000agent:main": {
+            queue: ids.map((id, createdAt) => ({ id, text: id, createdAt })),
+            updatedAt: ids.length,
+          },
+        },
+      });
+    sessionStorage.setItem(legacyKey, stored(["first"]));
+    const write = sessionStorage.setItem.bind(sessionStorage);
+    vi.spyOn(sessionStorage, "setItem").mockImplementation((key, value) => {
+      if (key !== legacyKey) {
+        throw new DOMException("quota exceeded", "QuotaExceededError");
+      }
+      write(key, value);
+    });
+    const state = { settings: { gatewayUrl } };
+    expect(createStoredChatOutboxReader().read(state).total).toBe(1);
+
+    sessionStorage.setItem(legacyKey, stored(["first", "second"]));
+    const storageEvent = new StorageEvent("storage", { key: legacyKey });
+    Object.defineProperty(storageEvent, "storageArea", { value: sessionStorage });
+    window.dispatchEvent(storageEvent);
+
+    const refreshedTotal = createStoredChatOutboxReader().read(state).total;
+    unsubscribe();
+    expect(refreshedTotal).toBe(2);
+  });
+
+  it.each([1, 2, 3])(
+    "retains the last v%i source when quota blocks verified retirement",
+    (version) => {
+      const target = storageTargetForGateway("ws://gateway.test/control");
+      const sourceKey =
+        version === 1 ? target.legacyKey : version === 2 ? target.previousKey : target.blobKey;
+      const scopeKey = storedChatOutboxScopeKey({ sessionKey: "thread", agentId: "main" });
+      sessionStorage.setItem(
+        sourceKey,
+        JSON.stringify({
+          version,
+          ...(version !== 1 ? { gatewayOwner: target.gatewayOwner } : {}),
+          sessions: {
+            [scopeKey]: {
+              queue: [{ id: "queued", text: "retire me", createdAt: 1 }],
+              updatedAt: 1,
+            },
+          },
+        }),
+      );
+      vi.spyOn(sessionStorage, "setItem").mockImplementation(() => {
+        throw new DOMException("quota exceeded", "QuotaExceededError");
+      });
+      const store = readStoredOutboxStore(sessionStorage, target);
+      expect(store.sessions[scopeKey]?.queue).toHaveLength(1);
+      store.sessions = {};
+      expect(() => writeStoredOutboxStore(sessionStorage, target, store)).toThrow("quota exceeded");
+      expect(readStoredOutboxStore(sessionStorage, target).sessions[scopeKey]?.queue).toEqual([
+        { id: "queued", text: "retire me", createdAt: 1, sessionKey: "thread" },
+      ]);
+      expect(sessionStorage.getItem(sourceKey)).toContain("retire me");
+    },
+  );
+
+  it("clears every retained projection after an external storage clear", () => {
+    const listener = vi.fn();
+    const unsubscribe = subscribeStoredChatOutboxChanges(listener);
+    const gatewayUrls = ["ws://first.test/control", "ws://second.test/control"];
+    for (const gatewayUrl of gatewayUrls) {
+      sessionStorage.setItem(
+        `openclaw.control.chatComposer.v4:${encodeURIComponent(gatewayUrl)}`,
+        JSON.stringify({
+          version: 4,
+          recovery: {},
+          gatewayOwner: gatewayUrl,
+          sessions: {
+            "thread\u0000agent:main": {
+              queue: [{ id: gatewayUrl, text: gatewayUrl, createdAt: 1 }],
+              updatedAt: 1,
+            },
+          },
+        }),
+      );
+      expect(createStoredChatOutboxReader().read({ settings: { gatewayUrl } }).total).toBe(1);
+    }
+
+    sessionStorage.clear();
+    const storageEvent = new StorageEvent("storage", { key: null });
+    Object.defineProperty(storageEvent, "storageArea", { value: sessionStorage });
+    window.dispatchEvent(storageEvent);
+    unsubscribe();
+
+    for (const gatewayUrl of gatewayUrls) {
+      expect(createStoredChatOutboxReader().read({ settings: { gatewayUrl } }).total).toBe(0);
+    }
+    expect(listener).toHaveBeenCalledOnce();
+  });
+
+  it("retires a captured main destination without consulting changed defaults", () => {
+    const target = storageTargetForGateway("ws://captured-retirement.test");
+    const original = storedChatOutboxScopeKey({ sessionKey: "agent:main:main" });
+    const current = storedChatOutboxScopeKey({ sessionKey: "agent:main:current" });
+    const store = readStoredOutboxStore(sessionStorage, target);
+    store.sessions[original] = { draft: "old target", draftRevision: 10, updatedAt: 10 };
+    store.sessions[current] = { draft: "new target", draftRevision: 11, updatedAt: 11 };
+    writeStoredOutboxStore(sessionStorage, target, store);
+    const state = {
+      settings: { gatewayUrl: target.gatewayOwner },
+      agentsList: { defaultId: "main", mainKey: "current", scope: "per-sender" },
+    };
+    expect(
+      retireStoredComposerDrafts(state, [{ key: "agent:main:main", retireBeforeRevision: 20 }])
+        .storageFailed,
+    ).toBe(false);
+    const retired = readStoredOutboxStore(sessionStorage, target);
+    expect(retired.sessions[original]?.draft).toBeUndefined();
+    expect(retired.sessions[original]?.draftRevision).toBeGreaterThan(20);
+    expect(retired.sessions[current]).toEqual(store.sessions[current]);
+  });
+
+  it("keeps the exact captured scope when sessionStorage retirement fails", () => {
+    const gatewayUrl = "ws://gateway.test/control";
+    const storageKey = `openclaw.control.chatComposer.v4:${encodeURIComponent(gatewayUrl)}`;
+    sessionStorage.setItem(
+      storageKey,
+      JSON.stringify({
+        version: 4,
+        recovery: {},
+        gatewayOwner: gatewayUrl,
         sessions: {
           "global\u0000agent:work": {
             draft: "retire me",
@@ -46,9 +527,12 @@ describe("stored outbox summaries", () => {
     vi.spyOn(sessionStorage, "setItem").mockImplementationOnce(() => {
       throw new DOMException("quota exceeded", "QuotaExceededError");
     });
-    const retired = retireStoredComposerDrafts({ settings: { gatewayUrl } }, [
-      { key: "workspace", retireBeforeRevision: 20 },
-    ]);
+    const retired = retireStoredComposerDrafts(
+      {
+        settings: { gatewayUrl },
+      },
+      [{ key: "global", agentId: "work", retireBeforeRevision: 20 }],
+    );
     expect(retired).toEqual({
       gatewayOwner: gatewayUrl,
       retirements: [
@@ -65,11 +549,12 @@ describe("stored outbox summaries", () => {
 
   it("retires a batch with one write and notification while preserving newer replacements", () => {
     const gatewayUrl = "ws://gateway.test/control";
-    const storageKey = `openclaw.control.chatComposer.v2:${encodeURIComponent(gatewayUrl)}`;
+    const storageKey = `openclaw.control.chatComposer.v4:${encodeURIComponent(gatewayUrl)}`;
     sessionStorage.setItem(
       storageKey,
       JSON.stringify({
-        version: 2,
+        version: 4,
+        recovery: {},
         gatewayOwner: gatewayUrl,
         sessions: {
           "older\u0000agent:main": {
@@ -112,17 +597,90 @@ describe("stored outbox summaries", () => {
     unsubscribe();
   });
 
-  it("lists only non-empty drafts under the same scope used by sidebar sessions", () => {
+  it.each([
+    {
+      name: "named sessions before defaults",
+      state: { hello: null },
+      storedKey: "thread-draft\u0000agent:main",
+      present: ["thread-draft"],
+      absent: ["agent:main:thread-draft"],
+    },
+    {
+      name: "unresolved main before defaults",
+      state: { hello: null },
+      storedKey: "main\u0000agent:@unresolved",
+      present: ["main"],
+      absent: ["agent:main:main"],
+    },
+    {
+      name: "configured default-main aliases",
+      state: {
+        assistantAgentId: "previous",
+        agentsList: { defaultId: "work", mainKey: "workspace" },
+      },
+      storedKey: "agent:work:workspace\u0000agent:work",
+      present: ["main", "workspace", "agent:work:main", "agent:work:workspace"],
+      absent: ["agent:previous:main"],
+    },
+    {
+      name: "qualified cross-agent main aliases",
+      state: { agentsList: { defaultId: "main", mainKey: "workspace" } },
+      storedKey: "agent:work:workspace\u0000agent:work",
+      present: ["agent:work:main", "agent:work:workspace"],
+      absent: ["main", "workspace", "agent:main:workspace"],
+    },
+    {
+      name: "raw global and qualified selected-agent aliases",
+      state: {
+        assistantAgentId: "work",
+        agentsList: { defaultId: "main", mainKey: "workspace", scope: "global" },
+      },
+      storedKey: "global\u0000agent:work",
+      present: ["global", "agent:work:main", "agent:work:workspace"],
+      absent: ["main", "workspace", "agent:main:main", "agent:work:global"],
+    },
+    {
+      name: "global default-main aliases with another agent selected",
+      state: {
+        assistantAgentId: "work",
+        agentsList: { defaultId: "main", mainKey: "workspace", scope: "global" },
+      },
+      storedKey: "global\u0000agent:main",
+      present: ["main", "workspace", "agent:main:main"],
+      absent: ["global", "agent:work:main"],
+    },
+    {
+      name: "qualified global-named session",
+      state: {
+        assistantAgentId: "work",
+        agentsList: { defaultId: "main", mainKey: "workspace", scope: "global" },
+      },
+      storedKey: "agent:work:global\u0000agent:work",
+      present: ["agent:work:global"],
+      absent: ["global", "main", "agent:work:main"],
+    },
+    {
+      name: "opaque qualified session casing",
+      state: { agentsList: { defaultId: "main", mainKey: "main" } },
+      storedKey: "agent:work:matrix:channel:!Room:Server\u0000agent:work",
+      present: ["agent:work:matrix:channel:!Room:Server", "Agent:Work:MATRIX:CHANNEL:!Room:Server"],
+      absent: ["agent:work:matrix:channel:!room:server"],
+    },
+  ])("queries draft and attention snapshots for $name", ({ state, storedKey, present, absent }) => {
     const gatewayUrl = "ws://gateway.test/control";
     sessionStorage.setItem(
-      `openclaw.control.chatComposer.v2:${encodeURIComponent(gatewayUrl)}`,
+      `openclaw.control.chatComposer.v4:${encodeURIComponent(gatewayUrl)}`,
       JSON.stringify({
-        version: 2,
+        version: 4,
+        recovery: {},
         gatewayOwner: gatewayUrl,
         sessions: {
-          "thread-draft\u0000agent:main": {
+          [storedKey]: {
             draft: "finish this message",
             draftRevision: 3,
+            queue: [
+              { id: "failed", text: "retry this message", createdAt: 3, sendState: "failed" },
+            ],
             updatedAt: 3,
           },
           "thread-empty\u0000agent:main": { draftRevision: 2, updatedAt: 2 },
@@ -133,11 +691,20 @@ describe("stored outbox summaries", () => {
         },
       }),
     );
-    const state = { settings: { gatewayUrl } };
+    const summary = createStoredChatOutboxReader().read({ ...state, settings: { gatewayUrl } });
+    const read = vi.spyOn(sessionStorage, "getItem");
+    sessionStorage.clear();
 
-    expect([...listStoredDraftScopes(state)]).toEqual([
-      storedChatOutboxScopeKey(resolveStoredChatOutboxScope(state, "thread-draft")),
-    ]);
+    expect(summary.total).toBe(2);
+    for (const sessionKey of present) {
+      expect(summary.hasSessionDraft(sessionKey), sessionKey).toBe(true);
+      expect(summary.attentionCountForSession(sessionKey), sessionKey).toBe(1);
+    }
+    for (const sessionKey of [...absent, "thread-empty", "thread-queue", "absent"]) {
+      expect(summary.hasSessionDraft(sessionKey), sessionKey).toBe(false);
+      expect(summary.attentionCountForSession(sessionKey), sessionKey).toBe(0);
+    }
+    expect(read).not.toHaveBeenCalled();
   });
 
   it("bridges matching storage events until the last subscriber leaves", () => {
@@ -151,7 +718,7 @@ describe("stored outbox summaries", () => {
     expect(addEventListener).toHaveBeenCalledWith("storage", expect.any(Function));
 
     window.dispatchEvent(
-      new StorageEvent("storage", { key: "openclaw.control.chatComposer.v2:gateway" }),
+      new StorageEvent("storage", { key: "openclaw.control.chatComposer.v4:gateway" }),
     );
     expect(firstListener).toHaveBeenCalledTimes(1);
     expect(secondListener).toHaveBeenCalledTimes(1);
@@ -189,106 +756,26 @@ describe("stored outbox summaries", () => {
       }),
     );
 
-    const summary = summarizeStoredChatOutboxes({
+    const summary = createStoredChatOutboxReader().read({
       settings: { gatewayUrl },
       assistantAgentId: "previous",
       agentsList: { defaultId: "work", mainKey: "main" },
     });
 
-    expect(summary.total).toBe(1);
+    expect(summary.total).toBe(0);
     expect(
-      summary.countsByScope.get(
-        storedChatOutboxScopeKey({ sessionKey: "global", agentId: "work" }),
-      ),
-    ).toBe(1);
-    expect(
-      summary.countsByScope.get(
-        storedChatOutboxScopeKey({ sessionKey: "global", agentId: "previous" }),
-      ),
-    ).toBeUndefined();
-  });
-
-  it("refreshes custom-main ownership for a later offline reload", () => {
-    const gatewayUrl = "ws://gateway.test/control";
-    const storageKey = `openclaw.control.chatComposer.v2:${encodeURIComponent(gatewayUrl)}`;
-    sessionStorage.setItem(
-      storageKey,
-      JSON.stringify({
-        version: 2,
-        gatewayOwner: gatewayUrl,
-        mainAlias: { key: "old-main", agentId: "previous" },
-        sessions: {},
-      }),
-    );
-
-    summarizeStoredChatOutboxes({
-      settings: { gatewayUrl },
-      agentsList: { defaultId: "work", mainKey: "workspace" },
-    });
-
-    expect(JSON.parse(sessionStorage.getItem(storageKey) ?? "{}").mainAlias).toEqual({
-      key: "workspace",
-      agentId: "work",
-    });
-    expect(
-      resolveStoredChatOutboxScope(
-        { settings: { gatewayUrl }, agentsList: null, hello: null },
-        "workspace",
-      ),
-    ).toEqual({ sessionKey: "global", agentId: "work" });
-  });
-
-  it("resolves legacy bare-main rows through the persisted alias on an offline reload", () => {
-    const gatewayUrl = "ws://gateway.test/control";
-    const storageKey = `openclaw.control.chatComposer.v2:${encodeURIComponent(gatewayUrl)}`;
-    sessionStorage.setItem(
-      storageKey,
-      JSON.stringify({
-        version: 2,
-        gatewayOwner: gatewayUrl,
-        mainAlias: { key: "main", agentId: "work" },
-        sessions: {
-          "main\u0000agent:previous": {
-            queue: [{ id: "queued", text: "queued", createdAt: 1 }],
-            updatedAt: 1,
-          },
-        },
-      }),
-    );
-
-    // Offline reload: no session defaults available, only the persisted alias.
-    const offlineState = { settings: { gatewayUrl }, agentsList: null, hello: null };
-    const summary = summarizeStoredChatOutboxes(offlineState);
-
-    expect(summary.total).toBe(1);
-    const sidebarScopeKey = storedChatOutboxScopeKey(
-      resolveStoredChatOutboxScope(offlineState, "main"),
-    );
-    expect(summary.countsByScope.get(sidebarScopeKey)).toBe(1);
-    expect(listStoredChatOutboxes(offlineState)).toEqual([
-      {
-        sessionKey: "global",
-        agentId: "work",
-        queue: [
-          {
-            id: "queued",
-            text: "queued",
-            createdAt: 1,
-            sessionKey: "global",
-            agentId: "work",
-          },
-        ],
-      },
-    ]);
+      readChatOutboxRecovery({ settings: { gatewayUrl } }).entries[0]?.session.queue?.[0]?.id,
+    ).toBe("queued");
   });
 
   it("rejects a v2 store owned by another gateway", () => {
     const gatewayUrl = "ws://gateway.test/control";
-    const storageKey = `openclaw.control.chatComposer.v2:${encodeURIComponent(gatewayUrl)}`;
+    const storageKey = `openclaw.control.chatComposer.v4:${encodeURIComponent(gatewayUrl)}`;
     sessionStorage.setItem(
       storageKey,
       JSON.stringify({
-        version: 2,
+        version: 4,
+        recovery: {},
         gatewayOwner: "ws://other.test/control",
         sessions: {
           "global\u0000agent:work": {
@@ -300,7 +787,7 @@ describe("stored outbox summaries", () => {
     );
 
     expect(
-      summarizeStoredChatOutboxes({
+      createStoredChatOutboxReader().read({
         settings: { gatewayUrl },
         agentsList: { defaultId: "work", mainKey: "workspace" },
       }).total,
@@ -310,43 +797,13 @@ describe("stored outbox summaries", () => {
     );
   });
 
-  it("retains custom-main aliases independently for each gateway", () => {
-    for (const [gatewayUrl, key, agentId] of [
-      ["ws://a.test/control", "workspace-a", "alpha"],
-      ["ws://b.test/control", "workspace-b", "beta"],
-    ] as const) {
-      sessionStorage.setItem(
-        `openclaw.control.chatComposer.v2:${encodeURIComponent(gatewayUrl)}`,
-        JSON.stringify({
-          version: 2,
-          gatewayOwner: gatewayUrl,
-          mainAlias: { key, agentId },
-          sessions: {},
-        }),
-      );
-      summarizeStoredChatOutboxes({ settings: { gatewayUrl }, agentsList: null, hello: null });
-    }
-
-    expect(
-      resolveStoredChatOutboxScope(
-        { settings: { gatewayUrl: "ws://a.test/control" }, agentsList: null, hello: null },
-        "workspace-a",
-      ),
-    ).toEqual({ sessionKey: "global", agentId: "alpha" });
-    expect(
-      resolveStoredChatOutboxScope(
-        { settings: { gatewayUrl: "ws://b.test/control" }, agentsList: null, hello: null },
-        "workspace-b",
-      ),
-    ).toEqual({ sessionKey: "global", agentId: "beta" });
-  });
-
   it("deduplicates item ids within a scope, not across scopes", () => {
     const gatewayUrl = "ws://gateway.test/control";
     sessionStorage.setItem(
-      `openclaw.control.chatComposer.v2:${encodeURIComponent(gatewayUrl)}`,
+      `openclaw.control.chatComposer.v4:${encodeURIComponent(gatewayUrl)}`,
       JSON.stringify({
-        version: 2,
+        version: 4,
+        recovery: {},
         gatewayOwner: gatewayUrl,
         sessions: {
           "thread-a\u0000agent:main": {
@@ -361,15 +818,13 @@ describe("stored outbox summaries", () => {
       }),
     );
 
-    const summary = summarizeStoredChatOutboxes({ settings: { gatewayUrl } });
+    const summary = createStoredChatOutboxReader().read({ settings: { gatewayUrl } });
     expect(summary.total).toBe(2);
-    expect(summary.countsByScope.get(storedChatOutboxScopeKey({ sessionKey: "thread-a" }))).toBe(1);
-    expect(summary.countsByScope.get(storedChatOutboxScopeKey({ sessionKey: "thread-b" }))).toBe(1);
   });
 
   it("counts only durable operator-review states for session-row attention", () => {
     const gatewayUrl = "ws://gateway.test/control";
-    const quietSendStates = [
+    const restoredSendStates = [
       undefined,
       "waiting-idle",
       "executing-command",
@@ -377,14 +832,15 @@ describe("stored outbox summaries", () => {
       "waiting-reconnect",
     ] as const;
     sessionStorage.setItem(
-      `openclaw.control.chatComposer.v2:${encodeURIComponent(gatewayUrl)}`,
+      `openclaw.control.chatComposer.v4:${encodeURIComponent(gatewayUrl)}`,
       JSON.stringify({
-        version: 2,
+        version: 4,
+        recovery: {},
         gatewayOwner: gatewayUrl,
         sessions: {
           "thread-a\u0000agent:main": {
             queue: [
-              ...quietSendStates.map((sendState, index) => ({
+              ...restoredSendStates.map((sendState, index) => ({
                 id: `healthy-${index}`,
                 text: `healthy ${index}`,
                 createdAt: index,
@@ -404,6 +860,13 @@ describe("stored outbox summaries", () => {
                 createdAt: 13,
                 sendState: "unconfirmed",
               },
+              {
+                id: "other-owner",
+                text: "another credential's attachment",
+                createdAt: 14,
+                sendState: "failed",
+                attachmentPayload: { key: "bundle", recoveryScope: "other-owner", tabId: "tab" },
+              },
             ],
             updatedAt: 13,
           },
@@ -422,15 +885,11 @@ describe("stored outbox summaries", () => {
       }),
     );
 
-    const summary = summarizeStoredChatOutboxes({ settings: { gatewayUrl } });
-    const threadA = storedChatOutboxScopeKey({ sessionKey: "thread-a" });
-    const threadB = storedChatOutboxScopeKey({ sessionKey: "thread-b" });
-
+    const summary = createStoredChatOutboxReader().read({ settings: { gatewayUrl } });
     expect(summary.total).toBe(8);
-    expect(summary.countsByScope.get(threadA)).toBe(7);
-    expect(summary.countsByScope.get(threadB)).toBe(1);
-    expect(summary.attentionCountsByScope.get(threadA)).toBe(2);
-    expect(summary.attentionCountsByScope.get(threadB)).toBe(1);
+    expect(summary.attentionCountForSession("thread-a")).toBe(3);
+    expect(summary.attentionCountForSession("thread-b")).toBe(1);
+    expect(summary.attentionCountForSession("absent")).toBe(0);
   });
 
   it("derives badges and replay from the same migrated durable queue", () => {
@@ -462,11 +921,10 @@ describe("stored outbox summaries", () => {
       agentsList: { defaultId: "work", mainKey: "main" },
     };
 
-    const summary = summarizeStoredChatOutboxes(state);
+    const summary = createStoredChatOutboxReader().read(state);
     const outboxes = listStoredChatOutboxes(state);
 
     expect(summary.total).toBe(1);
-    expect(summary.countsByScope.get(storedChatOutboxScopeKey(outboxes[0]!))).toBe(1);
     expect(outboxes[0]?.queue).toEqual([
       {
         id: "shared",

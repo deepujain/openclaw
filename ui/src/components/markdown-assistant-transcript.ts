@@ -1,4 +1,4 @@
-import type MarkdownIt from "markdown-it";
+import type { MarkdownIt } from "markdown-it";
 import {
   ASSISTANT_TRANSCRIPT_ROLE_NODE_TYPE,
   markdownItAssistantTranscriptRoles,
@@ -98,7 +98,7 @@ export function installAssistantTranscriptRoleImageRenderer(
     if (!token) {
       return "";
     }
-    const src = token.attrGet("src")?.trim() ?? "";
+    const src = String(token.attrGet("src") ?? "").trim();
     // token.content preserves raw Markdown formatting in image labels.
     const alt = options.normalizeLabel(token.content);
     const roleMeta = (token.meta as AssistantTranscriptRoleImageMeta | undefined)
@@ -121,16 +121,28 @@ export function installAssistantTranscriptRoleImageRenderer(
   };
 }
 
-export function renderAssistantTranscriptPlainTextFallback(
+function normalizeHtmlTextContent(value: string): string {
+  // Preserve HTML parser text normalization without reparsing the escaped body.
+  return value.replace(/\r\n?/g, "\n").replace(/\0/g, "");
+}
+
+export function createAssistantTranscriptPlainTextFallback(
   text: string,
   enabled: boolean,
   assistantLabel: () => string,
-  escapeHtml: (value: string) => string,
-): string {
-  const escaped = escapeHtml(text);
+): HTMLDivElement {
+  const container = document.createElement("div");
+  container.className = "markdown-plain-text-fallback";
   if (!enabled) {
-    return `<div class="markdown-plain-text-fallback">${escaped}</div>`;
+    container.textContent = normalizeHtmlTextContent(text);
+    return container;
   }
-  const marker = renderAssistantTranscriptRoleMarker(`${assistantLabel()}:`, escapeHtml);
-  return `<div class="markdown-plain-text-fallback">${marker}\n<span class="markdown-plain-text-source">${escaped}</span></div>`;
+  const marker = document.createElement("code");
+  marker.className = "assistant-transcript-role";
+  marker.textContent = normalizeHtmlTextContent(`${assistantLabel()}:`);
+  const source = document.createElement("span");
+  source.className = "markdown-plain-text-source";
+  source.textContent = normalizeHtmlTextContent(text);
+  container.append(marker, "\n", source);
+  return container;
 }

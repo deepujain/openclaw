@@ -1,126 +1,33 @@
 import fs from "node:fs";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
-import { useAutoCleanupTempDirTracker } from "../../../test/helpers/temp-dir.js";
+import { describe, expect, it } from "vitest";
 import {
-  closeOpenClawAgentDatabasesForTest,
-  runOpenClawAgentWriteTransaction,
-} from "../../state/openclaw-agent-db.js";
+  readSessionProgressCard,
+  writeSessionProgressCard,
+} from "../../session-cards/progress-card-store.js";
+import { runOpenClawAgentWriteTransaction } from "../../state/openclaw-agent-db.js";
 import { withExistingOpenClawStateDatabaseReadOnly } from "../../state/openclaw-state-db-readonly.js";
-import {
-  closeOpenClawStateDatabaseForTest,
-  runOpenClawStateWriteTransaction,
-} from "../../state/openclaw-state-db.js";
+import { runOpenClawStateWriteTransaction } from "../../state/openclaw-state-db.js";
 import { resolveOpenClawStateSqlitePath } from "../../state/openclaw-state-db.paths.js";
 import type { OpenClawConfig } from "../types.openclaw.js";
 import { migrateLegacyMainSessionKeys } from "./legacy-main-session-migration.js";
-import { assignSessionOwner } from "./session-accessor.js";
-import { readExactSessionEntryRowForCanonicalRepair } from "./session-accessor.sqlite-canonical-repair.js";
-import { writeSessionEntry } from "./session-accessor.sqlite-entry-store.js";
-import { readTranscriptEventRows } from "./session-accessor.sqlite-read.js";
-import { appendTranscriptEventInTransaction } from "./session-accessor.sqlite-transcript-store.js";
+import {
+  assignHumanOwner,
+  databasePath,
+  humanOwner,
+  outcomeKinds,
+  readClaim,
+  recordHarnessDeletions,
+  seedClaim,
+  setupLegacyMainSessionMigrationTests,
+} from "./legacy-main-session-migration.test-support.js";
 import type { SessionEntry } from "./types.js";
 
-const tempDirs = useAutoCleanupTempDirTracker(afterEach);
-const humanOwner = {
-  actor: { type: "human", id: "alice" },
-  assignedBy: { type: "human", id: "bob" },
-  assignedAt: 123,
-} as const;
-
-type Fixture = {
-  cfg: OpenClawConfig;
-  env: NodeJS.ProcessEnv;
-  stateDir: string;
-};
+const { tempDirs, createFixture } = setupLegacyMainSessionMigrationTests();
 
 type LegacyMainSessionMigrationOutcomeKind = Awaited<
   ReturnType<typeof migrateLegacyMainSessionKeys>
 >["outcomes"][number]["kind"];
-
-function createFixture(cfg: OpenClawConfig = { agents: { entries: { ops: {} } } }): Fixture {
-  const rawRoot = tempDirs.make("openclaw-legacy-main-session-");
-  const root = fs.realpathSync.native(rawRoot);
-  const stateDir = path.join(root, "state");
-  fs.mkdirSync(stateDir, { recursive: true });
-  return {
-    cfg,
-    env: { ...process.env, OPENCLAW_AGENT_DIR: undefined, OPENCLAW_STATE_DIR: stateDir },
-    stateDir,
-  };
-}
-
-function databasePath(stateDir: string, agentId: string): string {
-  return path.join(stateDir, "agents", agentId, "agent", "openclaw-agent.sqlite");
-}
-
-function assignHumanOwner(storePath: string): void {
-  expect(
-    assignSessionOwner(
-      { agentId: "main", sessionKey: "agent:main:chat", storePath },
-      {
-        owner: humanOwner.actor,
-        assignedBy: humanOwner.assignedBy,
-        assignedAt: humanOwner.assignedAt,
-      },
-    ),
-  ).toEqual(humanOwner);
-}
-
-function seedClaim(params: {
-  databaseAgentId: string;
-  databasePath: string;
-  entry?: SessionEntry;
-  events?: unknown[];
-  key: string;
-}): SessionEntry {
-  const entry = params.entry ?? {
-    sessionId: `session-${params.key.replaceAll(":", "-")}`,
-    updatedAt: 100,
-  };
-  runOpenClawAgentWriteTransaction(
-    (database) => {
-      writeSessionEntry(database, params.key, entry, {
-        allowStoredAliases: true,
-        previousEntry: null,
-      });
-      for (const event of params.events ?? [{ type: "message", id: "event-1", text: "hello" }]) {
-        appendTranscriptEventInTransaction(
-          database,
-          {
-            agentId: params.databaseAgentId,
-            path: params.databasePath,
-            sessionId: entry.sessionId,
-            sessionKey: params.key,
-          },
-          event,
-          { allowStoredAlias: true },
-        );
-      }
-    },
-    { agentId: params.databaseAgentId, path: params.databasePath },
-  );
-  return entry;
-}
-
-function readClaim(params: { databaseAgentId: string; databasePath: string; key: string }) {
-  return runOpenClawAgentWriteTransaction(
-    (database) => {
-      const entry = readExactSessionEntryRowForCanonicalRepair(database, params.key)?.entry;
-      return entry
-        ? {
-            entry,
-            events: readTranscriptEventRows(database, entry.sessionId).map((row) => row.eventJson),
-          }
-        : undefined;
-    },
-    { agentId: params.databaseAgentId, path: params.databasePath },
-  );
-}
-
-function outcomeKinds(result: Awaited<ReturnType<typeof migrateLegacyMainSessionKeys>>) {
-  return result.outcomes.map((outcome) => outcome.kind);
-}
 
 function setLedgerStatus(env: NodeJS.ProcessEnv, status: string): void {
   runOpenClawStateWriteTransaction(
@@ -146,11 +53,6 @@ function readLedgerReport(env: NodeJS.ProcessEnv): unknown {
     { env },
   );
 }
-
-afterEach(() => {
-  closeOpenClawAgentDatabasesForTest();
-  closeOpenClawStateDatabaseForTest();
-});
 
 describe("legacy main session migration", () => {
   const closedOutcomeCases = [
@@ -214,7 +116,7 @@ describe("legacy main session migration", () => {
         const result = await migrateLegacyMainSessionKeys({
           cfg: fixture.cfg,
           env: fixture.env,
-          mode: "automatic",
+          mode: "doctor-fix",
         });
         expect(
           readClaim({
@@ -246,7 +148,7 @@ describe("legacy main session migration", () => {
         return await migrateLegacyMainSessionKeys({
           cfg: fixture.cfg,
           env: fixture.env,
-          mode: "automatic",
+          mode: "doctor-fix",
         });
       },
     },
@@ -269,7 +171,7 @@ describe("legacy main session migration", () => {
         return await migrateLegacyMainSessionKeys({
           cfg: fixture.cfg,
           env: fixture.env,
-          mode: "automatic",
+          mode: "detect",
         });
       },
     },
@@ -296,7 +198,7 @@ describe("legacy main session migration", () => {
         const result = await migrateLegacyMainSessionKeys({
           cfg: fixture.cfg,
           env: fixture.env,
-          mode: "automatic",
+          mode: "detect",
         });
         expect(
           readClaim({
@@ -375,7 +277,7 @@ describe("legacy main session migration", () => {
     const result = await migrateLegacyMainSessionKeys({
       cfg: fixture.cfg,
       env: fixture.env,
-      mode: "automatic",
+      mode: "detect",
     });
 
     expect(outcomeKinds(result)).toContain("divergent-canonical");
@@ -403,107 +305,88 @@ describe("legacy main session migration", () => {
       session: { store: storePath },
     });
     seedClaim({ databaseAgentId: "main", databasePath: storePath, key: "agent:main:chat" });
+    runOpenClawAgentWriteTransaction(
+      (database) => {
+        writeSessionProgressCard(database.db, "agent:main:chat", {
+          markdown: "Keep working on the existing task",
+        });
+        database.db
+          .prepare(
+            "INSERT INTO heartbeat_outcomes (session_key, run_session_key, outcome, summary, occurred_at, updated_at) VALUES (?, ?, 'progress', 'Still working', 10, 10)",
+          )
+          .run("agent:main:chat", "agent:main:chat");
+      },
+      { agentId: "main", path: storePath },
+    );
 
-    const result = await migrateLegacyMainSessionKeys({
-      cfg: fixture.cfg,
-      env: fixture.env,
-      mode: "automatic",
-    });
+    const { result, committed } = await recordHarnessDeletions(() =>
+      migrateLegacyMainSessionKeys({
+        cfg: fixture.cfg,
+        env: fixture.env,
+        mode: "doctor-fix",
+      }),
+    );
 
     expect(outcomeKinds(result)).toContain("migrated-in-place");
+    expect(committed).toEqual(["agent:main:chat"]);
     expect(
       readClaim({ databaseAgentId: "main", databasePath: storePath, key: "agent:main:chat" }),
     ).toBeUndefined();
     expect(
       readClaim({ databaseAgentId: "main", databasePath: storePath, key: "agent:ops:chat" }),
     ).toBeDefined();
+    const migratedArtifacts = runOpenClawAgentWriteTransaction(
+      (database) => ({
+        heartbeat: database.db
+          .prepare("SELECT session_key, run_session_key FROM heartbeat_outcomes")
+          .get(),
+        progressCard: readSessionProgressCard(database.db, "agent:ops:chat"),
+      }),
+      { agentId: "main", path: storePath },
+    );
+    expect(migratedArtifacts).toMatchObject({
+      heartbeat: { session_key: "agent:ops:chat", run_session_key: "agent:ops:chat" },
+      progressCard: {
+        markdown: "Keep working on the existing task",
+        revision: 1,
+        sessionKey: "agent:ops:chat",
+      },
+    });
   });
 
-  it.each([
-    { kind: "migrated-in-place", sharedStore: true },
-    { kind: "migrated-cross-store", sharedStore: false },
-  ])("preserves the assigned human owner when $kind", async ({ kind, sharedStore }) => {
-    const storePath = sharedStore
-      ? path.join(tempDirs.make("owned-in-place-migration-"), "sessions.sqlite")
-      : undefined;
+  it("preserves a canonical owner created while alias deletion is preparing", async () => {
+    const storePath = path.join(tempDirs.make("in-place-owner-race-"), "sessions.sqlite");
     const fixture = createFixture({
       agents: { entries: { ops: {} } },
-      ...(storePath ? { session: { store: storePath } } : {}),
+      session: { store: storePath },
     });
-    const sourcePath = storePath ?? databasePath(fixture.stateDir, "main");
-    seedClaim({ databaseAgentId: "main", databasePath: sourcePath, key: "agent:main:chat" });
-    assignHumanOwner(sourcePath);
+    const sourceTarget = {
+      databaseAgentId: "main",
+      databasePath: storePath,
+      key: "agent:main:chat",
+    };
+    const canonicalTarget = { ...sourceTarget, key: "agent:ops:chat" };
+    seedClaim(sourceTarget);
+    const sourceBefore = readClaim(sourceTarget);
+    let canonicalBefore: ReturnType<typeof readClaim>;
 
-    const result = await migrateLegacyMainSessionKeys({
-      cfg: fixture.cfg,
-      env: fixture.env,
-      mode: "automatic",
-    });
+    const { result, committed } = await recordHarnessDeletions(
+      () =>
+        migrateLegacyMainSessionKeys({ cfg: fixture.cfg, env: fixture.env, mode: "doctor-fix" }),
+      () => {
+        seedClaim({
+          ...canonicalTarget,
+          entry: { sessionId: "concurrent-owner", updatedAt: 200 },
+          events: [{ type: "message", id: "concurrent-event" }],
+        });
+        canonicalBefore = readClaim(canonicalTarget);
+      },
+    );
 
-    expect(result.complete).toBe(true);
-    expect(outcomeKinds(result)).toContain(kind);
-    expect(
-      readClaim({
-        databaseAgentId: sharedStore ? "main" : "ops",
-        databasePath: storePath ?? databasePath(fixture.stateDir, "ops"),
-        key: "agent:ops:chat",
-      })?.entry.owner,
-    ).toEqual(humanOwner);
-    expect(
-      readClaim({ databaseAgentId: "main", databasePath: sourcePath, key: "agent:main:chat" }),
-    ).toBeUndefined();
-  });
-
-  it.each([
-    { copiedBeforeCrash: true, label: "copy committed before source cleanup" },
-    { copiedBeforeCrash: false, label: "source cleanup committed before ledger" },
-  ])("converges when $label", async ({ copiedBeforeCrash }) => {
-    const fixture = createFixture();
-    const entry: SessionEntry = { sessionId: "crash-window", updatedAt: 100 };
-    if (copiedBeforeCrash) {
-      seedClaim({
-        databaseAgentId: "main",
-        databasePath: databasePath(fixture.stateDir, "main"),
-        entry,
-        key: "agent:main:chat",
-      });
-    }
-    seedClaim({
-      databaseAgentId: "ops",
-      databasePath: databasePath(fixture.stateDir, "ops"),
-      entry,
-      key: "agent:ops:chat",
-    });
-
-    const converged = await migrateLegacyMainSessionKeys({
-      cfg: fixture.cfg,
-      env: fixture.env,
-      mode: "automatic",
-    });
-    const ledgerRerun = await migrateLegacyMainSessionKeys({
-      cfg: fixture.cfg,
-      env: fixture.env,
-      mode: "automatic",
-    });
-
-    expect(converged.complete).toBe(true);
-    expect(
-      readClaim({
-        databaseAgentId: "main",
-        databasePath: databasePath(fixture.stateDir, "main"),
-        key: "agent:main:chat",
-      }),
-    ).toBeUndefined();
-    expect(
-      readClaim({
-        databaseAgentId: "ops",
-        databasePath: databasePath(fixture.stateDir, "ops"),
-        key: "agent:ops:chat",
-      }),
-    ).toBeDefined();
-    expect(ledgerRerun.outcomes).toEqual([
-      { kind: "no-legacy-rows", detail: "matching completed ledger" },
-    ]);
+    expect(readClaim(canonicalTarget)).toEqual(canonicalBefore);
+    expect(readClaim(sourceTarget)).toEqual(sourceBefore);
+    expect(committed).toEqual([]);
+    expect(result.complete).toBe(false);
   });
 
   it.each([false, true])(
@@ -533,12 +416,15 @@ describe("legacy main session migration", () => {
         key: "agent:ops:chat",
       });
 
-      const result = await migrateLegacyMainSessionKeys({
-        cfg: fixture.cfg,
-        env: fixture.env,
-        mode: "doctor-fix",
-      });
+      const { result, committed } = await recordHarnessDeletions(() =>
+        migrateLegacyMainSessionKeys({
+          cfg: fixture.cfg,
+          env: fixture.env,
+          mode: "doctor-fix",
+        }),
+      );
 
+      expect(committed).toEqual(["agent:main:chat"]);
       const outcome = result.outcomes.find((entry) => entry.kind === "divergent-canonical");
       expect(outcome?.quarantinedKeys).toEqual(["agent:ops:legacy-main-conflict-2"]);
       expect(
@@ -559,13 +445,13 @@ describe("legacy main session migration", () => {
     const first = await migrateLegacyMainSessionKeys({
       cfg: fixture.cfg,
       env: fixture.env,
-      mode: "automatic",
+      mode: "doctor-fix",
       now: () => 100,
     });
     const second = await migrateLegacyMainSessionKeys({
       cfg: fixture.cfg,
       env: fixture.env,
-      mode: "automatic",
+      mode: "detect",
       now: () => 200,
     });
     expect(readLedgerReport(fixture.env)).toMatchObject({
@@ -688,7 +574,7 @@ describe("legacy main session migration", () => {
     const result = await migrateLegacyMainSessionKeys({
       cfg: fixture.cfg,
       env: fixture.env,
-      mode: "automatic",
+      mode: "detect",
     });
 
     expect(result).toMatchObject({
@@ -714,7 +600,7 @@ describe("legacy main session migration", () => {
     const result = await migrateLegacyMainSessionKeys({
       cfg: fixture.cfg,
       env: fixture.env,
-      mode: "automatic",
+      mode: "doctor-fix",
     });
 
     expect(result).toMatchObject({ armed: true, complete: true, ownerAgentId: "ops" });
@@ -730,9 +616,9 @@ describe("legacy main session migration", () => {
     ).toBeDefined();
   });
 
-  it("keeps automatic detection non-throwing for unreadable stores and treats ENOENT as absence", async () => {
+  it("keeps detection non-throwing for unreadable stores and treats ENOENT as absence", async () => {
     const absent = createFixture();
-    const unreadablePath = path.join(tempDirs.make("automatic-unreadable-"), "sessions.sqlite");
+    const unreadablePath = path.join(tempDirs.make("detect-unreadable-"), "sessions.sqlite");
     fs.symlinkSync(`${unreadablePath}.missing`, unreadablePath);
     const unreadable = createFixture({
       agents: { entries: { ops: {} } },
@@ -742,12 +628,12 @@ describe("legacy main session migration", () => {
     const absentResult = await migrateLegacyMainSessionKeys({
       cfg: absent.cfg,
       env: absent.env,
-      mode: "automatic",
+      mode: "detect",
     });
     const unreadableResult = await migrateLegacyMainSessionKeys({
       cfg: unreadable.cfg,
       env: unreadable.env,
-      mode: "automatic",
+      mode: "detect",
     });
 
     expect(absentResult).toMatchObject({ complete: true, outcomes: [{ kind: "no-legacy-rows" }] });
@@ -762,7 +648,7 @@ describe("legacy main session migration", () => {
     ).rejects.toThrow(`cannot read legacy session store ${unreadablePath}`);
   });
 
-  it("keeps automatic mode report-only while a legacy JSON candidate blocks inspection", async () => {
+  it("keeps detection read-only while a legacy JSON candidate blocks inspection", async () => {
     const fixture = createFixture();
     const mainPath = databasePath(fixture.stateDir, "main");
     seedClaim({ databaseAgentId: "main", databasePath: mainPath, key: "agent:main:chat" });
@@ -773,7 +659,7 @@ describe("legacy main session migration", () => {
     const result = await migrateLegacyMainSessionKeys({
       cfg: fixture.cfg,
       env: fixture.env,
-      mode: "automatic",
+      mode: "detect",
     });
 
     expect(outcomeKinds(result)).toContain("legacy-json-store");
@@ -810,7 +696,7 @@ describe("legacy main session migration", () => {
     const result = await migrateLegacyMainSessionKeys({
       cfg: fixture.cfg,
       env,
-      mode: "automatic",
+      mode: "doctor-fix",
     });
 
     expect(

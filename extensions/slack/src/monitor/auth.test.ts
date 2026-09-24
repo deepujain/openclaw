@@ -1,7 +1,15 @@
 import { WebAPIPlatformError, WebAPIRequestError } from "@slack/web-api";
+import { createPluginRuntimeMock } from "openclaw/plugin-sdk/channel-test-helpers";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { setSlackRuntime } from "../runtime.js";
 import type { SlackMonitorContext } from "./context.js";
 
+const participantDescriptors = vi.hoisted(
+  () =>
+    [] as Array<
+      import("openclaw/plugin-sdk/channel-ingress-runtime").ChannelIngressIdentityDescriptor
+    >,
+);
 const readChannelIngressStoreAllowFromForDmPolicyMock = vi.hoisted(() => vi.fn());
 let authorizeSlackBotRoomMessage: typeof import("./auth.js").authorizeSlackBotRoomMessage;
 let authorizeSlackSystemEventSender: typeof import("./auth.js").authorizeSlackSystemEventSender;
@@ -20,6 +28,7 @@ beforeAll(async () => {
 });
 
 beforeEach(() => {
+  setSlackRuntime(createPluginRuntimeMock());
   readChannelIngressStoreAllowFromForDmPolicyMock.mockReset();
   delete process.env.OPENCLAW_SLACK_CHANNEL_MEMBERS_CACHE_TTL_MS;
 });
@@ -34,6 +43,13 @@ vi.mock("openclaw/plugin-sdk/channel-ingress-runtime", async () => {
   >("openclaw/plugin-sdk/channel-ingress-runtime");
   return {
     ...actual,
+    defineStableChannelIngressIdentity: (
+      params: Parameters<typeof actual.defineStableChannelIngressIdentity>[0],
+    ) => {
+      const identity = actual.defineStableChannelIngressIdentity(params);
+      participantDescriptors.push(identity);
+      return identity;
+    },
     readChannelIngressStoreAllowFromForDmPolicy: (...args: unknown[]) =>
       readChannelIngressStoreAllowFromForDmPolicyMock(...args),
   };
@@ -75,10 +91,11 @@ function makeAuthorizeCtx(params?: {
     },
     isChannelAllowed: vi.fn(params?.isChannelAllowed ?? (() => true)),
     resolveUserName: vi.fn(
-      params?.resolveUserName ?? ((_) => Promise.resolve({ name: undefined })),
+      params?.resolveUserName ?? ((_userId) => Promise.resolve({ name: undefined })),
     ),
     resolveChannelName: vi.fn(
-      params?.resolveChannelName ?? ((_) => Promise.resolve({ name: "general", type: "channel" })),
+      params?.resolveChannelName ??
+        ((_channelId) => Promise.resolve({ name: "general", type: "channel" })),
     ),
   } as unknown as SlackMonitorContext;
 }
@@ -511,6 +528,21 @@ describe("authorizeSlackSystemEventSender", () => {
 });
 
 describe("resolveSlackCommandIngress", () => {
+  it("matches a slugged allowlist entry against a spaced sender name", async () => {
+    const result = await resolveSlackCommandIngress({
+      ctx: makeAuthorizeCtx({ allowNameMatching: true }),
+      senderId: "U123",
+      senderName: "Alice Smith",
+      channelId: "D123",
+      channelType: "im",
+      ownerAllowFromLower: ["alice-smith"],
+      allowTextCommands: true,
+      hasControlCommand: true,
+    });
+
+    expect(result.commandAccess.authorized).toBe(true);
+  });
+
   it.each([
     ["allows the workspace-qualified user in its workspace", "T11111111", "allow", true],
     ["blocks the same bare user ID in another workspace", "T22222222", "block", false],
@@ -692,3 +724,20 @@ describe("authorizeSlackSystemEventSender interactiveEvent", () => {
     ).resolves.toEqual(expected);
   });
 });
+
+it.each([
+  ["team:t001:user:u123", { domain: "t001", idKind: "user-id", id: "u123" }],
+  ["team:t002:user:u123", { domain: "t002", idKind: "user-id", id: "u123" }],
+  ["team:t001:user:b123", { domain: "t001", idKind: "bot-id", id: "b123" }],
+  ["team:t_invalid:user:u123", undefined],
+  [undefined, undefined],
+] as const)(
+  "qualifies Slack participant identity from workspace evidence %s",
+  (workspaceSenderId, expected) => {
+    expect(
+      participantDescriptors
+        .at(-1)
+        ?.resolveParticipant?.({ stableId: "u123", aliases: { workspaceSenderId } }),
+    ).toEqual(expected);
+  },
+);

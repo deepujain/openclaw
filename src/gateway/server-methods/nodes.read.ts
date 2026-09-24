@@ -9,8 +9,9 @@ import {
 } from "../../../packages/gateway-protocol/src/index.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { updatePairedNodeSessionHost } from "../../infra/device-pairing-node-facts.js";
-import { projectNodePairing } from "../../infra/device-pairing-node.js";
-import { listDevicePairing, resolveNodePairingState } from "../../infra/device-pairing.js";
+import { projectPairedDeviceNodeBindings } from "../../infra/device-pairing-node-state.js";
+import { listNodePairing, projectNodePairing } from "../../infra/device-pairing-node.js";
+import { listDevicePairing } from "../../infra/device-pairing.js";
 import { formatErrorMessage } from "../../infra/errors.js";
 import {
   formatNodeRunnerUpdateRequired,
@@ -20,14 +21,10 @@ import {
 } from "../../infra/node-runner-inventory.js";
 import { resolveLocalNodeId } from "../../node-host/local-id.js";
 import type { NodeListNode } from "../../shared/node-list-types.js";
-import { replaceRemoteNodeSkills } from "../../skills/runtime/remote-skills.js";
 import { recordRemoteNodeInfo, refreshRemoteNodeBins } from "../../skills/runtime/remote.js";
 import { createKnownNodeCatalog, getKnownNode, listKnownNodes } from "../node-catalog.js";
 import {
-  collectNodeRunnerIssuesByNodeId,
-  collectNodeWorkerBundleStatusByNodeId,
-  collectNodeWorkerCapacityByNodeId,
-  isNodeRunnerSessionHost,
+  collectNodeCatalogRuntimeState,
   updateNodeRunnerInventory,
 } from "../node-registry-private.js";
 import type { NodeSession } from "../node-registry.js";
@@ -37,9 +34,10 @@ import {
   refreshClientPluginNodeCapability,
 } from "../plugin-node-capability.js";
 import { nodeInvokePolicy } from "./nodes-policy.js";
-import { respondInvalidParams, respondUnavailableOnThrow } from "./nodes.helpers.js";
+import { respondUnavailableOnThrow } from "./response.js";
 import type { GatewayClient, GatewayRequestContext, RespondFn } from "./shared-types.js";
 import type { GatewayRequestHandler, GatewayRequestHandlers } from "./types.js";
+import { assertValidParams } from "./validation.js";
 
 function safeNodeReadProjection(
   node: NodeListNode,
@@ -74,58 +72,23 @@ function isVisibleNode(node: NodeListNode | null): node is NodeListNode {
   return node !== null;
 }
 
-function currentSessionHostNodeIds(params: {
-  connectedNodes: readonly NodeSession[];
-  nodeRegistry: GatewayRequestContext["nodeRegistry"];
-}): Set<string> {
-  return new Set(
-    params.connectedNodes.flatMap((node) =>
-      isNodeRunnerSessionHost({
-        registry: params.nodeRegistry,
-        nodeId: node.nodeId,
-        connId: node.connId,
-        pairingGeneration: node.pairingGeneration,
-      })
-        ? [node.nodeId]
-        : [],
-    ),
-  );
-}
-
 async function listNodesForClient(params: {
   client: GatewayClient | null;
   context: GatewayRequestContext;
   nodeId?: string;
-  pairedDevices: Awaited<ReturnType<typeof listDevicePairing>>["paired"];
-  pairedNodes: ReturnType<typeof projectNodePairing>["paired"];
-  pendingNodes: ReturnType<typeof projectNodePairing>["pending"];
-  connectedNodes: readonly NodeSession[];
-}): Promise<NodeListNode[]> {
-  const sessionHostNodeIds = currentSessionHostNodeIds({
-    connectedNodes: params.connectedNodes,
-    nodeRegistry: params.context.nodeRegistry,
-  });
-  const issuesByNodeId = collectNodeRunnerIssuesByNodeId(
-    params.context.nodeRegistry,
-    params.connectedNodes,
+}): Promise<{ nodes: NodeListNode[]; connectedNodes: NodeSession[] }> {
+  const devicePairing = await listDevicePairing();
+  const nodePairing = projectNodePairing(devicePairing.paired);
+  const connectedNodes = params.context.nodeRegistry.listConnectedForPairingStates(
+    projectPairedDeviceNodeBindings(devicePairing.paired),
   );
-  const workerSlotsByNodeId = collectNodeWorkerCapacityByNodeId(
-    params.context.nodeRegistry,
-    params.connectedNodes,
-  );
-  const workerBundleByNodeId = collectNodeWorkerBundleStatusByNodeId(
-    params.context.nodeRegistry,
-    params.connectedNodes,
-  );
+  const runtimeState = collectNodeCatalogRuntimeState(params.context.nodeRegistry, connectedNodes);
   const catalog = createKnownNodeCatalog({
-    pairedDevices: params.pairedDevices,
-    pairedNodes: params.pairedNodes,
-    pendingNodes: params.pendingNodes,
-    connectedNodes: params.connectedNodes,
-    sessionHostNodeIds,
-    workerSlotsByNodeId,
-    workerBundleByNodeId,
-    issuesByNodeId,
+    pairedDevices: devicePairing.paired,
+    pairedNodes: nodePairing.paired,
+    pendingNodes: nodePairing.pending,
+    connectedNodes,
+    ...runtimeState,
   });
   const localNodeId = await resolveLocalNodeId().catch((error: unknown) => {
     params.context.logGateway.warn(
@@ -140,27 +103,13 @@ async function listNodesForClient(params: {
     node.nodeId === localNodeId ? Object.assign({}, node, { gatewayLocal: true }) : node,
   );
   if (nodeInvokePolicy.canReadPendingNodePairing(params.client)) {
-    return nodes;
+    return { nodes, connectedNodes };
   }
   const ownDeviceId = nodeReadCallerDeviceId(params.client);
-  return nodes.map((node) => safeNodeReadProjection(node, ownDeviceId)).filter(isVisibleNode);
-}
-
-function listCurrentConnectedNodes(
-  context: GatewayRequestContext,
-  pairedDevices: Awaited<ReturnType<typeof listDevicePairing>>["paired"],
-): NodeSession[] {
-  const currentPairingStates = new Map<string, { identity: string; generation?: string }>();
-  for (const device of pairedDevices) {
-    const state = resolveNodePairingState(device);
-    if (state) {
-      currentPairingStates.set(state.identity.nodeId, {
-        identity: state.identity.key,
-        ...(state.generation ? { generation: state.generation.key } : {}),
-      });
-    }
-  }
-  return context.nodeRegistry.listConnectedForPairingStates(currentPairingStates);
+  return {
+    nodes: nodes.map((node) => safeNodeReadProjection(node, ownDeviceId)).filter(isVisibleNode),
+    connectedNodes,
+  };
 }
 
 function normalizePluginSurfaceRefreshParams(
@@ -281,25 +230,13 @@ export function refreshConnectedNodeSurfaceCaches(params: {
 
 export const nodeReadHandlers: GatewayRequestHandlers = {
   "node.list": async ({ params, respond, client, context }) => {
-    if (!validateNodeListParams(params)) {
-      respondInvalidParams({
-        respond,
-        method: "node.list",
-        validator: validateNodeListParams,
-      });
+    if (!assertValidParams(params, validateNodeListParams, "node.list", respond)) {
       return;
     }
     await respondUnavailableOnThrow(respond, async () => {
-      const devicePairing = await listDevicePairing();
-      const nodePairing = projectNodePairing(devicePairing.paired);
-      const connectedNodes = listCurrentConnectedNodes(context, devicePairing.paired);
-      const nodes = await listNodesForClient({
+      const { nodes, connectedNodes } = await listNodesForClient({
         client,
         context,
-        pairedDevices: devicePairing.paired,
-        pairedNodes: nodePairing.paired,
-        pendingNodes: nodePairing.pending,
-        connectedNodes,
       });
       const activeNodeId = context.nodeRegistry.getActiveNode(connectedNodes)?.nodeId;
       const nodesWithPresence = activeNodeId
@@ -309,32 +246,20 @@ export const nodeReadHandlers: GatewayRequestHandlers = {
     });
   },
   "node.describe": async ({ params, respond, client, context }) => {
-    if (!validateNodeDescribeParams(params)) {
-      respondInvalidParams({
-        respond,
-        method: "node.describe",
-        validator: validateNodeDescribeParams,
-      });
+    if (!assertValidParams(params, validateNodeDescribeParams, "node.describe", respond)) {
       return;
     }
-    const { nodeId } = params as { nodeId: string };
+    const { nodeId } = params;
     const id = normalizeOptionalString(nodeId) ?? "";
     if (!id) {
       respond(false, undefined, errorShape(ErrorCodes.INVALID_REQUEST, "nodeId required"));
       return;
     }
     await respondUnavailableOnThrow(respond, async () => {
-      const devicePairing = await listDevicePairing();
-      const nodePairing = projectNodePairing(devicePairing.paired);
-      const connectedNodes = listCurrentConnectedNodes(context, devicePairing.paired);
-      const nodes = await listNodesForClient({
+      const { nodes, connectedNodes } = await listNodesForClient({
         client,
         context,
         nodeId: id,
-        pairedDevices: devicePairing.paired,
-        pairedNodes: nodePairing.paired,
-        pendingNodes: nodePairing.pending,
-        connectedNodes,
       });
       const node = nodes[0];
       if (!node) {
@@ -357,12 +282,14 @@ export const nodeReadHandlers: GatewayRequestHandlers = {
   "plugin.surface.refresh": handlePluginSurfaceRefresh,
   "node.pluginSurface.refresh": handlePluginSurfaceRefresh,
   "node.pluginTools.update": async ({ params, respond, client, context }) => {
-    if (!validateNodePluginToolsUpdateParams(params)) {
-      respondInvalidParams({
+    if (
+      !assertValidParams(
+        params,
+        validateNodePluginToolsUpdateParams,
+        "node.pluginTools.update",
         respond,
-        method: "node.pluginTools.update",
-        validator: validateNodePluginToolsUpdateParams,
-      });
+      )
+    ) {
       return;
     }
     const nodeId = normalizeOptionalString(
@@ -384,12 +311,7 @@ export const nodeReadHandlers: GatewayRequestHandlers = {
     respond(true, { nodeId, tools: updated.nodePluginTools }, undefined);
   },
   "node.skills.update": async ({ params, respond, client, context }) => {
-    if (!validateNodeSkillsUpdateParams(params)) {
-      respondInvalidParams({
-        respond,
-        method: "node.skills.update",
-        validator: validateNodeSkillsUpdateParams,
-      });
+    if (!assertValidParams(params, validateNodeSkillsUpdateParams, "node.skills.update", respond)) {
       return;
     }
     const nodeId = normalizeOptionalString(
@@ -404,11 +326,6 @@ export const nodeReadHandlers: GatewayRequestHandlers = {
       respond(false, undefined, errorShape(ErrorCodes.INVALID_REQUEST, "unknown nodeId"));
       return;
     }
-    replaceRemoteNodeSkills({
-      nodeId,
-      displayName: updated.displayName,
-      skills: updated.nodeSkills,
-    });
     respond(true, { nodeId, skills: updated.nodeSkills }, undefined);
   },
   "node.runnerInventory.update": async ({ params, respond, client, context }) => {
@@ -455,9 +372,17 @@ export const nodeReadHandlers: GatewayRequestHandlers = {
         ? currentSession.pairingGeneration
         : undefined;
     if (!connId || !pairingGeneration) {
+      // A registered session without a pairing generation usually means the
+      // node's capability surface is still awaiting operator approval; name
+      // that state and the exact approve command instead of a generic retry.
+      const pendingSurface = nodeId
+        ? (await listNodePairing()).pending.find((entry) => entry.nodeId === nodeId)
+        : undefined;
       respondRunnerInventoryRetry(
         respond,
-        "node runner inventory publication is not current; retry after pairing completes",
+        pendingSurface
+          ? `node capability surface is awaiting operator approval; run \`openclaw nodes approve ${pendingSurface.requestId}\` (see \`openclaw nodes pending\`), then this node retries automatically`
+          : "node runner inventory publication is not current; retry after pairing completes",
       );
       return;
     }

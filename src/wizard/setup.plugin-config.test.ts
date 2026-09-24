@@ -341,7 +341,9 @@ describe("setupPluginConfig", () => {
         intro: vi.fn(async () => {}),
         outro: vi.fn(async () => {}),
         note: vi.fn(async () => {}),
-        select: vi.fn(async () => "llm-context") as unknown as WizardPrompter["select"],
+        select: vi.fn(
+          async (params: { options: Array<{ value: unknown }> }) => params.options[1]?.value,
+        ) as unknown as WizardPrompter["select"],
         multiselect: vi.fn(async () => ["brave"]) as unknown as WizardPrompter["multiselect"],
         text: vi.fn(async () => ""),
         confirm: vi.fn(async () => true),
@@ -355,6 +357,160 @@ describe("setupPluginConfig", () => {
       },
     });
     expect(result.plugins?.entries?.brave?.config?.["webSearch.mode"]).toBeUndefined();
+  });
+
+  it.each([
+    {
+      name: "number",
+      values: [1, 2],
+      selectedIndex: 1,
+      expected: 2,
+      expectedLabels: ["1", "2"],
+    },
+    {
+      name: "boolean",
+      values: [true, false],
+      selectedIndex: 1,
+      expected: false,
+      expectedLabels: ["true", "false"],
+    },
+    {
+      name: "object",
+      values: [{ mode: "first" }, { mode: "second" }],
+      selectedIndex: 1,
+      expected: { mode: "second" },
+      expectedLabels: ['{"mode":"first"}', '{"mode":"second"}'],
+    },
+    {
+      name: "mixed type",
+      values: [1, "1", null],
+      selectedIndex: 1,
+      expected: "1",
+      expectedLabels: ["1", '"1"', "null"],
+    },
+  ])(
+    "preserves and labels a selected $name enum value",
+    async ({ values, selectedIndex, expected, expectedLabels }) => {
+      const pluginId = "typed-enum";
+      loadPluginManifestRegistryCore.mockReturnValue({
+        plugins: [
+          makeManifestPlugin(
+            pluginId,
+            { choice: { label: "Choice" } },
+            {
+              type: "object",
+              properties: {
+                choice: { enum: values },
+              },
+            },
+          ),
+        ],
+      });
+      const select = vi.fn(
+        async (params: { options: Array<{ value: unknown }> }) =>
+          params.options[selectedIndex]?.value,
+      );
+
+      const result = await setupPluginConfig({
+        config: { plugins: { entries: { [pluginId]: { enabled: true } } } },
+        prompter: {
+          intro: vi.fn(async () => {}),
+          outro: vi.fn(async () => {}),
+          note: vi.fn(async () => {}),
+          select: select as unknown as WizardPrompter["select"],
+          multiselect: vi.fn(async () => [pluginId]) as unknown as WizardPrompter["multiselect"],
+          text: vi.fn(async () => ""),
+          confirm: vi.fn(async () => true),
+          progress: vi.fn(() => ({ update: vi.fn(), stop: vi.fn() })),
+        },
+      });
+
+      expect(select).toHaveBeenCalledWith({
+        message: "Choice",
+        options: expectedLabels.map((label, index) => ({ value: String(index), label })),
+        initialValue: undefined,
+      });
+      expect(result.plugins?.entries?.[pluginId]?.config).toEqual({ choice: expected });
+    },
+  );
+
+  it.each([
+    {
+      name: "an existing array through a dotted index",
+      field: "accounts.0.token",
+      existing: { accounts: [{}] },
+      expected: { accounts: [{ token: "configured" }] },
+    },
+    {
+      name: "a missing schema-declared array through a dotted index",
+      field: "accounts.0.token",
+      schema: {
+        type: "object",
+        properties: {
+          accounts: {
+            type: "array",
+            items: { type: "object", properties: { token: { type: "string" } } },
+          },
+        },
+      },
+      expected: { accounts: [{ token: "configured" }] },
+    },
+    {
+      name: "a numeric record key through a dotted path",
+      field: "accounts.0.token",
+      schema: {
+        type: "object",
+        properties: {
+          accounts: {
+            type: "object",
+            properties: {
+              "0": { type: "object", properties: { token: { type: "string" } } },
+            },
+          },
+        },
+      },
+      expected: { accounts: { "0": { token: "configured" } } },
+    },
+    {
+      name: "an explicit bracketed array index without a schema",
+      field: "accounts[0].token",
+      expected: { accounts: [{ token: "configured" }] },
+    },
+    {
+      name: "an explicitly quoted numeric record key without a schema",
+      field: 'accounts["0"].token',
+      expected: { accounts: { "0": { token: "configured" } } },
+    },
+    {
+      name: "a quoted record key containing a literal dot",
+      field: 'accounts["primary.backup"].token',
+      expected: { accounts: { "primary.backup": { token: "configured" } } },
+    },
+  ])("writes $name", async ({ field, existing, schema, expected }) => {
+    const pluginId = "indexed-plugin";
+    loadPluginManifestRegistryCore.mockReturnValue({
+      plugins: [makeManifestPlugin(pluginId, { [field]: { label: "Token" } }, schema)],
+    });
+
+    const result = await setupPluginConfig({
+      config: {
+        plugins: {
+          entries: { [pluginId]: { enabled: true, ...(existing && { config: existing }) } },
+        },
+      },
+      prompter: {
+        intro: vi.fn(async () => {}),
+        outro: vi.fn(async () => {}),
+        note: vi.fn(async () => {}),
+        select: vi.fn(async () => "") as unknown as WizardPrompter["select"],
+        multiselect: vi.fn(async () => [pluginId]) as unknown as WizardPrompter["multiselect"],
+        text: vi.fn(async () => "configured") as unknown as WizardPrompter["text"],
+        confirm: vi.fn(async () => true),
+        progress: vi.fn(() => ({ update: vi.fn(), stop: vi.fn() })),
+      },
+    });
+
+    expect(result.plugins?.entries?.[pluginId]?.config).toEqual(expected);
   });
 
   it("rejects prototype-polluting dotted uiHint paths without mutating config", async () => {
@@ -389,7 +545,7 @@ describe("setupPluginConfig", () => {
           progress: vi.fn(() => ({ update: vi.fn(), stop: vi.fn() })),
         },
       }),
-    ).rejects.toThrow(/prototype-polluting/);
+    ).rejects.toThrow(/Invalid path segment/);
     expect(config.plugins?.entries?.["unsafe-plugin"]?.config).toBeUndefined();
     expect(({} as Record<string, unknown>)[pollutionProbe]).toBeUndefined();
   });

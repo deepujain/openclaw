@@ -1,4 +1,4 @@
-/** CLI entrypoint for `openclaw gateway status`. */
+/** CLI entrypoint for `openclaw gateway probe`. */
 import { isRich } from "../../packages/terminal-core/src/theme.js";
 import { parseGatewayPortOption } from "../cli/gateway-port-option.js";
 import { parseTimeoutMsWithFallback } from "../cli/parse-timeout.js";
@@ -7,7 +7,7 @@ import { readBestEffortConfig, resolveGatewayPort } from "../config/config.js";
 import { ensureExplicitGatewayAuth, resolveExplicitGatewayAuth } from "../gateway/call.js";
 import { resolveWideAreaDiscoveryDomain } from "../infra/widearea-dns.js";
 import type { RuntimeEnv } from "../runtime.js";
-import { createLazyImportLoader } from "../shared/lazy-promise.js";
+import { createLazyPromise } from "../shared/lazy-promise.js";
 import { inferSshTargetFromRemoteUrl, resolveSshTarget } from "./gateway-status/discovery.js";
 import { buildNetworkHints, resolveTargets, sanitizeSshTarget } from "./gateway-status/helpers.js";
 import {
@@ -18,21 +18,9 @@ import {
 } from "./gateway-status/output.js";
 import { runGatewayStatusProbePass } from "./gateway-status/probe-run.js";
 
-const sshConfigModuleLoader = createLazyImportLoader(() => import("../infra/ssh-config.js"));
-const sshTunnelModuleLoader = createLazyImportLoader(() => import("../infra/ssh-tunnel.js"));
-const gatewayTlsModuleLoader = createLazyImportLoader(() => import("../infra/tls/gateway.js"));
-
-function loadSshConfigModule() {
-  return sshConfigModuleLoader.load();
-}
-
-function loadSshTunnelModule() {
-  return sshTunnelModuleLoader.load();
-}
-
-function loadGatewayTlsModule() {
-  return gatewayTlsModuleLoader.load();
-}
+const loadSshConfigModule = createLazyPromise(() => import("../infra/ssh-config.js"));
+const loadSshTunnelModule = createLazyPromise(() => import("../infra/ssh-tunnel.js"));
+const loadGatewayTlsModule = createLazyPromise(() => import("../infra/tls/gateway.js"));
 
 /** Resolves gateway status inputs, probes targets, then writes JSON or text output. */
 export async function gatewayStatusCommand(
@@ -49,7 +37,7 @@ export async function gatewayStatusCommand(
   },
   runtime: RuntimeEnv,
 ) {
-  ensureExplicitGatewayAuth({
+  await ensureExplicitGatewayAuth({
     urlOverride: opts.url?.trim(),
     urlOverrideSource: "cli",
     explicitAuth: resolveExplicitGatewayAuth(opts),
@@ -59,7 +47,9 @@ export async function gatewayStatusCommand(
   const cfg = await readBestEffortConfig();
   const rich = isRich() && opts.json !== true;
   const defaultTimeoutMs = 3000;
-  const overallTimeoutMs = parseTimeoutMsWithFallback(opts.timeout, defaultTimeoutMs);
+  const overallTimeoutMs = parseTimeoutMsWithFallback(opts.timeout, defaultTimeoutMs, {
+    invalidType: "error",
+  });
   const portOverride = parseGatewayPortOption(opts.port);
   const wideAreaDomain = resolveWideAreaDiscoveryDomain({
     configDomain: cfg.discovery?.wideArea?.domain,
@@ -100,36 +90,64 @@ export async function gatewayStatusCommand(
     }
   }
 
-  const localTlsRuntime =
+  const localCertificate =
     cfg.gateway?.tls?.enabled === true
-      ? await loadGatewayTlsModule().then(({ loadGatewayTlsRuntime }) =>
-          loadGatewayTlsRuntime(cfg.gateway?.tls),
+      ? await loadGatewayTlsModule().then(({ inspectGatewayTlsCertificate }) =>
+          inspectGatewayTlsCertificate(cfg.gateway?.tls),
         )
       : undefined;
 
-  const probePass = await withProgress(
-    {
-      label: "Inspecting gateways…",
-      indeterminate: true,
-      enabled: opts.json !== true,
-    },
-    async () =>
-      await runGatewayStatusProbePass({
-        cfg,
-        opts,
-        overallTimeoutMs,
-        discoveryTimeoutMs,
-        wideAreaDomain,
-        baseTargets,
-        remotePort,
-        sshTarget,
-        sshIdentity,
-        loadSshTunnelModule,
-        localTlsFingerprint: localTlsRuntime?.enabled
-          ? localTlsRuntime.fingerprintSha256
-          : undefined,
-      }),
-  );
+  const controller = new AbortController();
+  let abortSignal: "SIGINT" | "SIGTERM" | undefined;
+  const onSigInt = () => {
+    if (!abortSignal) {
+      abortSignal = "SIGINT";
+      controller.abort();
+    }
+  };
+  const onSigTerm = () => {
+    if (!abortSignal) {
+      abortSignal = "SIGTERM";
+      controller.abort();
+    }
+  };
+  process.on("SIGINT", onSigInt);
+  process.on("SIGTERM", onSigTerm);
+  const probePass = await (async () => {
+    try {
+      return await withProgress(
+        {
+          label: "Inspecting gateways…",
+          indeterminate: true,
+          enabled: opts.json !== true,
+        },
+        async () =>
+          await runGatewayStatusProbePass({
+            cfg,
+            opts,
+            overallTimeoutMs,
+            discoveryTimeoutMs,
+            wideAreaDomain,
+            baseTargets,
+            remotePort,
+            sshTarget,
+            sshIdentity,
+            loadSshTunnelModule,
+            localTlsFingerprint: localCertificate?.ok
+              ? localCertificate.value.fingerprintSha256
+              : undefined,
+            signal: controller.signal,
+          }),
+      );
+    } finally {
+      process.off("SIGINT", onSigInt);
+      process.off("SIGTERM", onSigTerm);
+    }
+  })();
+  if (abortSignal) {
+    runtime.exit(abortSignal === "SIGINT" ? 130 : 143);
+    return;
+  }
 
   const warnings = buildGatewayStatusWarnings({
     probed: probePass.probed,
@@ -137,10 +155,7 @@ export async function gatewayStatusCommand(
     sshTunnelStarted: probePass.sshTunnelStarted,
     sshTunnelError: probePass.sshTunnelError,
     discoveryCount: probePass.discovery.length,
-    localTlsLoadError:
-      localTlsRuntime && !localTlsRuntime.enabled && localTlsRuntime.required
-        ? (localTlsRuntime.error ?? "gateway tls is enabled but local TLS runtime could not load")
-        : null,
+    localTlsLoadError: localCertificate && !localCertificate.ok ? localCertificate.error : null,
   });
   const primary = pickPrimaryProbedTarget(probePass.probed);
 

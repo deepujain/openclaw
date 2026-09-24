@@ -2,13 +2,13 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { withTestDir } from "../test-helpers/temp-dir.js";
+import type { CommandRunner } from "./update-global-command-runner.js";
 import {
   detectGlobalInstallManagerForRoot,
   listActivePnpmIsolatedGlobalPackages,
   resolveGlobalInstallTarget,
-  resolvePnpmGlobalDirFromGlobalRoot,
-  type CommandRunner,
 } from "./update-global.js";
+import { resolvePnpmGlobalDirFromGlobalRoot } from "./update-native-package-owner.js";
 
 async function writeGlobalPackageJson(packageRoot: string, version: string): Promise<void> {
   await fs.writeFile(
@@ -190,12 +190,18 @@ describe("pnpm 11 global install discovery", () => {
         fs.symlink(activeInstallRoot, path.join(globalRoot, "hash-active"), "dir"),
       ]);
       const runCommand: CommandRunner = async (argv) => {
+        if (argv.join(" ") === "npm root -g") {
+          return { stdout: "", stderr: "", code: 1 };
+        }
         if (argv.join(" ") === "pnpm root -g") {
           return { stdout: `${globalRoot}\n`, stderr: "", code: 0 };
         }
         throw new Error(`unexpected command: ${argv.join(" ")}`);
       };
 
+      await expect(
+        detectGlobalInstallManagerForRoot(runCommand, sharedPackageRoot, 1000),
+      ).resolves.toBeNull();
       await expect(
         resolveGlobalInstallTarget({
           manager: "pnpm",

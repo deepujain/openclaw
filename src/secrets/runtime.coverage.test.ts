@@ -4,13 +4,14 @@ import fs from "node:fs";
 import path from "node:path";
 import { afterAll, beforeAll, describe, expect, test, vi } from "vitest";
 import type { AuthProfileStore } from "../agents/auth-profiles.js";
+import { createAuthProfileStoreFixture } from "../agents/auth-profiles/credential-fixtures.test-support.js";
 import type { OpenClawConfig } from "../config/config.js";
-import { loadBundledPluginPublicSurface } from "../plugin-sdk/test-helpers/public-surface-loader.js";
 import type {
   PluginOrigin,
   PluginWebFetchProviderEntry,
   PluginWebSearchProviderEntry,
 } from "../plugins/types.js";
+import { loadBundledPluginFacade } from "../test-utils/bundled-plugin-public-surface.js";
 import { getPath, setPathCreateStrict } from "./path-utils.js";
 
 const COVERAGE_WEB_PROVIDER_PLUGIN_IDS = vi.hoisted(() => ({
@@ -200,14 +201,6 @@ const COVERAGE_WEB_FETCH_PROVIDERS = new Map(
 );
 
 vi.mock("../plugins/web-provider-public-artifacts.explicit.js", () => ({
-  loadBundledWebFetchProviderEntriesFromDir: (params: { pluginId: string }) => {
-    const provider = COVERAGE_WEB_FETCH_PROVIDERS.get(params.pluginId);
-    return provider ? [provider] : null;
-  },
-  loadBundledWebSearchProviderEntriesFromDir: (params: { pluginId: string }) => {
-    const provider = COVERAGE_WEB_SEARCH_PROVIDERS.get(params.pluginId);
-    return provider ? [provider] : null;
-  },
   resolveBundledExplicitWebFetchProvidersFromPublicArtifacts: (params: {
     onlyPluginIds: readonly string[];
   }) => {
@@ -418,7 +411,7 @@ function addCoveragePluginLoadPath(config: OpenClawConfig, pluginId: string): vo
     return;
   }
   const nextIndex = Array.isArray(existing) ? existing.length : 0;
-  setPathCreateStrict(config, ["plugins", "load", "paths", String(nextIndex)], loadPath);
+  setPathCreateStrict(config, ["plugins", "load", "paths", nextIndex], loadPath);
 }
 
 function resolveCoverageLoadablePluginOrigins(
@@ -578,7 +571,7 @@ function applyConfigForOpenClawTarget(
     }
   }
   if (entry.id === "memory.search.remote.apiKey") {
-    setPathCreateStrict(config, ["agents", "list", "0", "id"], "sample-agent");
+    setPathCreateStrict(config, ["agents", "list", 0, "id"], "sample-agent");
   }
   if (entry.id === "gateway.auth.password") {
     setPathCreateStrict(config, ["gateway", "auth", "mode"], "password");
@@ -848,7 +841,7 @@ async function expectOpenClawCoverageBatchResolved(
 ): Promise<void> {
   logCoverageBatch(label, batch);
   const config = {} as OpenClawConfig;
-  const env: Record<string, string> = {};
+  const env: NodeJS.ProcessEnv = { OPENCLAW_STATE_DIR: process.env.OPENCLAW_TEST_HOME };
   for (const [index, entry] of batch.entries()) {
     const envId = toCoverageEnvRefId("OPENCLAW_SECRET_TARGET", entry.id);
     const runtimeEnvId = resolveCoverageEnvId(entry, envId);
@@ -917,7 +910,7 @@ describe("secrets runtime target coverage", () => {
           async (channelId) =>
             [
               channelId,
-              await loadBundledPluginPublicSurface<object>({
+              await loadBundledPluginFacade<object>({
                 pluginId: channelId,
                 artifactBasename: "secret-contract-api.js",
               }),
@@ -968,10 +961,7 @@ describe("secrets runtime target coverage", () => {
       async ({ batch }) => {
         logCoverageBatch("auth-profiles.json", batch);
         const env: Record<string, string> = {};
-        const authStore: AuthProfileStore = {
-          version: 1,
-          profiles: {},
-        };
+        const authStore: AuthProfileStore = createAuthProfileStoreFixture({});
         for (const [index, entry] of batch.entries()) {
           const envId = toCoverageEnvRefId("OPENCLAW_AUTH_SECRET_TARGET", entry.id);
           env[envId] = `resolved-${entry.id}`;

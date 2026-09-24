@@ -54,6 +54,11 @@ export async function prepareAgentRequestRouting(params: {
   context: AgentTurnContext;
   respond: GatewayRequestHandlerOptions["respond"];
   reserveDedupe: (sessionKey?: string, agentId?: string) => void;
+  bindDedupeSessionTarget: (target: {
+    sessionKey: string;
+    agentId?: string;
+    sessionId?: string;
+  }) => void;
   clearDedupe: () => void;
 }): Promise<AgentRequestRouting | undefined> {
   const normalizedAttachments = normalizeRpcAttachmentsToChatAttachments(
@@ -87,20 +92,6 @@ export async function prepareAgentRequestRouting(params: {
       ? requestedToRaw
       : undefined;
   const requestedSessionKeyRaw = requestedSessionKeyParam ?? sessionKeyFromTo;
-  if (
-    requestedSessionKeyRaw &&
-    classifySessionKeyShape(requestedSessionKeyRaw) === "malformed_agent"
-  ) {
-    params.respond(
-      false,
-      undefined,
-      errorShape(
-        ErrorCodes.INVALID_REQUEST,
-        `invalid agent params: malformed session key "${requestedSessionKeyRaw}"`,
-      ),
-    );
-    return undefined;
-  }
   if (requestedSessionKeyRaw) {
     const requestedSessionAgent = resolveRequestedSessionAgentId(
       params.cfg,
@@ -120,7 +111,6 @@ export async function prepareAgentRequestRouting(params: {
         cfg: params.cfg,
         sessionId: requestedSessionId,
         agentId,
-        clone: false,
       });
       agentId = sessionIdTarget.agentId ?? agentId;
     } catch (error) {
@@ -233,8 +223,16 @@ export async function prepareAgentRequestRouting(params: {
     ? loadSessionEntry(requestedSessionKey, {
         ...(agentId ? { agentId } : {}),
         clone: false,
+        projection: "list",
       })
     : undefined;
+  if (loaded) {
+    params.bindDedupeSessionTarget({
+      sessionKey: loaded.canonicalKey,
+      agentId,
+      sessionId: loaded.entry?.sessionId,
+    });
+  }
   return {
     normalizedAttachments,
     requestedBestEffortDeliver,
@@ -279,6 +277,7 @@ function dropReboundExecApprovalFollowup(params: {
       loadSessionEntry(params.requestedSessionKeyRaw, {
         ...(params.agentId ? { agentId: params.agentId } : {}),
         clone: false,
+        projection: "list",
       }).entry?.sessionId,
     );
   } catch {

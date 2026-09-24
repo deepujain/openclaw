@@ -93,13 +93,12 @@ function buildCompat(
   props: LlamaServerPropsWire | undefined,
 ): NonNullable<ModelDefinitionConfig["compat"]> {
   const caps = props?.chat_template_caps;
-  const supportsTools =
-    asBoolean(caps?.supports_tools) === true && asBoolean(caps?.supports_tool_calls) === true;
+  const supportsTools = asBoolean(caps?.supports_tool_calls) === true;
   const supportsTypedContent = asBoolean(caps?.supports_typed_content) === true;
   return {
     supportsStore: false,
     supportsDeveloperRole: false,
-    supportsReasoningEffort: false,
+    supportsReasoningEffort: asBoolean(caps?.supports_reasoning_effort) === true,
     supportsTemperature: true,
     supportsUsageInStreaming: true,
     supportsTools,
@@ -120,17 +119,18 @@ export function mapLlamaServerModel(
     return null;
   }
   const contextWindow = resolveContextWindow(props);
+  const compat = buildCompat(props);
   return {
     config: {
       id,
       name: id,
-      reasoning: false,
+      reasoning: compat.supportsReasoningEffort === true,
       input: resolveInput(row, props),
       cost: { ...SELF_HOSTED_DEFAULT_COST },
       contextWindow,
       contextTokens: contextWindow,
       maxTokens: resolveMaxTokens(props, contextWindow),
-      compat: buildCompat(props),
+      compat,
     },
     status: normalizeStatus(row.status?.value),
     failed: row.status?.failed === true,

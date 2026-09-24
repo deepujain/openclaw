@@ -1,20 +1,21 @@
-// Matrix plugin module implements approval handler behavior.
-import type {
-  ChannelApprovalCapabilityHandlerContext,
-  PendingApprovalView,
-  ResolvedApprovalView,
+import {
+  createChannelApprovalNativeRuntimeAdapter,
+  type ChannelApprovalCapabilityHandlerContext,
+  type PendingApprovalView,
+  type ResolvedApprovalView,
 } from "openclaw/plugin-sdk/approval-handler-runtime";
-import { createChannelApprovalNativeRuntimeAdapter } from "openclaw/plugin-sdk/approval-handler-runtime";
 import { buildChannelApprovalNativeTargetKey } from "openclaw/plugin-sdk/approval-native-runtime";
 import {
   buildExecApprovalPendingReplyPayload,
   buildPluginApprovalPendingReplyPayload,
   type ExecApprovalReplyDecision,
 } from "openclaw/plugin-sdk/approval-reply-runtime";
-import { buildPluginApprovalResolvedReplyPayload } from "openclaw/plugin-sdk/approval-runtime";
-import type {
-  ExecApprovalRequest,
-  PluginApprovalRequest,
+import {
+  buildApprovalPendingReplyPayload,
+  buildPluginApprovalResolvedReplyPayload,
+  formatChannelApprovalResolvedLabel,
+  type ExecApprovalRequest,
+  type PluginApprovalRequest,
 } from "openclaw/plugin-sdk/approval-runtime";
 import {
   listMessageReceiptPlatformIds,
@@ -33,7 +34,7 @@ import {
   isMatrixAnyApprovalClientEnabled,
   shouldHandleMatrixApprovalRequest,
 } from "./exec-approvals.js";
-import { resolveMatrixAccount } from "./matrix/accounts.js";
+import { resolveMatrixAccountConfig } from "./matrix/account-config.js";
 import { deleteMatrixMessage, editMatrixMessage } from "./matrix/actions/messages.js";
 import { repairMatrixDirectRooms } from "./matrix/direct-management.js";
 import type { MatrixClient } from "./matrix/sdk.js";
@@ -58,58 +59,13 @@ type PreparedMatrixTarget = {
   roomId: string;
   threadId?: string;
 };
-type MatrixApprovalMetadataAction = {
-  decision: ExecApprovalReplyDecision;
-  label: string;
-  style: PendingApprovalView["actions"][number]["style"];
-  command: string;
-};
-type MatrixApprovalMetadataBase = {
-  version: 1;
-  type: "approval.request";
-  id: string;
-  state: "pending";
-  kind: PendingApprovalView["approvalKind"];
-  phase: "pending";
-  title: string;
-  description?: string;
-  expiresAtMs: number;
-  metadata: PendingApprovalView["metadata"];
-  allowedDecisions: ExecApprovalReplyDecision[];
-  actions: MatrixApprovalMetadataAction[];
-};
-type MatrixExecApprovalMetadata = MatrixApprovalMetadataBase & {
-  kind: "exec";
-  ask?: string;
-  agentId?: string;
-  commandText: string;
-  commandPreview?: string;
-  cwd?: string;
-  envKeys?: readonly string[];
-  host?: string;
-  nodeId?: string;
-  sessionKey?: string;
-};
-type MatrixPluginApprovalSeverity = Extract<
-  PendingApprovalView,
-  { approvalKind: "plugin" }
->["severity"];
-type MatrixPluginApprovalMetadata = MatrixApprovalMetadataBase & {
-  kind: "plugin";
-  agentId?: string;
-  pluginId?: string;
-  toolName?: string;
-  severity: MatrixPluginApprovalSeverity;
-};
-type MatrixApprovalMetadata = MatrixExecApprovalMetadata | MatrixPluginApprovalMetadata;
-type MatrixApprovalExtraContent = {
-  [MATRIX_APPROVAL_METADATA_KEY]: MatrixApprovalMetadata;
-};
 type PendingApprovalContent = {
   approvalId: string;
   text: string;
   allowedDecisions: readonly ExecApprovalReplyDecision[];
-  extraContent: MatrixApprovalExtraContent;
+  extraContent: {
+    [MATRIX_APPROVAL_METADATA_KEY]: ReturnType<typeof buildMatrixApprovalMetadata>;
+  };
 };
 type ReactionTargetRef = {
   accountId: string;
@@ -211,7 +167,7 @@ async function prepareTarget(
   }
   const threadId = normalizeThreadId(params.rawTarget.threadId);
   if (target.kind === "user") {
-    const account = resolveMatrixAccount({
+    const accountConfig = resolveMatrixAccountConfig({
       cfg: params.cfg,
       accountId: resolved.accountId,
     });
@@ -221,7 +177,7 @@ async function prepareTarget(
         await repairDirectRooms({
           client: resolved.context.client,
           remoteUserId: target.id,
-          encrypted: account.config.encryption === true,
+          encrypted: accountConfig.encryption === true,
         }),
     );
     if (!repaired.activeRoomId) {
@@ -243,12 +199,12 @@ async function prepareTarget(
 function buildMatrixApprovalMetadata(params: {
   view: PendingApprovalView;
   allowedDecisions: readonly ExecApprovalReplyDecision[];
-}): MatrixApprovalMetadata {
-  const base: MatrixApprovalMetadataBase = {
-    version: 1,
-    type: "approval.request",
+}) {
+  const base = {
+    version: 1 as const,
+    type: "approval.request" as const,
     id: params.view.approvalId,
-    state: "pending",
+    state: "pending" as const,
     kind: params.view.approvalKind,
     phase: params.view.phase,
     title: params.view.title,
@@ -267,7 +223,7 @@ function buildMatrixApprovalMetadata(params: {
   if (params.view.approvalKind === "plugin") {
     return {
       ...base,
-      kind: "plugin",
+      kind: "plugin" as const,
       severity: params.view.severity,
       ...(params.view.agentId != null ? { agentId: params.view.agentId } : {}),
       ...(params.view.pluginId != null ? { pluginId: params.view.pluginId } : {}),
@@ -275,9 +231,19 @@ function buildMatrixApprovalMetadata(params: {
     };
   }
 
+  if (params.view.approvalKind === "system-agent") {
+    return {
+      ...base,
+      kind: "system-agent" as const,
+      commandText: params.view.commandText,
+      operationSummary: params.view.operationSummary,
+      ...(params.view.agentId != null ? { agentId: params.view.agentId } : {}),
+    };
+  }
+
   return {
     ...base,
-    kind: "exec",
+    kind: "exec" as const,
     commandText: params.view.commandText,
     ...(params.view.ask != null ? { ask: params.view.ask } : {}),
     ...(params.view.agentId != null ? { agentId: params.view.agentId } : {}),
@@ -295,41 +261,55 @@ function buildPendingApprovalContent(params: {
   nowMs: number;
 }): PendingApprovalContent {
   const allowedDecisions = params.view.actions.map((action) => action.decision);
-  const payload =
-    params.view.approvalKind === "plugin"
-      ? buildPluginApprovalPendingReplyPayload({
-          request: {
-            approvalKind: "plugin",
-            id: params.view.approvalId,
-            request: {
-              title: params.view.title,
-              description: params.view.description ?? "",
-              severity: params.view.severity,
-              toolName: params.view.toolName ?? undefined,
-              pluginId: params.view.pluginId ?? undefined,
-              agentId: params.view.agentId ?? undefined,
-            },
-            createdAtMs: 0,
-            expiresAtMs: params.view.expiresAtMs,
-          } satisfies PluginApprovalRequest,
-          nowMs: params.nowMs,
-          allowedDecisions,
-        })
-      : buildExecApprovalPendingReplyPayload({
-          approvalId: params.view.approvalId,
-          approvalSlug: params.view.approvalId.slice(0, 8),
-          approvalCommandId: params.view.approvalId,
-          ask: params.view.ask ?? undefined,
+  let payload;
+  if (params.view.approvalKind === "plugin") {
+    payload = buildPluginApprovalPendingReplyPayload({
+      request: {
+        approvalKind: "plugin",
+        id: params.view.approvalId,
+        request: {
+          title: params.view.title,
+          description: params.view.description ?? "",
+          severity: params.view.severity,
+          toolName: params.view.toolName ?? undefined,
+          pluginId: params.view.pluginId ?? undefined,
           agentId: params.view.agentId ?? undefined,
-          allowedDecisions,
-          command: params.view.commandText,
-          cwd: params.view.cwd ?? undefined,
-          host: params.view.host === "node" ? "node" : "gateway",
-          nodeId: params.view.nodeId ?? undefined,
-          sessionKey: params.view.sessionKey ?? undefined,
-          expiresAtMs: params.view.expiresAtMs,
-          nowMs: params.nowMs,
-        });
+          scope: params.view.scope ?? undefined,
+        },
+        createdAtMs: 0,
+        expiresAtMs: params.view.expiresAtMs,
+      } satisfies PluginApprovalRequest,
+      nowMs: params.nowMs,
+      allowedDecisions,
+    });
+  } else if (params.view.approvalKind === "system-agent") {
+    payload = buildApprovalPendingReplyPayload({
+      approvalKind: "system-agent",
+      approvalId: params.view.approvalId,
+      approvalSlug: params.view.approvalId.slice(0, 8),
+      text: `OpenClaw change requires approval:\n${params.view.operationSummary}`,
+      agentId: params.view.agentId,
+      allowedDecisions,
+      sessionKey: params.view.sessionKey,
+    });
+  } else {
+    payload = buildExecApprovalPendingReplyPayload({
+      approvalId: params.view.approvalId,
+      approvalSlug: params.view.approvalId.slice(0, 8),
+      approvalCommandId: params.view.approvalId,
+      ask: params.view.ask ?? undefined,
+      agentId: params.view.agentId ?? undefined,
+      allowedDecisions,
+      command: params.view.commandText,
+      cwd: params.view.cwd ?? undefined,
+      host: params.view.host === "node" ? "node" : "gateway",
+      nodeId: params.view.nodeId ?? undefined,
+      scope: params.view.scope ?? undefined,
+      sessionKey: params.view.sessionKey ?? undefined,
+      expiresAtMs: params.view.expiresAtMs,
+      nowMs: params.nowMs,
+    });
+  }
   const hint = buildMatrixApprovalReactionHint(allowedDecisions);
   const text = payload.text ?? "";
   return {
@@ -358,16 +338,11 @@ function buildResolvedApprovalText(view: ResolvedApprovalView): string {
       }).text ?? ""
     );
   }
-  const decisionLabel =
-    view.decision === "allow-once"
-      ? "Allowed once"
-      : view.decision === "allow-always"
-        ? "Allowed always"
-        : "Denied";
+  const decisionLabel = formatChannelApprovalResolvedLabel(view);
   return [
-    `Exec approval: ${decisionLabel}`,
+    `${view.approvalKind === "system-agent" ? "OpenClaw change" : "Exec approval"}: ${decisionLabel}`,
     "",
-    "Command",
+    view.approvalKind === "system-agent" ? "Change" : "Command",
     buildMarkdownCodeBlock(view.commandText),
   ].join("\n");
 }
@@ -385,7 +360,7 @@ export const matrixApprovalNativeRuntime = createChannelApprovalNativeRuntimeAda
   ReactionTargetRef,
   string
 >({
-  eventKinds: ["exec", "plugin"],
+  eventKinds: ["exec", "plugin", "system-agent"],
   availability: {
     isConfigured: ({ cfg, accountId, context }) => {
       const resolved = resolveHandlerContext({ cfg, accountId, context });
@@ -487,7 +462,7 @@ export const matrixApprovalNativeRuntime = createChannelApprovalNativeRuntimeAda
         result.primaryMessageId?.trim() ||
         platformMessageIds[0] ||
         result.messageId.trim();
-      registerMatrixApprovalReactionTarget({
+      await registerMatrixApprovalReactionTarget({
         accountId: resolved.accountId,
         roomId: result.roomId,
         eventId: reactionEventId,
@@ -560,7 +535,7 @@ export const matrixApprovalNativeRuntime = createChannelApprovalNativeRuntimeAda
     },
   },
   interactions: {
-    bindPending: (params) => {
+    bindPending: async (params) => {
       const accountId = params.accountId?.trim();
       if (!accountId) {
         return null;
@@ -573,7 +548,7 @@ export const matrixApprovalNativeRuntime = createChannelApprovalNativeRuntimeAda
       if (!target) {
         return null;
       }
-      registerMatrixApprovalReactionTarget({
+      await registerMatrixApprovalReactionTarget({
         accountId: target.accountId,
         roomId: target.roomId,
         eventId: target.eventId,
@@ -584,14 +559,14 @@ export const matrixApprovalNativeRuntime = createChannelApprovalNativeRuntimeAda
       });
       return target;
     },
-    unbindPending: (params) => {
+    unbindPending: async (params) => {
       const target = normalizeReactionTargetRef(params.binding);
       if (!target) {
         return;
       }
-      unregisterMatrixApprovalReactionTarget(target);
+      await unregisterMatrixApprovalReactionTarget(target);
     },
-    cancelDelivered: (params) => {
+    cancelDelivered: async (params) => {
       const accountId = params.accountId?.trim();
       if (!accountId) {
         return;
@@ -604,7 +579,7 @@ export const matrixApprovalNativeRuntime = createChannelApprovalNativeRuntimeAda
       if (!target) {
         return;
       }
-      unregisterMatrixApprovalReactionTarget(target);
+      await unregisterMatrixApprovalReactionTarget(target);
     },
   },
 });

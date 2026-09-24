@@ -1,5 +1,6 @@
 /** Validation and normalization for ACP session runtime options and config controls. */
 import { isAbsolute } from "node:path";
+import type { AcpRuntimeConfigOptionResult } from "@openclaw/acp-core/runtime/types";
 import { parseStrictPositiveInteger } from "@openclaw/normalization-core/number-coercion";
 import {
   normalizeLowercaseStringOrEmpty,
@@ -178,48 +179,21 @@ export function validateRuntimeOptionPatch(
   }
 
   const next: Partial<AcpSessionRuntimeOptions> = {};
-  if (Object.hasOwn(rawPatch, "runtimeMode")) {
-    if (rawPatch.runtimeMode === undefined) {
-      next.runtimeMode = undefined;
-    } else {
-      next.runtimeMode = validateRuntimeModeInput(rawPatch.runtimeMode);
+  function setOption<K extends Exclude<keyof AcpSessionRuntimeOptions, "backendExtras">>(
+    key: K,
+    validate: (value: unknown) => AcpSessionRuntimeOptions[K],
+  ): void {
+    // Own undefined clears an option; missing and inherited fields leave it unchanged.
+    if (Object.hasOwn(rawPatch, key)) {
+      next[key] = rawPatch[key] === undefined ? undefined : validate(rawPatch[key]);
     }
   }
-  if (Object.hasOwn(rawPatch, "model")) {
-    if (rawPatch.model === undefined) {
-      next.model = undefined;
-    } else {
-      next.model = validateRuntimeModelInput(rawPatch.model);
-    }
-  }
-  if (Object.hasOwn(rawPatch, "thinking")) {
-    if (rawPatch.thinking === undefined) {
-      next.thinking = undefined;
-    } else {
-      next.thinking = validateRuntimeThinkingInput(rawPatch.thinking);
-    }
-  }
-  if (Object.hasOwn(rawPatch, "cwd")) {
-    if (rawPatch.cwd === undefined) {
-      next.cwd = undefined;
-    } else {
-      next.cwd = validateRuntimeCwdInput(rawPatch.cwd);
-    }
-  }
-  if (Object.hasOwn(rawPatch, "permissionProfile")) {
-    if (rawPatch.permissionProfile === undefined) {
-      next.permissionProfile = undefined;
-    } else {
-      next.permissionProfile = validateRuntimePermissionProfileInput(rawPatch.permissionProfile);
-    }
-  }
-  if (Object.hasOwn(rawPatch, "timeoutSeconds")) {
-    if (rawPatch.timeoutSeconds === undefined) {
-      next.timeoutSeconds = undefined;
-    } else {
-      next.timeoutSeconds = validateRuntimeTimeoutSecondsInput(rawPatch.timeoutSeconds);
-    }
-  }
+  setOption("runtimeMode", validateRuntimeModeInput);
+  setOption("model", validateRuntimeModelInput);
+  setOption("thinking", validateRuntimeThinkingInput);
+  setOption("cwd", validateRuntimeCwdInput);
+  setOption("permissionProfile", validateRuntimePermissionProfileInput);
+  setOption("timeoutSeconds", validateRuntimeTimeoutSecondsInput);
   if (Object.hasOwn(rawPatch, "backendExtras")) {
     const rawExtras = rawPatch.backendExtras;
     if (rawExtras === undefined) {
@@ -286,6 +260,42 @@ export function mergeRuntimeOptions(params: {
     ...(patch.backendExtras
       ? { backendExtras: { ...current.backendExtras, ...patch.backendExtras } }
       : {}),
+  });
+}
+
+export function isThinkingConfigKey(key: string): boolean {
+  return RUNTIME_CONFIG_OPTION_ALIASES.thinking.some(
+    (alias) => alias === normalizeLowercaseStringOrEmpty(key),
+  );
+}
+
+/** Reconcile only selected thinking; backend defaults must not become new session overrides. */
+export function reconcileAcceptedRuntimeOptions(
+  options: AcpSessionRuntimeOptions,
+  result: AcpRuntimeConfigOptionResult | void,
+  pendingThinking?: string,
+): AcpSessionRuntimeOptions {
+  if (!result || !options.thinking) {
+    return options;
+  }
+  const thinking = result.configOptions.find(
+    (option) => option.category === "thought_level" || isThinkingConfigKey(option.id),
+  );
+  // Automatic model replay precedes thinking; a still-valid pending selection must survive it.
+  if (
+    pendingThinking &&
+    (thinking?.currentValue === pendingThinking ||
+      thinking?.options?.some((choice) =>
+        "options" in choice
+          ? choice.options.some((option) => option.value === pendingThinking)
+          : choice.value === pendingThinking,
+      ))
+  ) {
+    return options;
+  }
+  return normalizeRuntimeOptions({
+    ...options,
+    thinking: typeof thinking?.currentValue === "string" ? thinking.currentValue : undefined,
   });
 }
 
@@ -437,12 +447,7 @@ export function inferRuntimeOptionPatchFromConfigOption(
   if (normalizedKey === "model") {
     return { model: validateRuntimeModelInput(validated.value) };
   }
-  if (
-    normalizedKey === "thinking" ||
-    normalizedKey === "effort" ||
-    normalizedKey === "thought_level" ||
-    normalizedKey === "reasoning_effort"
-  ) {
+  if (isThinkingConfigKey(normalizedKey)) {
     return { thinking: validateRuntimeThinkingInput(validated.value) };
   }
   if (

@@ -1,4 +1,6 @@
+import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { formatErrorMessage } from "../infra/errors.js";
+import { requirePersonalGitHubPublicationConfirmation } from "./github-personal-publication-store.js";
 import { createGitHubPublicationTranscriptReporter } from "./github-publication-transcript.js";
 import { createGitHubPublicationCoordinator } from "./github-publication.js";
 import type {
@@ -8,10 +10,12 @@ import type {
 
 export function createGitHubPublicationRuntime(params: {
   placements: WorkerSessionPlacementStore;
+  getCommittedRuntimeConfig: () => OpenClawConfig;
   loadSessionRuntime: Parameters<typeof createGitHubPublicationTranscriptReporter>[0];
   warn: (message: string) => void;
 }) {
-  const coordinator = createGitHubPublicationCoordinator({ placements: params.placements });
+  const coordinator = createGitHubPublicationCoordinator(params);
+  requirePersonalGitHubPublicationConfirmation(params.placements.workspaceResultInstanceId());
   const report = createGitHubPublicationTranscriptReporter(params.loadSessionRuntime, coordinator);
   const reportDeferred = async (publication: {
     sessionId: string;
@@ -30,8 +34,8 @@ export function createGitHubPublicationRuntime(params: {
   const prepareAcceptedWorkspacePublication = async (claim: WorkerSessionTurnClaim) => {
     try {
       await coordinator.prepareClaimWorkspace(claim);
-    } catch (error) {
-      coordinator.failClaimPreparation(claim, error);
+    } catch {
+      coordinator.deferClaimPreparation(claim);
     }
   };
   const publishAcceptedWorkspace = async (claim: WorkerSessionTurnClaim) => {
@@ -50,6 +54,9 @@ export function createGitHubPublicationRuntime(params: {
       throw error;
     }
     for (const result of results) {
+      if (result.status !== "published" && result.status !== "failed") {
+        continue;
+      }
       await reportDeferred({
         sessionId: placement.sessionId,
         sessionKey: placement.sessionKey,
@@ -60,19 +67,13 @@ export function createGitHubPublicationRuntime(params: {
   };
   const reconcilePublications = async () => {
     try {
-      await coordinator.resumeLocalRequests();
+      coordinator.deferOrphanedRequests();
+      await coordinator.resumeSessionRequests();
     } catch (error) {
       params.warn(`GitHub publication recovery deferred: ${formatErrorMessage(error)}`);
     }
-    const attempted = new Set<string>();
-    for (const publication of coordinator.failOrphanedRequests()) {
-      attempted.add(publication.result.requestId);
-      await reportDeferred(publication);
-    }
     for (const publication of coordinator.listUnreportedResults()) {
-      if (!attempted.has(publication.result.requestId)) {
-        await reportDeferred(publication);
-      }
+      await reportDeferred(publication);
     }
   };
   return {

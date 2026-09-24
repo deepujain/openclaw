@@ -2,6 +2,8 @@ import { asNullableRecord as asRecord } from "@openclaw/normalization-core/recor
 import { readNonBlankString } from "@openclaw/normalization-core/string-coerce";
 import {
   MAX_DIFF_RENDER_LINES,
+  splitDiffLines,
+  type DiffFilePaths,
   type DiffLine,
   type DiffLineKind,
   type DiffStat,
@@ -9,9 +11,8 @@ import {
 
 type PatchOperation = "add" | "delete" | "update";
 
-export type PatchFileOperation = {
+export type PatchFileOperation = DiffFilePaths & {
   operation: PatchOperation;
-  path: string;
 };
 
 type PatchSection = {
@@ -42,17 +43,6 @@ type PatchViewData = {
   stat: DiffStat;
   move?: { from: string; to: string };
 };
-
-function splitLines(text: string): string[] {
-  if (text === "") {
-    return [];
-  }
-  const lines = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
-  if (lines.length > 1 && lines.at(-1) === "") {
-    lines.pop();
-  }
-  return lines;
-}
 
 function startSection(
   collector: PatchCollector,
@@ -162,7 +152,11 @@ function finish(collector: PatchCollector): PatchViewData | null {
     return null;
   }
   const paths = [...new Set(collector.sections.map((section) => section.path).filter(Boolean))];
-  const fileOperations = collector.sections.map(({ operation, path }) => ({ operation, path }));
+  const fileOperations = collector.sections.map(({ operation, path, sourcePath }) => ({
+    operation,
+    path,
+    ...(operation === "update" && sourcePath !== path ? { oldPath: sourcePath } : {}),
+  }));
   const stat = collector.sections.reduce(
     (sum, section) => ({
       added: sum.added + section.stat.added,
@@ -179,12 +173,17 @@ function finish(collector: PatchCollector): PatchViewData | null {
       clipped = true;
     }
   };
-  for (const section of collector.sections) {
+  for (const [index, section] of collector.sections.entries()) {
     if (collector.sections.length > 1) {
       if (lines.length > 0 && lines.at(-1)?.kind !== "skip") {
         append({ kind: "skip", text: "" });
       }
-      append({ kind: "file", text: sectionLabel(section) });
+      append({
+        kind: "file",
+        path: section.path,
+        ...("oldPath" in fileOperations[index]! ? { oldPath: section.sourcePath } : {}),
+        text: sectionLabel(section),
+      });
     }
     for (const line of section.lines) {
       append(line);
@@ -206,7 +205,7 @@ function parseCodexPatch(text: string): PatchViewData | null {
   let current: PatchSection | null = null;
   let mode: PatchOperation | "outside" = "outside";
   let hunk: HunkState | null = null;
-  for (const raw of splitLines(text)) {
+  for (const raw of splitDiffLines(text)) {
     const structural = mode === "update" ? raw.trimEnd() : raw.trim();
     const fileMatch = structural.match(/^\*\*\* (Update|Add|Delete) File: (.+)$/);
     if (fileMatch) {
@@ -288,7 +287,7 @@ function applyHeaderPair(
 
 function parseUnifiedPatch(text: string): PatchViewData | null {
   const collector: PatchCollector = { sections: [], storedRows: 0, truncated: false };
-  const rawLines = splitLines(text);
+  const rawLines = splitDiffLines(text);
   let current: PatchSection | null = null;
   let hunk: HunkState | null = null;
   let awaitingGitHeaders = false;
@@ -358,7 +357,7 @@ function appendStructuredUpdate(
   diff: string,
 ): void {
   let hunk: HunkState | null = null;
-  for (const raw of splitLines(diff)) {
+  for (const raw of splitDiffLines(diff)) {
     if (raw.startsWith("@@")) {
       separateHunk(collector, section);
       hunk = parseHunkHeader(raw);
@@ -392,7 +391,7 @@ function parseStructuredPatch(changes: unknown[]): PatchViewData | null {
         appendStructuredUpdate(collector, section, record.diff);
       } else {
         const kind = operation === "add" ? "add" : "del";
-        for (const [index, text] of splitLines(record.diff).entries()) {
+        for (const [index, text] of splitDiffLines(record.diff).entries()) {
           pushLine(collector, section, { kind, lineNo: index + 1, text });
         }
       }

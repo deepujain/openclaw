@@ -31,14 +31,16 @@ struct TalkOverlayView: View {
                         TalkModeController.shared.exitTalkMode()
                     } label: {
                         Image(systemName: "xmark")
-                            .font(.system(size: 10, weight: .bold))
+                            .font(.system(size: 12, weight: .semibold))
                             .foregroundStyle(Color.white.opacity(0.95))
-                            .frame(width: 18, height: 18)
+                            .frame(width: 28, height: 28)
                             .background(Color.black.opacity(0.4))
                             .clipShape(Circle())
+                            .contentShape(Circle())
                     }
                     .buttonStyle(.plain)
-                    .contentShape(Circle())
+                    .help("Stop Talk Mode")
+                    .accessibilityLabel("Stop Talk Mode")
                     .offset(x: -2, y: -2)
                     .opacity(self.hoveringWindow ? 1 : 0)
                     .animation(.easeOut(duration: 0.12), value: self.hoveringWindow)
@@ -54,7 +56,7 @@ struct TalkOverlayView: View {
     private static let defaultSeamColor = Color(red: 79 / 255.0, green: 122 / 255.0, blue: 154 / 255.0)
 
     private var seamColor: Color {
-        ColorHexSupport.color(fromHex: self.appState.seamColorHex) ?? Self.defaultSeamColor
+        ColorHexSupport.color(fromHex: self.appState.effectiveAccentHex) ?? Self.defaultSeamColor
     }
 }
 

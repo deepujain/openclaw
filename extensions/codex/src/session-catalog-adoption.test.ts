@@ -1,7 +1,22 @@
+import {
+  createPluginStateSyncKeyedStoreForTests,
+  resetPluginStateStoreForTests,
+} from "openclaw/plugin-sdk/plugin-state-test-runtime";
 // Codex supervision tests cover passive listing and safe local session takeover.
 /* oxlint-disable typescript/unbound-method -- assertions inspect vi.fn-backed object methods, not unbound class methods. */
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import { createLazyCodexAppServerBindingStore } from "./app-server/session-binding-store.js";
+import { bindingStoreKey, type StoredCodexAppServerBinding } from "./app-server/session-binding.js";
+import { listAdoptedSessionEntries } from "./session-catalog-adoption.js";
 import {
+  commandRpcMocks,
+  pinnedConnectionMocks,
+  createCodexSessionCatalogControlFactory,
+  fs,
+  os,
+  path,
+  tempDirs,
+  transcriptMirrorMocks,
   CODEX_APP_SERVER_THREADS_LIST_COMMAND,
   listCodexSessionCatalog,
   continueLocalCodexSession,
@@ -24,107 +39,134 @@ import {
   type CodexThread,
   type OpenClawConfig,
   type PluginRuntime,
-  originalPath,
-  tempDirs,
-  fs,
 } from "./session-catalog.test-helpers.js";
 
-const commandRpcMocks = vi.hoisted(() => ({
-  codexControlRequest: vi.fn(),
-}));
-const pinnedConnectionMocks = vi.hoisted(() => ({
-  client: { connectionId: "pinned-catalog-client" },
-  getClient: vi.fn(),
-  releaseClient: vi.fn(),
-  request: vi.fn(),
-}));
-const transcriptMirrorMocks = vi.hoisted(() => ({
-  importCodexThreadHistoryToTranscript: vi.fn(async () => ({
-    importedMessages: 0,
-    omittedMessages: 0,
-  })),
-}));
-const nodeHostMocks = vi.hoisted(() => ({
-  runNodePtyCommand: vi.fn(async () => ({ exitCode: 0 })),
-  userShellPaths: new Map<string, string>(),
-}));
-
-vi.mock("./command-rpc.js", () => ({
-  codexControlRequest: commandRpcMocks.codexControlRequest,
-}));
-vi.mock("./app-server/request.js", () => ({
-  requestCodexAppServerClientJson: pinnedConnectionMocks.request,
-}));
-vi.mock("./app-server/shared-client.js", () => ({
-  getLeasedSharedCodexAppServerClient: pinnedConnectionMocks.getClient,
-  releaseLeasedSharedCodexAppServerClient: pinnedConnectionMocks.releaseClient,
-}));
-vi.mock("./app-server/transcript-mirror.js", () => ({
-  importCodexThreadHistoryToTranscript: transcriptMirrorMocks.importCodexThreadHistoryToTranscript,
-}));
-vi.mock("./session-catalog-pty.runtime.js", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("./session-catalog-pty.runtime.js")>();
-  return {
-    ...actual,
-    runNodePtyCommand: nodeHostMocks.runNodePtyCommand,
-    resolveNodeHostExecutable: (
-      command: string,
-      options: {
-        env?: NodeJS.ProcessEnv;
-        pathEnv?: string;
-        includeExtensionless?: boolean;
-        strategy: "direct" | "fallback" | "prefer";
-      },
-    ) => {
-      const env = options.env ?? process.env;
-      const pathEnv = options.pathEnv ?? env.PATH ?? env.Path ?? "";
-      const direct = actual.resolveNodeHostExecutable(command, {
-        env,
-        pathEnv,
-        includeExtensionless: options.includeExtensionless,
-        strategy: "direct",
-      });
-      if (direct && options.strategy !== "prefer") {
-        return direct;
-      }
-      const shellPath = nodeHostMocks.userShellPaths.get(command);
-      if (!shellPath) {
-        return direct;
-      }
-      const shellExecutable = actual.resolveNodeHostExecutable(command, {
-        env,
-        pathEnv: shellPath,
-        includeExtensionless: options.includeExtensionless,
-        strategy: "direct",
-      });
-      return shellExecutable
-        ? { executable: shellExecutable.executable, pathEnv: shellPath }
-        : direct;
-    },
-  };
-});
-
-beforeEach(() => {
-  nodeHostMocks.runNodePtyCommand.mockClear();
-  nodeHostMocks.userShellPaths.clear();
-  commandRpcMocks.codexControlRequest.mockReset();
-  pinnedConnectionMocks.getClient.mockReset();
-  pinnedConnectionMocks.getClient.mockResolvedValue(pinnedConnectionMocks.client);
-  pinnedConnectionMocks.releaseClient.mockReset();
-  pinnedConnectionMocks.request.mockReset();
-  transcriptMirrorMocks.importCodexThreadHistoryToTranscript.mockReset();
-  transcriptMirrorMocks.importCodexThreadHistoryToTranscript.mockResolvedValue({
-    importedMessages: 0,
-    omittedMessages: 0,
-  });
-});
-
-afterEach(async () => {
-  process.env.PATH = originalPath;
-  await Promise.all(tempDirs.splice(0).map((dir) => fs.rm(dir, { recursive: true, force: true })));
-});
-
 describe("Codex supervision catalog", () => {
+  it("refreshes bulk adoption authority after a generation changes or a binding disappears", async () => {
+    const state = createPluginStateSyncKeyedStoreForTests<StoredCodexAppServerBinding>("codex", {
+      namespace: "adoption-cohort",
+      maxEntries: 10,
+    });
+    const bindingStore = createLazyCodexAppServerBindingStore(state);
+    const entries = ["first", "second"].map((sourceThreadId) => ({
+      sessionKey: supervisionSessionKey(sourceThreadId),
+      entry: adoptedEntry({ sourceThreadId, sessionId: `session-${sourceThreadId}` }),
+    }));
+    const { runtime } = createRuntime({ entries });
+    try {
+      for (const [index, sourceThreadId] of ["first", "second"].entries()) {
+        await seedSupervisionBinding({
+          bindingStore,
+          sessionId: entries[index]!.entry.sessionId,
+          sessionKey: entries[index]!.sessionKey,
+          sourceThreadId,
+        });
+      }
+      const lookupMany = vi.spyOn(state, "lookupMany");
+      const lookup = vi.spyOn(state, "lookup");
+      const list = () =>
+        listCodexSessionCatalog({
+          bindingStore,
+          config,
+          runtime,
+          control: createControl({
+            listPage: vi.fn(async () => ({
+              sessions: ["first", "second"].map((threadId) => ({
+                threadId,
+                status: "idle",
+                archived: false as const,
+              })),
+            })),
+          }),
+        });
+      expect((await list()).hosts[0]?.sessions.map((entry) => entry.sessionKey)).toEqual(
+        entries.map((entry) => entry.sessionKey),
+      );
+      entries[0]!.entry.sessionId = "successor";
+      expect((await list()).hosts[0]?.sessions.map((entry) => entry.sessionKey)).toEqual([
+        undefined,
+        entries[1]!.sessionKey,
+      ]);
+      const firstIdentity = sessionBindingIdentity({
+        sessionId: "successor",
+        sessionKey: entries[0]!.sessionKey,
+        config,
+      });
+      state.update(
+        bindingStoreKey(firstIdentity),
+        (row) => row && { ...row, sessionId: "successor" },
+      );
+      state.delete(
+        bindingStoreKey(
+          sessionBindingIdentity({
+            sessionId: entries[1]!.entry.sessionId,
+            sessionKey: entries[1]!.sessionKey,
+            config,
+          }),
+        ),
+      );
+      expect((await list()).hosts[0]?.sessions.map((entry) => entry.sessionKey)).toEqual([
+        entries[0]!.sessionKey,
+        undefined,
+      ]);
+      expect(lookupMany).toHaveBeenCalled();
+      expect(lookup).not.toHaveBeenCalled();
+    } finally {
+      resetPluginStateStoreForTests();
+    }
+  });
+
+  it("reports duplicate adoption across agents before decoding a later malformed bulk row", async () => {
+    const state = createPluginStateSyncKeyedStoreForTests<StoredCodexAppServerBinding>("codex", {
+      namespace: "adoption-order",
+      maxEntries: 10,
+    });
+    const bindingStore = createLazyCodexAppServerBindingStore(state);
+    const cohortConfig: OpenClawConfig = {
+      agents: { list: [{ id: "main", default: true }, { id: "beta" }, { id: "gamma" }] },
+    };
+    const duplicates = ["main", "beta"].map((agentId) => ({
+      sessionKey: `agent:${agentId}:${supervisionSessionInputKey("duplicate")}`,
+      entry: adoptedEntry({ sourceThreadId: "duplicate", sessionId: `${agentId}-session` }),
+    }));
+    const malformed = {
+      sessionKey: `agent:gamma:${supervisionSessionInputKey("malformed")}`,
+      entry: adoptedEntry({ sourceThreadId: "malformed", sessionId: "malformed-session" }),
+    };
+    const { runtime, entries } = createRuntime({ entries: [...duplicates, malformed] });
+    try {
+      for (const duplicate of duplicates) {
+        await seedSupervisionBinding({
+          bindingStore,
+          sessionId: duplicate.entry.sessionId,
+          sessionKey: duplicate.sessionKey,
+          sourceThreadId: "duplicate",
+        });
+      }
+      const key = bindingStoreKey(
+        sessionBindingIdentity({
+          sessionId: malformed.entry.sessionId,
+          sessionKey: malformed.sessionKey,
+          config: cohortConfig,
+        }),
+      );
+      state.register(key, { version: 1, state: "active", binding: { threadId: "", cwd: "/repo" } });
+      const lookupMany = vi.spyOn(state, "lookupMany");
+      await expect(
+        listAdoptedSessionEntries({ bindingStore, config: cohortConfig, runtime }),
+      ).rejects.toThrow(
+        "multiple OpenClaw sessions adopt Codex thread duplicate from the same home",
+      );
+      entries.splice(1, 1);
+      await expect(
+        listAdoptedSessionEntries({ bindingStore, config: cohortConfig, runtime }),
+      ).rejects.toThrow(`Invalid Codex app-server binding row: ${key}`);
+      expect(lookupMany).toHaveBeenCalledTimes(2);
+    } finally {
+      resetPluginStateStoreForTests();
+    }
+  });
+
   it("enriches only the local source row with its adopted OpenClaw session", async () => {
     const control = createControl({
       listPage: vi.fn(async () => ({
@@ -321,6 +363,68 @@ describe("Codex supervision catalog", () => {
 });
 
 describe("Codex supervision actions", () => {
+  it("imports an exact local source when broad native listing times out", async () => {
+    const home = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "codex-exact-import-")));
+    tempDirs.push(home);
+    const sessionsRoot = path.join(home, "sessions");
+    await fs.mkdir(sessionsRoot);
+    const rollout = path.join(sessionsRoot, "source.jsonl");
+    await fs.writeFile(
+      rollout,
+      `${JSON.stringify({
+        type: "session_meta",
+        payload: {
+          id: "thread-source",
+          source: "cli",
+          originator: "codex_cli_rs",
+        },
+      })}\n`,
+    );
+    const sourceThread = idleThread({
+      id: "thread-source",
+      source: "cli",
+      path: rollout,
+      turns: [],
+    });
+    let indexed = false;
+    pinnedConnectionMocks.request.mockImplementation(async ({ method, requestParams }) => {
+      if (method === "thread/read") {
+        indexed = true;
+        return { thread: sourceThread };
+      }
+      if (method === "thread/list" && requestParams.useStateDbOnly === true) {
+        return { data: indexed ? [sourceThread] : [] };
+      }
+      throw new Error("thread/list timed out");
+    });
+    const factory = createCodexSessionCatalogControlFactory({
+      getPluginConfig: () => ({}),
+      getRuntimeConfig: () => config,
+      env: { CODEX_HOME: home },
+    });
+    const source = (await factory.homesForAgent("main"))[0]!;
+    const { runtime, createSessionEntry } = createRuntime();
+    const { api } = createGatewayApi(runtime);
+    await expect(
+      continueLocalCodexSession({
+        api,
+        bindingStore: createCodexTestBindingStore(),
+        config,
+        control: factory.forRequest("main", source),
+        threadId: sourceThread.id,
+        sourceHomeId: source.sourceHomeId,
+      }),
+    ).resolves.toMatchObject({ disposition: "forked" });
+    expect(createSessionEntry).toHaveBeenCalledOnce();
+    expect(transcriptMirrorMocks.importCodexThreadHistoryToTranscript).toHaveBeenCalledWith(
+      expect.objectContaining({ thread: sourceThread }),
+    );
+    expect(pinnedConnectionMocks.request.mock.calls.map(([request]) => request.method)).toEqual([
+      "thread/read",
+      "thread/read",
+    ]);
+  });
+
   it("lists and adopts a local session under the retained compatibility owner", async () => {
     const runtimeConfig = compatibilityOwnerConfig();
     const { runtime, createSessionEntry } = createRuntime();
@@ -409,11 +513,12 @@ describe("Codex supervision actions", () => {
     ]);
     expect(control.withPinnedConnection).toHaveBeenCalledTimes(2);
     expect(createSessionEntry).toHaveBeenCalledOnce();
+    expect(createSessionEntry.mock.calls[0]?.[0]).not.toHaveProperty("label");
     expect(createSessionEntry).toHaveBeenCalledWith(
       expect.objectContaining({
         cfg: config,
         key: supervisionSessionInputKey("thread-1"),
-        label: "Continue native task",
+        displayName: "Continue native task",
         spawnedCwd: "/workspace/project",
         afterCreate: expect.any(Function),
         initialEntry: {
@@ -432,9 +537,10 @@ describe("Codex supervision actions", () => {
       }),
     );
     expect(transcriptMirrorMocks.importCodexThreadHistoryToTranscript).toHaveBeenCalledWith({
+      assertCurrent: expect.any(Function),
       thread: sourceThread,
       storePath: resolveStorePath(undefined, { agentId: "main" }),
-      sessionId: "openclaw-session-1",
+      sessionId: runtime.agent.session.getSessionEntry({ sessionKey: first.sessionKey })!.sessionId,
       sessionKey: first.sessionKey,
       agentId: "main",
       cwd: "/workspace/project",
@@ -442,15 +548,16 @@ describe("Codex supervision actions", () => {
       modelProvider: "openai",
       config,
     });
-    await expect(
+    expect(
       bindingStore.read(
         sessionBindingIdentity({
-          sessionId: "openclaw-session-1",
+          sessionId: runtime.agent.session.getSessionEntry({ sessionKey: first.sessionKey })!
+            .sessionId,
           sessionKey: first.sessionKey,
           config,
         }),
       ),
-    ).resolves.toMatchObject({
+    ).toMatchObject({
       threadId: "thread-1",
       connectionScope: "supervision",
       supervisionSourceThreadId: "thread-1",
@@ -703,11 +810,12 @@ describe("Codex supervision actions", () => {
     expect(control.archiveThread).not.toHaveBeenCalled();
 
     const identity = sessionBindingIdentity({
-      sessionId: "openclaw-session-1",
+      sessionId: runtime.agent.session.getSessionEntry({ sessionKey: continued.sessionKey })!
+        .sessionId,
       sessionKey: continued.sessionKey,
       config,
     });
-    const pending = (await bindingStore.read(identity))?.pendingSupervisionBranch;
+    const pending = bindingStore.read(identity)?.pendingSupervisionBranch;
     if (!pending) {
       throw new Error("expected a pending supervision branch");
     }

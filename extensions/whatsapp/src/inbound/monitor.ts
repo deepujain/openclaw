@@ -1,8 +1,8 @@
 // Whatsapp plugin module composes the inbound socket, metadata, and delivery owners.
 import type { WAMessageKey, WASocket } from "baileys";
+import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import { getChildLogger } from "openclaw/plugin-sdk/logging-core";
 import { createSubsystemLogger, defaultRuntime } from "openclaw/plugin-sdk/runtime-env";
-import type { OpenClawConfig } from "../runtime-api.js";
 import { createWaSocket, waitForWaConnection } from "../session.js";
 import { resolveWhatsAppSocketTiming, type WhatsAppSocketTimingOptions } from "../socket-timing.js";
 import {
@@ -10,10 +10,7 @@ import {
   type WhatsAppBaileysGroupMetadataCache,
   type WhatsAppBaileysMessageCache,
 } from "./baileys-cache.js";
-import {
-  createWhatsAppDurableInboundQueue,
-  type WhatsAppDurableInboundQueue,
-} from "./durable-receive.js";
+import type { WhatsAppDurableInboundQueue } from "./durable-receive.js";
 import {
   createWhatsAppGroupMetadataCacheOwner,
   type WhatsAppGroupMetadataCache,
@@ -74,13 +71,8 @@ type MonitorWebInboxOptions = {
   durableInboundQueue?: WhatsAppDurableInboundQueue;
 };
 
-type AttachWebInboxToSocketOptions = Omit<
-  MonitorWebInboxOptions,
-  "onMessage" | "shouldDebounce" | "socketTiming"
-> & {
+type AttachWebInboxToSocketOptions = MonitorWebInboxOptions & {
   socketTiming: Required<WhatsAppSocketTimingOptions>;
-  onMessage: (msg: AdmittedWebInboundCallbackMessage) => Promise<void>;
-  shouldDebounce?: (msg: AdmittedWebInboundCallbackMessage) => boolean;
 };
 
 export async function attachWebInboxToSocket(
@@ -134,8 +126,7 @@ export async function attachWebInboxToSocket(
     appendReplyWindow: options.appendReplyWindow,
     shouldDebounce: options.shouldDebounce,
     onPendingWorkChanged: options.onPendingWorkChanged,
-    durableInboundQueue:
-      options.durableInboundQueue ?? createWhatsAppDurableInboundQueue(options.accountId),
+    durableInboundQueue: options.durableInboundQueue,
   });
   const sendApi = createWebSendApi({
     sock: socketSession.socketOperations,

@@ -1,114 +1,99 @@
-import type { DatabaseSync } from "node:sqlite";
-import type { Selectable } from "kysely";
 import {
-  executeSqliteQuerySync,
-  executeSqliteQueryTakeFirstSync,
-  getNodeSqliteKysely,
-} from "../infra/kysely-sync.js";
-import type { DB as OpenClawStateKyselyDatabase } from "../state/openclaw-state-db.generated.js";
+  updateConfigMachineState,
+  updateConfigMachineStateInDatabase,
+} from "../state/config-machine-state-write.js";
 import {
-  openOpenClawStateDatabase,
+  readConfigMachineState,
+  readConfigMachineStateRowInDatabase,
+} from "../state/config-machine-state.js";
+import { isArtifactPreservingStateRead } from "../state/openclaw-state-db-readonly.js";
+import {
   runOpenClawStateWriteTransaction,
   type OpenClawStateDatabaseOptions,
 } from "../state/openclaw-state-db.js";
+import type { OpenClawStateWorkerContext } from "../state/openclaw-state-worker-context.types.js";
 
-type RemoteModelCatalogDatabase = Pick<OpenClawStateKyselyDatabase, "model_catalog_remote">;
-type RemoteModelCatalogStoreRow = Selectable<OpenClawStateKyselyDatabase["model_catalog_remote"]>;
+type RemoteModelCatalogStoreRow = {
+  id: number;
+  bundle_json: string;
+  generated_at: number;
+  min_version: string | null;
+  source_url: string;
+  etag: string | null;
+  last_modified: string | null;
+  checked_at: number;
+};
+
+type RemoteModelCatalogSnapshot = Omit<RemoteModelCatalogStoreRow, "id">;
 
 type RemoteModelCatalogWriteResult =
   | { status: "written" }
   | { status: "retained-newer"; row: RemoteModelCatalogStoreRow };
 
-const ensuredDatabases = new WeakSet<DatabaseSync>();
-const REMOTE_MODEL_CATALOG_SCHEMA_SQL = `
-CREATE TABLE IF NOT EXISTS model_catalog_remote (
-  id INTEGER PRIMARY KEY CHECK (id = 1),
-  bundle_json TEXT NOT NULL,
-  generated_at INTEGER NOT NULL,
-  min_version TEXT,
-  source_url TEXT NOT NULL,
-  etag TEXT,
-  last_modified TEXT,
-  checked_at INTEGER NOT NULL
-) STRICT;
-`;
-
-function ensureRemoteModelCatalogSchema(options: OpenClawStateDatabaseOptions = {}): void {
-  const database = openOpenClawStateDatabase(options);
-  if (ensuredDatabases.has(database.db)) {
-    return;
-  }
-  runOpenClawStateWriteTransaction(
-    ({ db }) => {
-      // sqlite-allow-raw -- feature-local additive schema DDL; catalog rows use Kysely below.
-      db.exec(REMOTE_MODEL_CATALOG_SCHEMA_SQL);
-    },
-    options,
-    { operationLabel: "model-catalog.remote.schema.ensure" },
-  );
-  ensuredDatabases.add(database.db);
-}
-
-function openDatabase(options: OpenClawStateDatabaseOptions) {
-  ensureRemoteModelCatalogSchema(options);
-  return openOpenClawStateDatabase(options);
-}
+// Older clients retain their v1 slot, including when both versions refresh the same mirror.
+const REMOTE_MODEL_CATALOG_STATE_KEY = "modelCatalog.remote.v2";
+// Upgrades read the older client's row until this client stores its own. The row parses as
+// a v1 bundle, and activation still checks its source and age. It is never written here, so
+// a downgraded client keeps its catalog.
+const LEGACY_REMOTE_MODEL_CATALOG_STATE_KEY = "modelCatalog.remote";
 
 export function readRemoteModelCatalog(
   options: OpenClawStateDatabaseOptions = {},
 ): RemoteModelCatalogStoreRow | undefined {
-  const state = openDatabase(options);
-  const db = getNodeSqliteKysely<RemoteModelCatalogDatabase>(state.db);
-  return executeSqliteQueryTakeFirstSync(
-    state.db,
-    db.selectFrom("model_catalog_remote").selectAll().where("id", "=", 1),
+  const snapshot =
+    readConfigMachineState<RemoteModelCatalogSnapshot>(REMOTE_MODEL_CATALOG_STATE_KEY, options) ??
+    readConfigMachineState<RemoteModelCatalogSnapshot>(
+      LEGACY_REMOTE_MODEL_CATALOG_STATE_KEY,
+      options,
+    );
+  return snapshot ? { id: 1, ...snapshot } : undefined;
+}
+
+/** Read the startup catalog through the existing shared-state inspection owner. */
+export async function readRemoteModelCatalogAsync(
+  context: OpenClawStateWorkerContext,
+): Promise<RemoteModelCatalogStoreRow | undefined> {
+  const artifactPreservingReadOnly = isArtifactPreservingStateRead();
+  const { runOpenClawStateWorkerOperation } =
+    await import("../state/openclaw-state-worker-store.js");
+  context.admission.assertCurrent();
+  return runOpenClawStateWorkerOperation(
+    context,
+    async (scope) => {
+      const row = await scope.execute({
+        type: "modelCatalog.remote.read",
+        input: { artifactPreservingReadOnly },
+      });
+      context.admission.assertCurrent();
+      return row;
+    },
+    { existingOnly: true },
   );
 }
 
 export function writeRemoteModelCatalog(
-  row: Omit<RemoteModelCatalogStoreRow, "id">,
+  row: RemoteModelCatalogSnapshot,
   options: OpenClawStateDatabaseOptions = {},
 ): RemoteModelCatalogWriteResult {
-  ensureRemoteModelCatalogSchema(options);
-  return runOpenClawStateWriteTransaction(
-    ({ db: sqlite }) => {
-      const db = getNodeSqliteKysely<RemoteModelCatalogDatabase>(sqlite);
-      const current = executeSqliteQueryTakeFirstSync(
-        sqlite,
-        db.selectFrom("model_catalog_remote").selectAll().where("id", "=", 1),
-      );
-      // The CLI and Gateway can refresh concurrently in separate processes.
-      // Compare under BEGIN IMMEDIATE so a slower stale response cannot win the singleton slot.
+  let result: RemoteModelCatalogWriteResult = { status: "written" };
+  updateConfigMachineState<RemoteModelCatalogSnapshot>(
+    REMOTE_MODEL_CATALOG_STATE_KEY,
+    (current) => {
+      // CLI and Gateway refreshes race across processes; compare inside the write transaction.
       if (
         current &&
         current.source_url === row.source_url &&
         (current.generated_at > row.generated_at ||
           (current.generated_at === row.generated_at && current.bundle_json !== row.bundle_json))
       ) {
-        return { status: "retained-newer", row: current };
+        result = { status: "retained-newer", row: { id: 1, ...current } };
+        return current;
       }
-      executeSqliteQuerySync(
-        sqlite,
-        db
-          .insertInto("model_catalog_remote")
-          .values({ id: 1, ...row })
-          .onConflict((conflict) =>
-            conflict.column("id").doUpdateSet({
-              bundle_json: row.bundle_json,
-              generated_at: row.generated_at,
-              min_version: row.min_version,
-              source_url: row.source_url,
-              etag: row.etag,
-              last_modified: row.last_modified,
-              checked_at: row.checked_at,
-            }),
-          ),
-      );
-      return { status: "written" };
+      return row;
     },
     options,
-    { operationLabel: "model-catalog.remote.write" },
   );
+  return result;
 }
 
 export function markRemoteModelCatalogChecked(
@@ -123,31 +108,50 @@ export function markRemoteModelCatalogChecked(
   },
   options: OpenClawStateDatabaseOptions = {},
 ): boolean {
-  ensureRemoteModelCatalogSchema(options);
-  return runOpenClawStateWriteTransaction(
-    ({ db: sqlite }) => {
-      const db = getNodeSqliteKysely<RemoteModelCatalogDatabase>(sqlite);
-      let query = db
-        .updateTable("model_catalog_remote")
-        .set({
-          checked_at: checkedAt,
-          ...(metadata.etag !== undefined ? { etag: metadata.etag } : {}),
-          ...(metadata.lastModified !== undefined ? { last_modified: metadata.lastModified } : {}),
-        })
-        .where("id", "=", 1)
-        .where("source_url", "=", metadata.expected.source_url)
-        .where("generated_at", "=", metadata.expected.generated_at);
-      query =
-        metadata.expected.etag === null
-          ? query.where("etag", "is", null)
-          : query.where("etag", "=", metadata.expected.etag);
-      query =
-        metadata.expected.last_modified === null
-          ? query.where("last_modified", "is", null)
-          : query.where("last_modified", "=", metadata.expected.last_modified);
-      return executeSqliteQuerySync(sqlite, query).numAffectedRows === 1n;
+  let matched = false;
+  runOpenClawStateWriteTransaction(
+    ({ db }) => {
+      // Read the legacy slot in this transaction so an older client's concurrent refresh
+      // is seen. Only a matching legacy row is adopted into this client's slot; the legacy
+      // slot itself is never written.
+      const legacyJson = readConfigMachineStateRowInDatabase(
+        db,
+        LEGACY_REMOTE_MODEL_CATALOG_STATE_KEY,
+      )?.value_json;
+      let legacy: RemoteModelCatalogSnapshot | undefined;
+      if (legacyJson !== undefined) {
+        // SAFETY: Only OpenClaw catalog stores write this key, always as a catalog snapshot.
+        legacy = JSON.parse(legacyJson) as RemoteModelCatalogSnapshot;
+      }
+      updateConfigMachineStateInDatabase<RemoteModelCatalogSnapshot>(
+        db,
+        REMOTE_MODEL_CATALOG_STATE_KEY,
+        (stored) => {
+          const current = stored ?? legacy;
+          if (
+            !current ||
+            current.source_url !== metadata.expected.source_url ||
+            current.generated_at !== metadata.expected.generated_at ||
+            current.etag !== metadata.expected.etag ||
+            current.last_modified !== metadata.expected.last_modified
+          ) {
+            return stored;
+          }
+          matched = true;
+          return {
+            ...current,
+            checked_at: checkedAt,
+            ...(metadata.etag !== undefined ? { etag: metadata.etag } : {}),
+            ...(metadata.lastModified !== undefined
+              ? { last_modified: metadata.lastModified }
+              : {}),
+          };
+        },
+        Date.now(),
+      );
     },
     options,
-    { operationLabel: "model-catalog.remote.checked" },
+    { operationLabel: "model-catalog.remote.mark-checked" },
   );
+  return matched;
 }

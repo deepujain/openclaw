@@ -1,6 +1,7 @@
 // Mattermost plugin module implements slash commands behavior.
 import { normalizeOptionalString } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { truncateUtf8Prefix } from "openclaw/plugin-sdk/text-utility-runtime";
+import { isWildcardBindHost } from "./callback-host.js";
 import type { MattermostClient } from "./client.js";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
@@ -86,18 +87,6 @@ type MattermostCommandCreate = {
   auto_complete_hint?: string;
   token?: string;
   creator_id?: string;
-};
-
-type MattermostCommandUpdate = {
-  id: string;
-  team_id: string;
-  trigger: string;
-  method: typeof MATTERMOST_SLASH_POST_METHOD | "G";
-  url: string;
-  description?: string;
-  auto_complete: boolean;
-  auto_complete_desc?: string;
-  auto_complete_hint?: string;
 };
 
 export type MattermostCommandResponse = {
@@ -217,41 +206,14 @@ export async function getMattermostCommand(
 }
 
 /**
- * Create a custom slash command on a Mattermost team.
- */
-async function createMattermostCommand(
-  client: MattermostClient,
-  params: MattermostCommandCreate,
-): Promise<MattermostCommandResponse> {
-  return await client.request<MattermostCommandResponse>("/commands", {
-    method: "POST",
-    body: JSON.stringify(params),
-  });
-}
-
-/**
  * Delete a custom slash command.
  */
 async function deleteMattermostCommand(client: MattermostClient, commandId: string): Promise<void> {
-  await client.request<Record<string, unknown>>(`/commands/${encodeURIComponent(commandId)}`, {
+  // Mattermost answers with 200 {"status":"OK"}; registration recreates the command after this.
+  await client.request<void>(`/commands/${encodeURIComponent(commandId)}`, {
     method: "DELETE",
+    discardResponse: true,
   });
-}
-
-/**
- * Update an existing custom slash command.
- */
-async function updateMattermostCommand(
-  client: MattermostClient,
-  params: MattermostCommandUpdate,
-): Promise<MattermostCommandResponse> {
-  return await client.request<MattermostCommandResponse>(
-    `/commands/${encodeURIComponent(params.id)}`,
-    {
-      method: "PUT",
-      body: JSON.stringify(params),
-    },
-  );
 }
 
 /**
@@ -321,6 +283,16 @@ export async function registerSlashCommands(params: {
     }
 
     const existingCmd = ownedCommands[0];
+    const command: MattermostCommandCreate = {
+      team_id: teamId,
+      trigger: spec.trigger,
+      method: MATTERMOST_SLASH_POST_METHOD,
+      url: callbackUrl,
+      description,
+      auto_complete: spec.autoComplete,
+      auto_complete_desc: description,
+      auto_complete_hint: spec.autoCompleteHint,
+    };
 
     const existingNeedsUpdate = existingCmd
       ? existingCmd.url !== callbackUrl || existingCmd.method !== MATTERMOST_SLASH_POST_METHOD
@@ -347,17 +319,13 @@ export async function registerSlashCommands(params: {
         `mattermost: command /${spec.trigger} exists with different callback settings; updating (id=${existingCmd.id})`,
       );
       try {
-        const updated = await updateMattermostCommand(client, {
-          id: existingCmd.id,
-          team_id: teamId,
-          trigger: spec.trigger,
-          method: MATTERMOST_SLASH_POST_METHOD,
-          url: callbackUrl,
-          description,
-          auto_complete: spec.autoComplete,
-          auto_complete_desc: description,
-          auto_complete_hint: spec.autoCompleteHint,
-        });
+        const updated = await client.request<MattermostCommandResponse>(
+          `/commands/${encodeURIComponent(existingCmd.id)}`,
+          {
+            method: "PUT",
+            body: JSON.stringify({ id: existingCmd.id, ...command }),
+          },
+        );
         registered.push({
           id: updated.id,
           trigger: spec.trigger,
@@ -387,15 +355,9 @@ export async function registerSlashCommands(params: {
     }
 
     try {
-      const created = await createMattermostCommand(client, {
-        team_id: teamId,
-        trigger: spec.trigger,
-        method: MATTERMOST_SLASH_POST_METHOD,
-        url: callbackUrl,
-        description,
-        auto_complete: spec.autoComplete,
-        auto_complete_desc: description,
-        auto_complete_hint: spec.autoCompleteHint,
+      const created = await client.request<MattermostCommandResponse>("/commands", {
+        method: "POST",
+        body: JSON.stringify(command),
       });
       log?.(`mattermost: registered command /${spec.trigger} (id=${created.id})`);
       registered.push({
@@ -450,42 +412,18 @@ export function parseSlashCommandPayload(
   }
 
   try {
-    if (contentType?.includes("application/json")) {
-      const parsed = JSON.parse(body) as Record<string, unknown>;
-
-      // Validate required fields (same checks as the form-encoded branch)
-      const token = typeof parsed.token === "string" ? parsed.token : "";
-      const teamId = typeof parsed.team_id === "string" ? parsed.team_id : "";
-      const channelId = typeof parsed.channel_id === "string" ? parsed.channel_id : "";
-      const userId = typeof parsed.user_id === "string" ? parsed.user_id : "";
-      const command = typeof parsed.command === "string" ? parsed.command : "";
-
-      if (!token || !teamId || !channelId || !userId || !command) {
-        return null;
-      }
-
-      return {
-        token,
-        team_id: teamId,
-        team_domain: typeof parsed.team_domain === "string" ? parsed.team_domain : undefined,
-        channel_id: channelId,
-        channel_name: typeof parsed.channel_name === "string" ? parsed.channel_name : undefined,
-        user_id: userId,
-        user_name: typeof parsed.user_name === "string" ? parsed.user_name : undefined,
-        command,
-        text: typeof parsed.text === "string" ? parsed.text : "",
-        trigger_id: typeof parsed.trigger_id === "string" ? parsed.trigger_id : undefined,
-        response_url: typeof parsed.response_url === "string" ? parsed.response_url : undefined,
-      };
-    }
-
-    // Default: application/x-www-form-urlencoded
-    const params = new URLSearchParams(body);
-    const token = params.get("token");
-    const teamId = params.get("team_id");
-    const channelId = params.get("channel_id");
-    const userId = params.get("user_id");
-    const command = params.get("command");
+    const json = contentType?.includes("application/json");
+    const parsed = json ? (JSON.parse(body) as Record<string, unknown>) : undefined;
+    const form = json ? undefined : new URLSearchParams(body);
+    const read = (key: string): string | undefined => {
+      const value = form ? form.get(key) : parsed?.[key];
+      return typeof value === "string" ? value : undefined;
+    };
+    const token = read("token");
+    const teamId = read("team_id");
+    const channelId = read("channel_id");
+    const userId = read("user_id");
+    const command = read("command");
 
     if (!token || !teamId || !channelId || !userId || !command) {
       return null;
@@ -494,15 +432,15 @@ export function parseSlashCommandPayload(
     return {
       token,
       team_id: teamId,
-      team_domain: params.get("team_domain") ?? undefined,
+      team_domain: read("team_domain"),
       channel_id: channelId,
-      channel_name: params.get("channel_name") ?? undefined,
+      channel_name: read("channel_name"),
       user_id: userId,
-      user_name: params.get("user_name") ?? undefined,
+      user_name: read("user_name"),
       command,
-      text: params.get("text") ?? "",
-      trigger_id: params.get("trigger_id") ?? undefined,
-      response_url: params.get("response_url") ?? undefined,
+      text: read("text") ?? "",
+      trigger_id: read("trigger_id"),
+      response_url: read("response_url"),
     };
   } catch {
     return null;
@@ -557,14 +495,8 @@ export function resolveSlashCommandConfig(
 }
 
 export function isSlashCommandsEnabled(config: MattermostSlashCommandConfig): boolean {
-  if (config.native === true) {
-    return true;
-  }
-  if (config.native === false) {
-    return false;
-  }
   // "auto" defaults to false for mattermost (opt-in)
-  return false;
+  return config.native === true;
 }
 
 /**
@@ -578,19 +510,6 @@ export function resolveCallbackUrl(params: {
   if (params.config.callbackUrl) {
     return params.config.callbackUrl;
   }
-
-  const isWildcardBindHost = (rawHost: string): boolean => {
-    const trimmed = rawHost.trim();
-    if (!trimmed) {
-      return false;
-    }
-    const host = trimmed.startsWith("[") && trimmed.endsWith("]") ? trimmed.slice(1, -1) : trimmed;
-
-    // NOTE: Wildcard listen hosts are valid bind addresses but are not routable callback
-    // destinations. Don't emit callback URLs like http://0.0.0.0:3015/... or http://[::]:3015/...
-    // when an operator sets gateway.customBindHost.
-    return host === "0.0.0.0" || host === "::" || host === "0:0:0:0:0:0:0:0" || host === "::0";
-  };
 
   let host =
     params.gatewayHost && !isWildcardBindHost(params.gatewayHost)

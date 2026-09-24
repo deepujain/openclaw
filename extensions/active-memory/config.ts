@@ -8,9 +8,10 @@ import {
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/plugin-entry";
 import {
   asOptionalRecord,
-  normalizeLowercaseStringOrEmpty,
   normalizeOptionalString,
   normalizeStringEntries,
+  normalizeTrimmedStringList,
+  uniqueStrings,
 } from "openclaw/plugin-sdk/string-coerce-runtime";
 import {
   ACTIVE_MEMORY_RESERVED_TOOLS_ALLOW,
@@ -70,67 +71,24 @@ function normalizeTranscriptDir(value: unknown): string {
   return safeParts.length > 0 ? path.join(...safeParts) : DEFAULT_TRANSCRIPT_DIR;
 }
 
-function normalizeChatIdList(value: unknown): string[] {
-  if (!Array.isArray(value)) {
-    return [];
-  }
-  const seen = new Set<string>();
-  const out: string[] = [];
-  for (const entry of value) {
-    if (typeof entry !== "string") {
-      continue;
-    }
-    const trimmed = entry.trim().toLowerCase();
-    if (!trimmed) {
-      continue;
-    }
-    if (seen.has(trimmed)) {
-      continue;
-    }
-    seen.add(trimmed);
-    out.push(trimmed);
-  }
-  return out;
+function normalizeIdentifierList(value: unknown): string[] {
+  return uniqueStrings(normalizeTrimmedStringList(value).map((entry) => entry.toLowerCase()));
 }
 
 function normalizeConfiguredToolsAllow(value: unknown): string[] | undefined {
   if (!Array.isArray(value)) {
     return undefined;
   }
-  const seen = new Set<string>();
-  const out: string[] = [];
-  for (const entry of value) {
-    if (typeof entry !== "string") {
-      continue;
-    }
-    const normalized = normalizeLowercaseStringOrEmpty(entry);
-    if (!normalized || isReservedActiveMemoryToolsAllowEntry(normalized) || seen.has(normalized)) {
-      continue;
-    }
-    seen.add(normalized);
-    out.push(normalized);
-    if (out.length >= MAX_ACTIVE_MEMORY_TOOLS_ALLOW) {
-      break;
-    }
-  }
-  return out.length > 0 ? out : undefined;
-}
-
-function isReservedActiveMemoryToolsAllowEntry(value: string): boolean {
-  const normalized = value.trim().toLowerCase();
-  return normalized.startsWith("group:") || ACTIVE_MEMORY_RESERVED_TOOLS_ALLOW.has(normalized);
+  const tools = normalizeIdentifierList(value)
+    .filter((name) => !name.startsWith("group:") && !ACTIVE_MEMORY_RESERVED_TOOLS_ALLOW.has(name))
+    .slice(0, MAX_ACTIVE_MEMORY_TOOLS_ALLOW);
+  return tools.length > 0 ? tools : undefined;
 }
 
 function resolveDefaultToolsAllow(cfg: OpenClawConfig | undefined): string[] {
   return cfg?.plugins?.slots?.memory === "memory-lancedb"
     ? [...LANCEDB_ACTIVE_MEMORY_TOOLS_ALLOW]
     : [...DEFAULT_ACTIVE_MEMORY_TOOLS_ALLOW];
-}
-
-function resolveToolsAllow(params: { pluginToolsAllow: unknown; cfg?: OpenClawConfig }): string[] {
-  return (
-    normalizeConfiguredToolsAllow(params.pluginToolsAllow) ?? resolveDefaultToolsAllow(params.cfg)
-  );
 }
 
 function hasDeprecatedModelFallbackPolicy(pluginConfig: unknown): boolean {
@@ -165,13 +123,6 @@ function resolvePersistentTranscriptBaseDir(api: OpenClawPluginApi, agentId: str
     "agents",
     toSafeTranscriptAgentDirName(agentId),
   );
-}
-
-function requireTransientWorkspaceDir(tempDir: string | undefined): string {
-  if (!tempDir) {
-    throw new Error("Active memory transient workspace was not initialized.");
-  }
-  return tempDir;
 }
 
 function formatRuntimeToolsAllowSource(toolsAllow: readonly string[]): string {
@@ -221,20 +172,15 @@ function normalizePluginConfig(
         ? raw.mode
         : DEFAULT_ACTIVE_MEMORY_MODE,
     agents: Array.isArray(raw.agents) ? normalizeStringEntries(raw.agents) : [],
-    model: typeof raw.model === "string" && raw.model.trim() ? raw.model.trim() : undefined,
-    modelFallback:
-      typeof raw.modelFallback === "string" && raw.modelFallback.trim()
-        ? raw.modelFallback.trim()
-        : undefined,
-    modelFallbackPolicy:
-      raw.modelFallbackPolicy === "resolved-only" ? "resolved-only" : "default-remote",
+    model: normalizeOptionalString(raw.model),
+    modelFallback: normalizeOptionalString(raw.modelFallback),
     allowedChatTypes: allowedChatTypes.length > 0 ? allowedChatTypes : ["direct"],
-    allowedChatIds: normalizeChatIdList(raw.allowedChatIds),
-    deniedChatIds: normalizeChatIdList(raw.deniedChatIds),
+    allowedChatIds: normalizeIdentifierList(raw.allowedChatIds),
+    deniedChatIds: normalizeIdentifierList(raw.deniedChatIds),
     thinking: resolveThinkingLevel(raw.thinking),
     fastMode: normalizeActiveMemoryFastMode(raw.fastMode),
     promptStyle: resolvePromptStyle(raw.promptStyle, raw.queryMode),
-    toolsAllow: resolveToolsAllow({ pluginToolsAllow: raw.toolsAllow, cfg }),
+    toolsAllow: normalizeConfiguredToolsAllow(raw.toolsAllow) ?? resolveDefaultToolsAllow(cfg),
     promptOverride: normalizeOptionalString(raw.promptOverride),
     promptAppend: normalizeOptionalString(raw.promptAppend),
     timeoutMs: clampInt(
@@ -283,14 +229,11 @@ function normalizePluginConfig(
   };
 }
 
-function resolveActiveMemoryCleanupConfig(api: OpenClawPluginApi): OpenClawConfig | undefined {
+function readActiveMemoryConfig(api: OpenClawPluginApi): OpenClawConfig {
   try {
-    return (
-      (api.runtime.config?.current?.() as OpenClawConfig | undefined) ??
-      (api.config as OpenClawConfig | undefined)
-    );
+    return (api.runtime.config?.current?.() as OpenClawConfig | undefined) ?? api.config;
   } catch {
-    return api.config as OpenClawConfig | undefined;
+    return api.config;
   }
 }
 
@@ -376,9 +319,8 @@ export {
   isMissingRegisteredMemoryToolsError,
   normalizeActiveMemoryFastMode,
   normalizePluginConfig,
-  requireTransientWorkspaceDir,
   resetActiveMemoryConfigForTests,
-  resolveActiveMemoryCleanupConfig,
+  readActiveMemoryConfig,
   resolvePersistentTranscriptBaseDir,
   resolveSafeTranscriptDir,
   setMinimumTimeoutMsForTests,

@@ -155,6 +155,21 @@ description: *missing
   });
 });
 
+describe("resolveSkillManifestMetadata skill keys", () => {
+  it("ignores empty optional keys without changing existing nonempty config keys", () => {
+    for (const [value, expected] of [
+      ["", undefined],
+      [" foo ", " foo "],
+    ]) {
+      expect(
+        resolveSkillManifestMetadata({
+          metadata: JSON.stringify({ openclaw: { skillKey: value } }),
+        })?.skillKey,
+      ).toBe(expected);
+    }
+  });
+});
+
 describe("resolveSkillManifestMetadata install validation", () => {
   function resolveInstall(frontmatter: Record<string, string>) {
     return resolveSkillManifestMetadata(frontmatter)?.install;
@@ -201,6 +216,42 @@ describe("resolveSkillManifestMetadata install validation", () => {
     });
     expect(install).toBeUndefined();
   });
+
+  it("normalizes a download installer's optional SHA-256 digest", () => {
+    const sha256 = "a".repeat(64);
+    const install = resolveInstall({
+      metadata: JSON.stringify({
+        openclaw: {
+          install: [
+            {
+              kind: "download",
+              url: "https://example.com/runtime.tar.bz2",
+              sha256: ` ${sha256.toUpperCase()} `,
+            },
+          ],
+        },
+      }),
+    });
+
+    expect(install).toEqual([
+      { kind: "download", url: "https://example.com/runtime.tar.bz2", sha256 },
+    ]);
+  });
+
+  it.each(["", "abc123", "g".repeat(64), `sha256:${"a".repeat(64)}`, 123])(
+    "drops a download installer declaring an invalid SHA-256 digest (%j)",
+    (sha256) => {
+      const install = resolveInstall({
+        metadata: JSON.stringify({
+          openclaw: {
+            install: [{ kind: "download", url: "https://example.com/runtime.tar.bz2", sha256 }],
+          },
+        }),
+      });
+
+      expect(install).toBeUndefined();
+    },
+  );
 
   it("parses Link-style YAML metadata with node install hints", () => {
     const frontmatter = parseSkillFrontmatter(`---

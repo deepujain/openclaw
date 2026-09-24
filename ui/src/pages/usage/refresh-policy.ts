@@ -1,6 +1,13 @@
+import {
+  IncompleteUsageRetry,
+  isUsageIncomplete,
+  type UsageRetryState,
+} from "../../lib/incomplete-usage-retry.ts";
+import type { ProviderUsageRequestResult } from "../../lib/provider-usage-request.ts";
+
 const USAGE_PAYLOAD_TTL_MS = 5 * 60_000;
 
-type UsageRefreshReason = "focus" | "manual" | "poll" | "reconnect";
+type UsageRefreshReason = "focus" | "manual" | "poll" | "publication" | "reconnect";
 type UsageRefreshDecision = "defer" | "fetch" | "skip";
 
 function decideUsageRefresh(params: {
@@ -31,24 +38,65 @@ function decideUsageRefresh(params: {
 
 type UsageRefreshPolicyOptions = {
   isLoading: () => boolean;
-  reload: () => void;
+  reload: (reason: UsageRefreshReason) => void | Promise<void>;
+  onIncompleteUsageExhausted?: () => void;
 };
 
 /** Owns Usage's page-specific TTL, interruption, and refresh coalescing policy. */
 export class UsageRefreshPolicy {
   private lastLoadedAtMs: number | null = null;
   private pendingAutomaticRefresh = false;
+  private publicationPending = false;
   private reloadPending = false;
+  private readonly incompleteUsageRetry = new IncompleteUsageRetry({
+    retry: () => this.requestAndWait("poll"),
+    // Let the Gateway's 30s aggregate cache expire without increasing request volume.
+    retryMs: (attempt) => 5_000 * 2 ** (attempt - 1),
+    onExhausted: () => this.options.onIncompleteUsageExhausted?.(),
+  });
 
   constructor(private readonly options: UsageRefreshPolicyOptions) {}
 
-  setLastLoadedAtMs(value: number | null): void {
-    this.lastLoadedAtMs = value;
+  get incompleteUsageExhausted(): boolean {
+    return this.incompleteUsageRetry.exhausted;
+  }
+
+  setLastLoadedAtMs(
+    value: number | null,
+    params?: { incomplete?: boolean; connection?: unknown },
+  ): UsageRetryState {
+    return this.applyLoadState(value, params?.incomplete === true, params?.connection);
+  }
+
+  markProviderUsage(
+    result: ProviderUsageRequestResult | null,
+    value: number | null,
+    connection: unknown,
+  ): UsageRetryState {
+    const incomplete =
+      result?.ok === false || (result?.ok === true && isUsageIncomplete(result.value));
+    return this.applyLoadState(value, incomplete, connection);
   }
 
   resetPayload(): void {
-    this.lastLoadedAtMs = null;
+    this.applyLoadState(null, false);
     this.reloadPending = false;
+    this.publicationPending = false;
+  }
+
+  dispose(): void {
+    this.incompleteUsageRetry.dispose();
+  }
+
+  private applyLoadState(
+    loadedAtMs: number | null,
+    incomplete: boolean,
+    connection?: unknown,
+  ): UsageRetryState {
+    const state = this.incompleteUsageRetry.observe(incomplete, connection);
+    // Incomplete usage must not start the TTL or focus/reconnect can skip recovery.
+    this.lastLoadedAtMs = state === "complete" ? loadedAtMs : null;
+    return state;
   }
 
   interrupt(): void {
@@ -63,12 +111,15 @@ export class UsageRefreshPolicy {
     this.reloadPending = false;
   }
 
-  reload(): void {
-    this.pendingAutomaticRefresh = false;
-    this.options.reload();
+  request(reason: UsageRefreshReason): void {
+    void this.requestAndWait(reason);
   }
 
-  request(reason: UsageRefreshReason): void {
+  private async requestAndWait(reason: UsageRefreshReason): Promise<void> {
+    if (reason === "publication") {
+      this.publicationPending = true;
+      this.reloadPending = true;
+    }
     if (this.options.isLoading() && reason !== "manual") {
       this.pendingAutomaticRefresh = true;
       return;
@@ -82,7 +133,11 @@ export class UsageRefreshPolicy {
       lastLoadedAtMs: this.lastLoadedAtMs,
     });
     if (decision === "fetch") {
-      this.reload();
+      if (reason === "manual" || (reason !== "poll" && !this.publicationPending)) {
+        this.incompleteUsageRetry.startCycle();
+      }
+      this.publicationPending = false;
+      await this.options.reload(reason);
     }
   }
 

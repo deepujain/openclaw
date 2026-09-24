@@ -4,12 +4,14 @@ import {
   normalizeOptionalLowercaseString,
   normalizeOptionalString,
 } from "@openclaw/normalization-core/string-coerce";
-import { truncateUtf16Safe, truncateWithMarker } from "@openclaw/normalization-core/utf16-slice";
+import { truncateUtf16Safe } from "@openclaw/normalization-core/utf16-slice";
 import { resolveAcpToolTerminalOutcome } from "../../acp/tool-status.js";
 import { EmbeddedBlockChunker } from "../../agents/embedded-agent-block-chunker.js";
+import { createVerifiedConversationContextStreamFilter } from "../../agents/embedded-agent-helpers/sanitize-user-facing-text.js";
 import { formatToolSummary, resolveToolDisplay } from "../../agents/tool-display.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { prefixSystemMessage } from "../../infra/system-message.js";
+import { truncateUtf16WithEllipsis as truncateText } from "../../shared/text-truncate.js";
 import type { ReplyPayload } from "../types.js";
 import {
   type AcpHiddenBoundarySeparator,
@@ -45,25 +47,6 @@ type BufferedToolDelivery = {
   payload: ReplyPayload;
   meta?: AcpProjectedDeliveryMeta;
 };
-
-function truncateText(input: string, maxChars: number): string {
-  if (input.length <= maxChars) {
-    return input;
-  }
-  if (maxChars <= 1) {
-    return truncateUtf16Safe(input, maxChars);
-  }
-  return truncateWithMarker(input, maxChars, { marker: "…", reserve: 1, trimEnd: false });
-}
-
-function hashText(text: string): string {
-  return text.trim();
-}
-
-function normalizeToolStatus(status: string | undefined): string | undefined {
-  const normalized = normalizeOptionalLowercaseString(status);
-  return normalized || undefined;
-}
 
 function resolveHiddenBoundarySeparatorText(mode: AcpHiddenBoundarySeparator): string {
   if (mode === "space") {
@@ -183,6 +166,7 @@ export function createAcpReplyProjector(params: {
     payload: ReplyPayload,
     meta?: AcpProjectedDeliveryMeta,
   ) => Promise<boolean>;
+  getConversationContext?: () => string | undefined;
   onProgress?: () => void;
   provider?: string;
   accountId?: string;
@@ -202,6 +186,9 @@ export function createAcpReplyProjector(params: {
     coalescing: settings.deliveryMode === "live" ? undefined : streaming.coalescing,
   });
   const chunker = new EmbeddedBlockChunker(streaming.chunking);
+  const filterConversationContext = createVerifiedConversationContextStreamFilter(
+    params.getConversationContext,
+  );
   const liveIdleFlushMs = Math.max(streaming.coalescing.idleMs, ACP_LIVE_IDLE_FLUSH_FLOOR_MS);
 
   let emittedOutputChars = 0;
@@ -316,7 +303,7 @@ export function createAcpReplyProjector(params: {
       return;
     }
     const formatted = prefixSystemMessage(bounded);
-    const hash = hashText(formatted);
+    const hash = formatted.trim();
     const shouldDedupe = settings.repeatSuppression && opts?.dedupe !== false;
     if (shouldDedupe && lastStatusHash === hash) {
       return;
@@ -337,7 +324,7 @@ export function createAcpReplyProjector(params: {
     if (!event.tag || !HIDDEN_BOUNDARY_TAGS.has(event.tag)) {
       return;
     }
-    const status = normalizeToolStatus(event.status);
+    const status = normalizeOptionalLowercaseString(event.status);
     const isTerminal = resolveAcpToolTerminalOutcome(status) !== undefined;
     pendingHiddenBoundary = pendingHiddenBoundary || event.tag === "tool_call" || isTerminal;
   };
@@ -347,15 +334,11 @@ export function createAcpReplyProjector(params: {
       markHiddenToolBoundary(event);
       return;
     }
-    if (!isAcpTagVisible(settings, event.tag)) {
-      return;
-    }
-
     const renderedToolSummary = renderToolSummaryText(event, params.shouldSendFullToolDetails);
     const toolSummary = truncateText(renderedToolSummary, settings.maxSessionUpdateChars);
-    const hash = hashText(renderedToolSummary);
+    const hash = renderedToolSummary.trim();
     const toolCallId = normalizeOptionalString(event.toolCallId);
-    const status = normalizeToolStatus(event.status);
+    const status = normalizeOptionalLowercaseString(event.status);
     const isTerminal = resolveAcpToolTerminalOutcome(status) !== undefined;
     const isStart = status === "in_progress" || event.tag === "tool_call";
 
@@ -455,9 +438,10 @@ export function createAcpReplyProjector(params: {
       const accepted = remaining < text.length ? truncateUtf16Safe(text, remaining) : text;
       if (accepted.length > 0) {
         emittedOutputChars += accepted.length;
-        lastVisibleOutputTail = accepted.slice(-1);
+        const safeText = filterConversationContext(accepted);
+        lastVisibleOutputTail = safeText.slice(-1) || lastVisibleOutputTail;
         if (settings.deliveryMode === "live") {
-          liveBufferText += accepted;
+          liveBufferText += safeText;
           if (shouldFlushLiveBufferOnBoundary(liveBufferText)) {
             clearLiveIdleTimer();
             flushLiveBuffer({ force: true });
@@ -465,7 +449,7 @@ export function createAcpReplyProjector(params: {
             scheduleLiveIdleFlush();
           }
         } else {
-          finalOnlyOutputText += accepted;
+          finalOnlyOutputText += safeText;
         }
       }
       if (accepted.length < text.length) {
@@ -485,7 +469,7 @@ export function createAcpReplyProjector(params: {
         const usageTuple =
           typeof event.used === "number" && typeof event.size === "number"
             ? `${event.used}/${event.size}`
-            : hashText(event.text);
+            : event.text.trim();
         if (usageTuple === lastUsageTuple) {
           return;
         }

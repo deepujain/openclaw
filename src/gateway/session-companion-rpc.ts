@@ -10,9 +10,12 @@ import {
   type SessionsCompanionResetParams,
   type SessionsCompanionStateParams,
 } from "../../packages/gateway-protocol/src/index.js";
+import { captureGatewayOperatorRunAuthority } from "./operator-run-authority.js";
 import type { GatewayRequestHandlers } from "./server-methods/types.js";
-import { SessionCompanionAskError } from "./session-companion-ask.js";
+import { SessionCompanionAskError } from "./session-companion-errors.js";
 import { resolveRequestedSessionAgentId } from "./session-request-agent.js";
+import { hiddenSessionNotFound } from "./session-sharing-policy.js";
+import { prepareSessionSharing, resolveSessionSharingTarget } from "./session-sharing.js";
 import { resolveSessionStoreKey } from "./session-store-key.js";
 
 function resolveCompanionTarget(
@@ -35,8 +38,40 @@ function resolveCompanionTarget(
   };
 }
 
+function companionTargetIsVisible(
+  target: { sessionKey: string; agentId: string },
+  client: Parameters<GatewayRequestHandlers[string]>[0]["client"],
+  context: Parameters<GatewayRequestHandlers[string]>[0]["context"],
+): boolean {
+  if (client?.connId && context.isConnectionActive?.(client.connId) === false) {
+    return false;
+  }
+  const cfg = context.getRuntimeConfig();
+  const sharingTarget = resolveSessionSharingTarget({
+    cfg,
+    sessionKey: target.sessionKey,
+    agentId: target.agentId,
+  });
+  if (!sharingTarget) {
+    return cfg.gateway?.roles === undefined;
+  }
+  return (
+    prepareSessionSharing({ client, cfg }).entryFilter?.(
+      sharingTarget.storeKey,
+      sharingTarget.entry,
+    ) !== false
+  );
+}
+
 export const sessionCompanionHandlers: GatewayRequestHandlers = {
-  "sessions.companion.ask": async ({ params, respond, client, context, signal }) => {
+  "sessions.companion.ask": async ({
+    params,
+    respond,
+    client,
+    context,
+    signal,
+    hasCurrentClientAuthority,
+  }) => {
     if (!validateSessionsCompanionAskParams(params)) {
       respond(
         false,
@@ -48,7 +83,7 @@ export const sessionCompanionHandlers: GatewayRequestHandlers = {
       );
       return;
     }
-    const { sessionKey, agentId, question } = params as SessionsCompanionAskParams;
+    const { sessionKey, agentId, question, attachments } = params as SessionsCompanionAskParams;
     if (!question.trim()) {
       respond(
         false,
@@ -61,16 +96,12 @@ export const sessionCompanionHandlers: GatewayRequestHandlers = {
       respond(
         false,
         undefined,
-        errorShape(ErrorCodes.FORBIDDEN, "Session companion asks require a connected client."),
+        errorShape(ErrorCodes.FORBIDDEN, "Side chat questions require a connected client."),
       );
       return;
     }
     if (!context.sessionCompanion) {
-      respond(
-        false,
-        undefined,
-        errorShape(ErrorCodes.UNAVAILABLE, "Session companion is unavailable."),
-      );
+      respond(false, undefined, errorShape(ErrorCodes.UNAVAILABLE, "Side chat is unavailable."));
       return;
     }
     const target = resolveCompanionTarget({ sessionKey, agentId }, context);
@@ -78,21 +109,41 @@ export const sessionCompanionHandlers: GatewayRequestHandlers = {
       respond(false, undefined, target.error);
       return;
     }
+    if (!companionTargetIsVisible(target, client, context)) {
+      respond(false, undefined, hiddenSessionNotFound(target.sessionKey));
+      return;
+    }
+    const assertSourceCurrent = () => {
+      if (!companionTargetIsVisible(target, client, context)) {
+        throw new SessionCompanionAskError("session-missing", "Side chat is unavailable.");
+      }
+    };
+    let capturedOperator: ReturnType<typeof captureGatewayOperatorRunAuthority>;
     try {
+      capturedOperator = captureGatewayOperatorRunAuthority({
+        client,
+        context,
+        hasCurrentClientAuthority,
+        invocationAuthority: { assertCurrent: assertSourceCurrent, signal },
+      });
       const result = await context.sessionCompanion.ask({
         sessionKey: target.sessionKey,
         agentId: target.agentId,
         question,
+        ...(attachments?.length ? { attachments } : {}),
         connId: client.connId,
+        assertSourceCurrent,
+        ...(capturedOperator ? { operatorAuthority: capturedOperator.authority } : {}),
         ...(signal ? { signal } : {}),
       });
+      capturedOperator?.authority.assertCurrent();
       respond(true, result);
     } catch (error) {
       if (!(error instanceof SessionCompanionAskError)) {
         respond(
           false,
           undefined,
-          errorShape(ErrorCodes.UNAVAILABLE, "The session companion could not answer right now."),
+          errorShape(ErrorCodes.UNAVAILABLE, "Side chat could not answer right now."),
         );
         return;
       }
@@ -117,9 +168,11 @@ export const sessionCompanionHandlers: GatewayRequestHandlers = {
           ...(error.retryAfterMs ? { retryAfterMs: error.retryAfterMs } : {}),
         }),
       );
+    } finally {
+      capturedOperator?.release();
     }
   },
-  "sessions.companion.state": ({ params, respond, context }) => {
+  "sessions.companion.state": ({ params, respond, client, context }) => {
     if (!validateSessionsCompanionStateParams(params)) {
       respond(
         false,
@@ -132,17 +185,17 @@ export const sessionCompanionHandlers: GatewayRequestHandlers = {
       return;
     }
     if (!context.sessionCompanion) {
-      respond(
-        false,
-        undefined,
-        errorShape(ErrorCodes.UNAVAILABLE, "Session companion is unavailable."),
-      );
+      respond(false, undefined, errorShape(ErrorCodes.UNAVAILABLE, "Side chat is unavailable."));
       return;
     }
     const { sessionKey, agentId } = params as SessionsCompanionStateParams;
     const target = resolveCompanionTarget({ sessionKey, agentId }, context);
     if (!target.ok) {
       respond(false, undefined, target.error);
+      return;
+    }
+    if (!companionTargetIsVisible(target, client, context)) {
+      respond(false, undefined, hiddenSessionNotFound(target.sessionKey));
       return;
     }
     respond(
@@ -167,11 +220,7 @@ export const sessionCompanionHandlers: GatewayRequestHandlers = {
       return;
     }
     if (!context.sessionCompanion) {
-      respond(
-        false,
-        undefined,
-        errorShape(ErrorCodes.UNAVAILABLE, "Session companion is unavailable."),
-      );
+      respond(false, undefined, errorShape(ErrorCodes.UNAVAILABLE, "Side chat is unavailable."));
       return;
     }
     const { sessionKey, agentId } = params as SessionsCompanionResetParams;

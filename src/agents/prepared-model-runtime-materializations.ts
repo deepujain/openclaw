@@ -1,9 +1,8 @@
 import {
   getPreparedRuntimeAuthMaterializations,
   registerRuntimeAuthMaterializationMutationListener,
-  type RuntimeAuthMaterialization,
 } from "./auth-profiles/runtime-materializations.js";
-import { setPreparedModelRuntimeAuthMaterializations } from "./prepared-model-runtime-auth.js";
+import { bindPreparedModelRuntimeAuth } from "./prepared-model-runtime-auth.js";
 import {
   normalizeOptionalDir,
   type PreparedModelRuntimeOwner,
@@ -14,7 +13,7 @@ type MaterializationMutationEvent = {
   affectsInheritedStores: boolean;
 };
 
-function configuredOwnersAreRequestVisible(
+export function configuredOwnersAreRequestVisible(
   owners: ReadonlyMap<string, PreparedModelRuntimeOwner>,
 ): boolean {
   for (const owner of owners.values()) {
@@ -30,14 +29,14 @@ function configuredOwnersAreRequestVisible(
 
 export function registerPreparedRuntimeAuthMaterializationPublisher(
   owners: ReadonlyMap<string, PreparedModelRuntimeOwner>,
-  notify: (event: { phase: "invalidated" | "published" }) => void,
+  notify: (event: { phase: "invalidated" | "published"; modelFactsChanged: false }) => void,
 ): () => void {
   return registerRuntimeAuthMaterializationMutationListener((event) => {
     publishPreparedRuntimeAuthMaterializations({
       event,
       owners,
-      onInvalidated: () => notify({ phase: "invalidated" }),
-      onPublished: () => notify({ phase: "published" }),
+      onInvalidated: () => notify({ phase: "invalidated", modelFactsChanged: false }),
+      onPublished: () => notify({ phase: "published", modelFactsChanged: false }),
     });
   });
 }
@@ -47,7 +46,6 @@ function publishPreparedRuntimeAuthMaterializations(params: {
   owners: ReadonlyMap<string, PreparedModelRuntimeOwner>;
   onInvalidated: () => void;
   onPublished: () => void;
-  read?: (agentDir?: string) => readonly RuntimeAuthMaterialization[];
 }): void {
   const event = {
     ...params.event,
@@ -65,14 +63,14 @@ function publishPreparedRuntimeAuthMaterializations(params: {
   if (affectedOwners.length === 0) {
     return;
   }
-  const read = params.read ?? getPreparedRuntimeAuthMaterializations;
   for (const { owner, snapshot } of affectedOwners) {
     // A successful route only changes this bounded secret-free fact set. Rebuilding the model
     // catalog here would pull plugin lifecycle work into the turn-completion boundary.
-    setPreparedModelRuntimeAuthMaterializations(
-      snapshot,
-      Object.freeze([...read(owner.input.agentDir)]),
-    );
+    bindPreparedModelRuntimeAuth(snapshot, {
+      materializations: Object.freeze([
+        ...getPreparedRuntimeAuthMaterializations(owner.input.agentDir),
+      ]),
+    });
   }
   // Chat metadata treats published as "every configured owner is capturable".
   // A bind on one agent must not announce while a sibling is stale or a replacement

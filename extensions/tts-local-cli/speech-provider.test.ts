@@ -2,6 +2,8 @@
 import { mkdtempSync, rmSync, truncateSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+// Prepare the native process runtime before the subprocess deadline cases start.
+import "openclaw/plugin-sdk/process-runtime";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import type { SpeechProviderConfig, SpeechSynthesisRequest } from "openclaw/plugin-sdk/speech-core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -128,6 +130,7 @@ async function synthesize(params: {
 function parseAudioPayload(result: { audioBuffer: Buffer }) {
   const jsonStart = result.audioBuffer.indexOf("{");
   return JSON.parse(result.audioBuffer.subarray(jsonStart).toString("utf8")) as {
+    args: string[];
     stdin?: string;
     textArg?: string;
   };
@@ -194,6 +197,12 @@ describe("buildCliSpeechProvider", () => {
     ).toEqual({ command: "canonical-command" });
   });
 
+  describe("CLI timeout ownership", () => {
+    it("advertises the existing command timeout as its provider default", () => {
+      expect(buildCliSpeechProvider().defaultTimeoutMs).toBe(120_000);
+    });
+  });
+
   it("passes text through stdin when args omit the text template", async () => {
     const fixture = createCliFixture();
     try {
@@ -234,6 +243,54 @@ describe("buildCliSpeechProvider", () => {
       const audioPayload = parseAudioPayload(result);
       expect(audioPayload.stdin).toBe("");
       expect(audioPayload.textArg).toBe("spoken words");
+    } finally {
+      rmSync(fixture.dir, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    {
+      name: "consecutive single- and double-quoted empty arguments",
+      command: "--voice \"\"  ''",
+      args: [],
+      expected: ["--voice", "", ""],
+    },
+    {
+      name: "quoted whitespace",
+      command: '--voice " \t "',
+      args: [],
+      expected: ["--voice", " \t "],
+    },
+    {
+      name: "adjacent quoted and unquoted fragments",
+      command: "--voice a''b\"\"",
+      args: [],
+      expected: ["--voice", "ab"],
+    },
+    {
+      name: "an explicit array empty argument",
+      command: "",
+      args: ["--voice", ""],
+      expected: ["--voice", ""],
+    },
+  ])("preserves $name through the speech process", async ({ command, args, expected }) => {
+    const fixture = createCliFixture();
+    try {
+      const result = await synthesize({
+        providerConfig: {
+          command: `"${process.execPath}" "${fixture.script}" ${command}`,
+          args: [...args, "--text", "{{Text}}"],
+          outputFormat: "wav",
+        },
+        text: "spoken words",
+      });
+
+      expect(result.outputFormat).toBe("wav");
+      expect(parseAudioPayload(result)).toEqual({
+        args: [...expected, "--text", "spoken words"],
+        stdin: "",
+        textArg: "spoken words",
+      });
     } finally {
       rmSync(fixture.dir, { recursive: true, force: true });
     }

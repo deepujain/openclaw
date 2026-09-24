@@ -1,8 +1,13 @@
 import path from "node:path";
 import { createZstdDecompress } from "node:zlib";
 import { root as openSafeFilesystemRoot } from "openclaw/plugin-sdk/file-access-runtime";
-import { isRecord } from "openclaw/plugin-sdk/string-coerce-runtime";
-import type { CodexThread } from "./app-server/protocol.js";
+import {
+  isJsonObject,
+  type CodexThread,
+  type JsonObject,
+  type JsonValue,
+} from "./app-server/protocol.js";
+import type { CodexCatalogPageDiagnostics } from "./session-catalog-diagnostics.js";
 
 const MAX_SESSION_META_BYTES = 1024 * 1024;
 const SESSION_META_READ_CHUNK_BYTES = 64 * 1024;
@@ -23,11 +28,11 @@ function cacheProvenance(key: string, value: boolean): void {
 }
 
 /** Undefined means the metadata line is not durable enough to cache yet. */
-async function readOpenClawOriginator(
+export async function readCodexSessionMeta(
   sessionsRoot: string,
   rolloutPath: string,
   threadId: string,
-): Promise<boolean | undefined> {
+): Promise<JsonObject | null | undefined> {
   let safeRoot: Awaited<ReturnType<typeof openSafeFilesystemRoot>>;
   try {
     safeRoot = await openSafeFilesystemRoot(sessionsRoot, {
@@ -75,18 +80,22 @@ async function readOpenClawOriginator(
       if (!line) {
         continue;
       }
-      let parsed: unknown;
+      let parsed: JsonValue;
       try {
-        parsed = JSON.parse(line) as unknown;
+        // SAFETY: JSON.parse without a reviver returns JSON shapes; envelope/id checks follow.
+        parsed = JSON.parse(line) as JsonValue;
       } catch {
         continue;
       }
-      if (!isRecord(parsed) || parsed.type !== "session_meta" || !isRecord(parsed.payload)) {
-        return false;
+      if (
+        !isJsonObject(parsed) ||
+        parsed.type !== "session_meta" ||
+        !isJsonObject(parsed.payload)
+      ) {
+        return null;
       }
       const payload = parsed.payload;
-      const recordedId = payload.id ?? payload.session_id;
-      return recordedId === threadId && payload.originator === "openclaw";
+      return payload.id === threadId ? payload : null;
     } catch {
       continue;
     } finally {
@@ -98,29 +107,48 @@ async function readOpenClawOriginator(
   return undefined;
 }
 
-/**
- * Codex 0.147 reports OpenClaw app-server rollouts as `vscode`, so the rollout's
- * immutable session metadata is the authoritative historical provenance.
- */
+/** Passive local listing uses native creation provenance, with rollout fallback for older records. */
 export async function isOpenClawManagedCodexThread(
   thread: CodexThread,
   localSessionsRoot: string | undefined,
+  diagnostics?: CodexCatalogPageDiagnostics,
 ): Promise<boolean> {
-  const rolloutPath = typeof thread.path === "string" ? thread.path.trim() : "";
-  if (!localSessionsRoot || !rolloutPath) {
-    return false;
+  const started = diagnostics ? performance.now() : 0;
+  if (diagnostics) {
+    diagnostics.fields.provenanceChecks++;
   }
-  const cacheKey = `${localSessionsRoot}\0${rolloutPath}`;
-  const cached = provenanceByPath.get(cacheKey);
-  if (cached !== undefined) {
-    return cached;
+  try {
+    const rolloutPath = typeof thread.path === "string" ? thread.path.trim() : "";
+    if (!localSessionsRoot || !rolloutPath) {
+      return false;
+    }
+    if (typeof thread.originator === "string" && thread.originator.length > 0) {
+      return thread.originator === "openclaw";
+    }
+    const cacheKey = `${localSessionsRoot}\0${rolloutPath}`;
+    const cached = provenanceByPath.get(cacheKey);
+    if (cached !== undefined) {
+      if (diagnostics) {
+        diagnostics.fields.provenanceCacheHits++;
+      }
+      return cached;
+    }
+    if (diagnostics) {
+      diagnostics.fields.provenanceReadCalls++;
+    }
+    const metadata = await readCodexSessionMeta(localSessionsRoot, rolloutPath, thread.id);
+    const managed = metadata === undefined ? undefined : metadata?.originator === "openclaw";
+    // A missing or still-being-written rollout must not become a permanent false
+    // negative. Newly created sessions are additionally covered by the durable
+    // ownership store, while a completed metadata line can be cached safely.
+    if (managed !== undefined) {
+      cacheProvenance(cacheKey, managed);
+    }
+    return managed ?? false;
+  } finally {
+    if (diagnostics) {
+      diagnostics.fields.provenanceMs =
+        (diagnostics.fields.provenanceMs ?? 0) + performance.now() - started;
+    }
   }
-  const managed = await readOpenClawOriginator(localSessionsRoot, rolloutPath, thread.id);
-  // A missing or still-being-written rollout must not become a permanent false
-  // negative. Newly created sessions are additionally covered by the durable
-  // ownership store, while a completed metadata line can be cached safely.
-  if (managed !== undefined) {
-    cacheProvenance(cacheKey, managed);
-  }
-  return managed ?? false;
 }

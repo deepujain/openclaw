@@ -116,6 +116,15 @@ describe("resolveCurrentTurnImages", () => {
       imageBytes: PNG_IMAGE_BYTES,
       expectedMime: "image/png",
     },
+    {
+      name: "an opaque image identified by separate filename metadata",
+      fileName: "opaque",
+      originalFileName: "photo.png",
+      contentType: "application/octet-stream",
+      kind: undefined,
+      imageBytes: PNG_IMAGE_BYTES,
+      expectedMime: "image/png",
+    },
   ])("hydrates $name using the verified byte MIME", async (testCase) => {
     await withTestDir({ prefix: "openclaw-current-turn-canonical-kind-" }, async (base) => {
       const imagePath = path.join(base, testCase.fileName);
@@ -127,6 +136,7 @@ describe("resolveCurrentTurnImages", () => {
           media: [
             {
               path: imagePath,
+              ...("originalFileName" in testCase ? { fileName: testCase.originalFileName } : {}),
               contentType: testCase.contentType,
               kind: testCase.kind,
               workspaceDir: base,
@@ -383,11 +393,39 @@ describe("resolveCurrentTurnImages", () => {
     expect(resolveAgentTurnAttachments).not.toHaveBeenCalled();
   });
 
+  it("does not rehydrate a managed copy of an already-provided inline image", async () => {
+    vi.mocked(resolveAgentTurnAttachments).mockClear();
+    const inlineImage = {
+      type: "image" as const,
+      data: Buffer.from("inline").toString("base64"),
+      mimeType: "image/png",
+    };
+
+    const result = await resolveCurrentTurnImages({
+      ctx: {
+        Body: "inspect",
+        media: [
+          {
+            path: "/state/media/inbound/photo.png",
+            contentType: "image/png",
+            hydrationSuppressed: true,
+          },
+        ],
+      } satisfies MsgContext,
+      cfg: {} as OpenClawConfig,
+      images: [inlineImage],
+      imageOrder: ["inline"],
+    });
+
+    expect(result).toEqual({ images: [inlineImage], imageOrder: ["inline"] });
+    expect(resolveAgentTurnAttachments).not.toHaveBeenCalled();
+  });
+
   it("hydrates only current image facts missing prompt descriptions", async () => {
     const imageData = Buffer.from("second image").toString("base64");
     vi.mocked(resolveAgentTurnAttachments).mockResolvedValueOnce({
       attachments: [{ data: imageData, mediaType: "image/png" }],
-      attachmentIndexes: [0],
+      attachmentIndexes: [1],
       recentHistoryImages: [],
     });
 
@@ -397,9 +435,7 @@ describe("resolveCurrentTurnImages", () => {
     });
 
     expect(resolveAgentTurnAttachments).toHaveBeenCalledWith({
-      ctx: expect.objectContaining({
-        media: [expect.objectContaining({ path: "/tmp/second.png", kind: "image" })],
-      }),
+      ctx: createDescribedImageContext([0]),
       cfg: {},
       includeRecentHistoryImages: false,
       includeAttachmentIndexes: true,
@@ -489,7 +525,7 @@ describe("resolveCurrentTurnImages", () => {
     });
   });
 
-  it("retains resolved native images when current media partially resolves", async () => {
+  it("retains undescribed native images when a described sibling and missing sibling coexist", async () => {
     await withTestDir({ prefix: "openclaw-current-turn-partial-" }, async (base) => {
       const imagePath = path.join(base, "present.png");
       const imageBytes = Buffer.from("present-image");
@@ -499,11 +535,24 @@ describe("resolveCurrentTurnImages", () => {
         ctx: {
           Body: "compare these images",
           media: [
+            {
+              path: path.join(base, "described.png"),
+              contentType: "image/png",
+              workspaceDir: base,
+            },
             { path: imagePath, contentType: "image/png", workspaceDir: base },
             {
               path: path.join(base, "missing.png"),
               contentType: "image/png",
               workspaceDir: base,
+            },
+          ],
+          MediaUnderstanding: [
+            {
+              kind: "image.description",
+              attachmentIndex: 0,
+              provider: "imageModel",
+              text: "an already described image",
             },
           ],
         } satisfies MsgContext,
@@ -518,8 +567,8 @@ describe("resolveCurrentTurnImages", () => {
         },
       ]);
       expect(result.imageOrder).toEqual(["inline"]);
-      expect(result.imageSourceIndexes).toEqual([0]);
-      expect(result.unresolvedSourceIndexes).toEqual([1]);
+      expect(result.imageSourceIndexes).toEqual([1]);
+      expect(result.unresolvedSourceIndexes).toEqual([2]);
     });
   });
 

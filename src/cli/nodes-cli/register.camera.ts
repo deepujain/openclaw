@@ -25,8 +25,7 @@ import {
   callNodesGatewayCli,
   nodesCallOpts,
   parseOptionalNodeFiniteNumber,
-  parseOptionalNodeNonNegativeInteger,
-  parseOptionalNodePositiveInteger,
+  parseOptionalNodeInteger,
   resolveCliNode,
   resolveCliNodeId,
 } from "./rpc.js";
@@ -128,8 +127,6 @@ export function registerNodesCameraCommands(nodes: Command) {
       .option("--invoke-timeout <ms>", "Node invoke timeout in ms (default 20000)", "20000")
       .action(async (opts: NodesRpcOpts) => {
         await runNodesCommand("camera snap", async () => {
-          const node = await resolveCliNode(opts, normalizeOptionalString(opts.node) ?? "");
-          const nodeId = node.nodeId;
           const facingOpt = normalizeLowercaseStringOrEmpty(
             normalizeOptionalString(opts.facing) ?? "",
           );
@@ -144,13 +141,16 @@ export function registerNodesCameraCommands(nodes: Command) {
                     );
                   })();
 
-          const maxWidth = parseOptionalNodePositiveInteger(opts.maxWidth, "--max-width");
+          const maxWidth = parseOptionalNodeInteger(opts.maxWidth, "--max-width");
           const quality = parseOptionalNodeFiniteNumber(opts.quality, "--quality", {
             minInclusive: 0,
             maxInclusive: 1,
           });
-          const delayMs = parseOptionalNodeNonNegativeInteger(opts.delayMs, "--delay-ms");
+          const delayMs = parseOptionalNodeInteger(opts.delayMs, "--delay-ms", "non-negative");
           const deviceId = normalizeOptionalString(opts.deviceId);
+          const timeoutMs = parseOptionalNodeInteger(opts.invokeTimeout, "--invoke-timeout");
+          const node = await resolveCliNode(opts, normalizeOptionalString(opts.node) ?? "");
+          const nodeId = node.nodeId;
           if (deviceId && facing === "both" && node.platform?.toLowerCase() !== "linux") {
             throw new Error("facing=both is not allowed when --device-id is set");
           }
@@ -159,40 +159,43 @@ export function registerNodesCameraCommands(nodes: Command) {
             platform: node.platform,
             deviceId,
           });
-          const timeoutMs = parseOptionalNodePositiveInteger(
-            opts.invokeTimeout,
-            "--invoke-timeout",
-          );
-
-          const results: Array<{
+          const captures: Array<{
             facing: CameraArtifactFacing;
-            path: string;
-            width: number;
-            height: number;
+            payload: ReturnType<typeof parseCameraSnapPayload>;
+            filePath: string;
           }> = [];
-
           for (const target of targets) {
             const invokeParams = buildNodeInvokeParams({
               nodeId,
               command: "camera.snap",
               params: {
                 ...(target.requestFacing ? { facing: target.requestFacing } : {}),
-                maxWidth: Number.isFinite(maxWidth) ? maxWidth : undefined,
-                quality: Number.isFinite(quality) ? quality : undefined,
+                maxWidth,
+                quality,
                 format: "jpg",
-                delayMs: Number.isFinite(delayMs) ? delayMs : undefined,
+                delayMs,
                 deviceId: deviceId || undefined,
               },
               timeoutMs,
             });
 
             const raw = await callNodesGatewayCli("node.invoke", opts, invokeParams);
-            const payload = parseCameraSnapPayload(getGatewayInvokePayload(raw));
-            const filePath = cameraTempPath({
-              kind: "snap",
-              facing: target.artifactFacing,
-              ext: payload.format === "jpeg" ? "jpg" : payload.format,
+            const payload = parseCameraSnapPayload(getGatewayInvokePayload(raw), {
+              expectedHost: node.remoteIp,
             });
+            captures.push({
+              facing: target.artifactFacing,
+              payload,
+              filePath: cameraTempPath({
+                kind: "snap",
+                facing: target.artifactFacing,
+                ext: payload.format === "jpeg" ? "jpg" : payload.format,
+              }),
+            });
+          }
+
+          const results = [];
+          for (const { facing: artifactFacing, payload, filePath } of captures) {
             await writeCameraPayloadToFile({
               filePath,
               payload,
@@ -200,7 +203,7 @@ export function registerNodesCameraCommands(nodes: Command) {
               invalidPayloadMessage: "invalid camera.snap payload",
             });
             results.push({
-              facing: target.artifactFacing,
+              facing: artifactFacing,
               path: filePath,
               width: payload.width,
               height: payload.height,
@@ -233,24 +236,21 @@ export function registerNodesCameraCommands(nodes: Command) {
       .option("--invoke-timeout <ms>", "Node invoke timeout in ms (default 90000)", "90000")
       .action(async (opts: NodesRpcOpts & { audio?: boolean }) => {
         await runNodesCommand("camera clip", async () => {
-          const node = await resolveCliNode(opts, normalizeOptionalString(opts.node) ?? "");
-          const nodeId = node.nodeId;
           const facing = parseFacing(opts.facing ?? "front");
-          const target = resolveCameraClipTarget({ facing, platform: node.platform });
           const durationMs = parseDurationMs(opts.duration ?? "3000");
           const includeAudio = opts.audio !== false;
-          const timeoutMs = parseOptionalNodePositiveInteger(
-            opts.invokeTimeout,
-            "--invoke-timeout",
-          );
+          const timeoutMs = parseOptionalNodeInteger(opts.invokeTimeout, "--invoke-timeout");
           const deviceId = normalizeOptionalString(opts.deviceId);
+          const node = await resolveCliNode(opts, normalizeOptionalString(opts.node) ?? "");
+          const nodeId = node.nodeId;
+          const target = resolveCameraClipTarget({ facing, platform: node.platform });
 
           const invokeParams = buildNodeInvokeParams({
             nodeId,
             command: "camera.clip",
             params: {
               facing: target.requestFacing,
-              durationMs: Number.isFinite(durationMs) ? durationMs : undefined,
+              durationMs,
               includeAudio,
               format: "mp4",
               deviceId: deviceId || undefined,

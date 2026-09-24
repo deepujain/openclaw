@@ -1,6 +1,7 @@
 import type { BoardWidget } from "../../lib/board/types.ts";
 import type { BoardWidgetAppViewState } from "../../lib/board/view-types.ts";
 import { formatUiError } from "../../lib/format-error.ts";
+import { NearViewportObserver } from "../near-viewport-observer.ts";
 
 const REFRESH_LEAD_MS = 5_000;
 type AppViewMode = "cached" | "refresh" | "expired";
@@ -16,60 +17,8 @@ function clearTimer(timer: number | undefined): undefined {
   return undefined;
 }
 
-class NearViewportObserver {
-  private observer?: IntersectionObserver;
-  nearVisible = false;
-  target?: Element;
-
-  constructor(
-    private readonly marginPx: number,
-    private readonly visibilityChanged: () => void,
-  ) {}
-
-  observe(target: Element): void {
-    if (target === this.target) {
-      return;
-    }
-    this.disconnect();
-    this.target = target;
-    this.setNearVisible(this.isNearViewport(target));
-    if (typeof IntersectionObserver === "undefined") {
-      return;
-    }
-    this.observer = new IntersectionObserver(
-      (entries) => {
-        const entry = entries.at(-1);
-        if (!entry || entry.target !== this.target) {
-          return;
-        }
-        this.setNearVisible(entry.isIntersecting || this.isNearViewport(entry.target));
-      },
-      { rootMargin: `${this.marginPx}px 0px` },
-    );
-    this.observer.observe(target);
-  }
-
-  disconnect(): void {
-    this.observer?.disconnect();
-    this.observer = undefined;
-    this.target = undefined;
-    this.setNearVisible(false);
-  }
-
-  private setNearVisible(nearVisible: boolean): void {
-    if (nearVisible !== this.nearVisible) {
-      this.nearVisible = nearVisible;
-      this.visibilityChanged();
-    }
-  }
-
-  private isNearViewport(target: Element): boolean {
-    const bounds = target.getBoundingClientRect();
-    return bounds.bottom >= -this.marginPx && bounds.top <= window.innerHeight + this.marginPx;
-  }
-}
-
 type AppViewCallbacks = {
+  appViewGeneration: () => number;
   widgetAppView: (name: string, revision: number) => Promise<BoardWidgetAppViewState>;
   refreshWidgetAppView: (name: string, revision: number) => Promise<BoardWidgetAppViewState>;
 };
@@ -87,6 +36,7 @@ export class BoardMcpAppLifecycle {
   loading = false;
 
   private callbacks?: AppViewCallbacks;
+  private appViewGeneration = 0;
   private key = "";
   private generation = 0;
   private renewalTimer?: number;
@@ -106,12 +56,11 @@ export class BoardMcpAppLifecycle {
       return;
     }
     const key = appViewKey(this.host.sessionKey(), widget);
-    if (key !== this.key) {
-      this.clearTimers();
-      this.generation += 1;
-      this.loading = false;
+    const appViewGeneration = callbacks.appViewGeneration();
+    if (key !== this.key || appViewGeneration !== this.appViewGeneration) {
+      this.reset();
       this.key = key;
-      this.state = undefined;
+      this.appViewGeneration = appViewGeneration;
     }
   }
 
@@ -187,6 +136,7 @@ export class BoardMcpAppLifecycle {
     this.clearTimers();
     this.generation += 1;
     this.key = "";
+    this.appViewGeneration = 0;
     this.state = undefined;
     this.loading = false;
   }
@@ -250,40 +200,33 @@ export class BoardMcpAppLifecycle {
         Math.max(0, previousLease.expiresAtMs - Date.now()),
       );
     }
+    let appView: BoardWidgetAppViewState;
     try {
-      const appView = await (mode === "cached"
+      appView = await (mode === "cached"
         ? callbacks.widgetAppView(widget.name, widget.revision)
         : callbacks.refreshWidgetAppView(widget.name, widget.revision));
-      if (!isCurrent()) {
-        return;
-      }
-      if (appView.status === "stale" && previousLease && previousLease.expiresAtMs > Date.now()) {
-        this.loading = false;
-        this.notify();
-        return;
-      }
-      this.clearTimers();
-      this.state = appView;
-      this.loading = false;
-      this.scheduleRenewal(widget, callbacks, appView, mode !== "cached");
-      this.notify();
     } catch (error) {
       if (!isCurrent()) {
         return;
       }
-      if (previousLease && previousLease.expiresAtMs > Date.now()) {
-        this.loading = false;
-        this.notify();
-        return;
-      }
-      this.clearTimers();
-      this.state = {
+      appView = {
         status: "stale",
         error: formatUiError(error),
       };
+    }
+    if (!isCurrent()) {
+      return;
+    }
+    if (appView.status === "stale" && previousLease && previousLease.expiresAtMs > Date.now()) {
       this.loading = false;
       this.notify();
+      return;
     }
+    this.clearTimers();
+    this.state = appView;
+    this.loading = false;
+    this.scheduleRenewal(widget, callbacks, appView, mode !== "cached");
+    this.notify();
   }
 
   private scheduleExpiry(widget: BoardWidget, appView: BoardWidgetAppViewState): void {

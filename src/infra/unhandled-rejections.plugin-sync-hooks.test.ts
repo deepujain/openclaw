@@ -1,8 +1,15 @@
+import { spawnSync } from "node:child_process";
 import { describe, expect, it, vi } from "vitest";
 import type { AgentMessage } from "../agents/runtime/index.js";
 import { createHookRunner } from "../plugins/hooks.js";
 import { createMockPluginRegistry } from "../plugins/hooks.test-helpers.js";
-import { spawnNodeEvalSync } from "../test-utils/node-process.js";
+import { resolveTestNodeExecPath } from "../test-utils/node-process.js";
+import { nativeBoundaryTestEntrypoints } from "./native-boundary-runtime.test-support.js";
+import { resolveRuntimeWorkerArgv, resolveRuntimeWorkerUrl } from "./runtime-worker-url.js";
+
+const rejectionUrl = resolveRuntimeWorkerUrl(nativeBoundaryTestEntrypoints.unhandledRejections);
+const hooksUrl = resolveRuntimeWorkerUrl(nativeBoundaryTestEntrypoints.pluginHooks);
+const registryUrl = resolveRuntimeWorkerUrl(nativeBoundaryTestEntrypoints.emptyPluginRegistry);
 
 const syncHookNames = ["tool_result_persist", "before_message_write"] as const;
 type SyncHookName = (typeof syncHookNames)[number];
@@ -29,9 +36,17 @@ function runSyncHook(params: {
   runner: ReturnType<typeof createHookRunner>;
   message: AgentMessage;
 }) {
+  return runSyncHookEvent({ ...params, event: { message: params.message } });
+}
+
+function runSyncHookEvent(params: {
+  hookName: SyncHookName;
+  runner: ReturnType<typeof createHookRunner>;
+  event: { message: AgentMessage };
+}) {
   return params.hookName === "tool_result_persist"
-    ? params.runner.runToolResultPersist({ message: params.message }, {})
-    : params.runner.runBeforeMessageWrite({ message: params.message }, {});
+    ? params.runner.runToolResultPersist(params.event, {})
+    : params.runner.runBeforeMessageWrite(params.event, {});
 }
 
 describe("sync-only plugin hooks", () => {
@@ -40,10 +55,16 @@ describe("sync-only plugin hooks", () => {
     (hookName) => {
       const method =
         hookName === "tool_result_persist" ? "runToolResultPersist" : "runBeforeMessageWrite";
-      const result = spawnNodeEvalSync(
-        `import { installUnhandledRejectionHandler } from "./src/infra/unhandled-rejections.ts";
-       import { createHookRunner } from "./src/plugins/hooks.ts";
-       import { createEmptyPluginRegistry } from "./src/plugins/registry-empty.ts";
+      const nodeExecutable = resolveTestNodeExecPath();
+      const result = spawnSync(
+        nodeExecutable,
+        [
+          ...resolveRuntimeWorkerArgv(rejectionUrl, nodeExecutable).slice(0, -1),
+          "--input-type=module",
+          "--eval",
+          `import { installUnhandledRejectionHandler } from ${JSON.stringify(rejectionUrl.href)};
+       import { createHookRunner } from ${JSON.stringify(hooksUrl.href)};
+       import { createEmptyPluginRegistry } from ${JSON.stringify(registryUrl.href)};
        installUnhandledRejectionHandler();
        const registry = createEmptyPluginRegistry();
        registry.typedHooks.push({
@@ -66,7 +87,8 @@ describe("sync-only plugin hooks", () => {
          process.exit(2);
        }
        console.log("sync hook rejection contained");`,
-        { imports: ["tsx"], timeout: 20_000 },
+        ],
+        { cwd: process.cwd(), encoding: "utf8", timeout: 20_000 },
       );
 
       expect(result.status).toBe(0);
@@ -102,6 +124,156 @@ describe("sync-only plugin hooks", () => {
     ]);
     expect(logger.error).not.toHaveBeenCalled();
   });
+
+  it.each(syncHookNames)("composes synchronous %s results after fail-open errors", (hookName) => {
+    const logger = createLogger();
+    const originalMessage = createToolResultMessage("original");
+    const replacementMessage = createToolResultMessage("replacement");
+    const finalMessage = createToolResultMessage("final");
+    const observer = vi.fn((event: unknown) => {
+      expect((event as { message: AgentMessage }).message).toBe(replacementMessage);
+      return { message: finalMessage };
+    });
+    const runner = createHookRunner(
+      createMockPluginRegistry([
+        {
+          hookName,
+          pluginId: "replacement-hook",
+          priority: 30,
+          handler: () => ({ message: replacementMessage }),
+        },
+        {
+          hookName,
+          pluginId: "failed-hook",
+          priority: 20,
+          handler: () => {
+            throw new Error("sync-hook-failure");
+          },
+        },
+        { hookName, pluginId: "observer-hook", priority: 10, handler: observer },
+      ]),
+      { logger },
+    );
+
+    expect(runSyncHook({ hookName, runner, message: originalMessage })).toEqual({
+      message: finalMessage,
+    });
+    expect(observer).toHaveBeenCalledOnce();
+    expect(logger.error).toHaveBeenCalledWith(
+      `[hooks] ${hookName} handler from failed-hook failed: Error: sync-hook-failure`,
+    );
+    expect(logger.warn).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["tool_result_persist", "event"],
+    ["before_message_write", "event"],
+    ["tool_result_persist", "message"],
+    ["before_message_write", "message"],
+    ["before_message_write", "block"],
+  ] as const)(
+    "contains %s %s getter failures and continues composition",
+    (hookName, getterName) => {
+      const logger = createLogger();
+      const originalMessage = createToolResultMessage("original");
+      const finalMessage = createToolResultMessage("final");
+      const event = { message: originalMessage };
+      if (getterName === "event") {
+        let reads = 0;
+        Object.defineProperty(event, "hostile", {
+          enumerable: true,
+          get: () => {
+            if (reads++ === 0) {
+              throw new Error("event-getter-failure");
+            }
+            return true;
+          },
+        });
+      }
+      const failingHandler = vi.fn(() => {
+        const result: { message?: AgentMessage; block?: boolean } = {};
+        Object.defineProperty(result, getterName, {
+          enumerable: true,
+          get: () => {
+            throw new Error(`${getterName}-getter-failure`);
+          },
+        });
+        return result;
+      });
+      const runner = createHookRunner(
+        createMockPluginRegistry([
+          { hookName, pluginId: "getter", priority: 20, handler: failingHandler },
+          {
+            hookName,
+            pluginId: "observer",
+            priority: 10,
+            handler: () => ({ message: finalMessage }),
+          },
+        ]),
+        { logger },
+      );
+
+      expect(runSyncHookEvent({ hookName, runner, event })).toEqual({ message: finalMessage });
+      expect(logger.error).toHaveBeenCalledWith(
+        `[hooks] ${hookName} handler from getter failed: Error: ${getterName}-getter-failure`,
+      );
+      expect(failingHandler).toHaveBeenCalledTimes(getterName === "event" ? 0 : 1);
+    },
+  );
+
+  it("does not read block from tool_result_persist results", () => {
+    const replacementMessage = createToolResultMessage("replacement");
+    let blockReads = 0;
+    const result = { message: replacementMessage };
+    Object.defineProperty(result, "block", {
+      get: () => {
+        blockReads += 1;
+        throw new Error("tool-block-getter-failure");
+      },
+    });
+    const runner = createHookRunner(
+      createMockPluginRegistry([
+        { hookName: "tool_result_persist", pluginId: "tool", handler: () => result },
+      ]),
+    );
+
+    expect(
+      runner.runToolResultPersist({ message: createToolResultMessage("original") }, {}),
+    ).toEqual({ message: replacementMessage });
+    expect(blockReads).toBe(0);
+  });
+
+  it.each(syncHookNames)(
+    "fails closed on synchronous %s invocation errors and skips later handlers",
+    (hookName) => {
+      const cause = new Error("sync-hook-failure");
+      const laterHandler = vi.fn();
+      const runner = createHookRunner(
+        createMockPluginRegistry([
+          {
+            hookName,
+            pluginId: "failed",
+            priority: 20,
+            handler: () => {
+              throw cause;
+            },
+          },
+          { hookName, pluginId: "later", priority: 10, handler: laterHandler },
+        ]),
+        { failurePolicyByHook: { [hookName]: "fail-closed" } },
+      );
+
+      expect(() =>
+        runSyncHook({ hookName, runner, message: createToolResultMessage("original") }),
+      ).toThrow(
+        expect.objectContaining({
+          message: `[hooks] ${hookName} handler from failed failed: Error: sync-hook-failure`,
+          cause,
+        }),
+      );
+      expect(laterHandler).not.toHaveBeenCalled();
+    },
+  );
 
   it("preserves synchronous secret redaction and subsequent handler composition", () => {
     const logger = createLogger();

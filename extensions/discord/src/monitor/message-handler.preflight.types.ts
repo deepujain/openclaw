@@ -1,5 +1,8 @@
 // Discord type declarations define plugin contracts.
-import type { InboundEventKind } from "openclaw/plugin-sdk/channel-inbound";
+import type {
+  GroupThreadMentionFacts,
+  InboundEventKind,
+} from "openclaw/plugin-sdk/channel-inbound";
 import type {
   ChannelIngressContextBinding,
   ResolvedChannelMessageIngress,
@@ -11,8 +14,9 @@ import type { ChannelType, Client, User } from "../internal/discord.js";
 import type { DiscordChannelConfigResolved, DiscordGuildEntryResolved } from "./allow-list.js";
 import type { DiscordIngressLifecycle } from "./ingress.js";
 import type { DiscordAvatarResolver } from "./message-avatar.js";
+import type { DiscordChannelInfo } from "./message-channel-info.js";
 import type { DiscordHistoryEntry } from "./message-handler.history.js";
-import type { DiscordChannelInfo, DiscordMediaInfo } from "./message-utils.js";
+import type { DiscordMediaInfo } from "./message-media.js";
 import type { DiscordThreadBindingLookup } from "./reply-delivery.js";
 import type { DiscordSenderIdentity } from "./sender-identity.js";
 import type { DiscordThreadChannel } from "./threading.js";
@@ -37,6 +41,7 @@ type DiscordMessagePreflightSharedFields = {
   buildContext?: BuildChannelInboundContext;
   botUserId?: string;
   abortSignal?: AbortSignal;
+  isPolicyCurrent?: () => boolean;
   guildHistories: Map<string, DiscordHistoryEntry[]>;
   historyLimit: number;
   mediaMaxBytes: number;
@@ -55,6 +60,7 @@ export type DiscordMessagePreflightContext = DiscordMessagePreflightSharedFields
   author: User;
   sender: DiscordSenderIdentity;
   canonicalMessageId?: string;
+  sourceMessageIds?: readonly string[];
   memberRoleIds: string[];
 
   channelInfo: DiscordChannelInfo | null;
@@ -110,6 +116,7 @@ export type DiscordMessagePreflightContext = DiscordMessagePreflightSharedFields
   allowTextCommands: boolean;
   shouldBypassMention: boolean;
   effectiveWasMentioned: boolean;
+  groupThread?: GroupThreadMentionFacts;
   inboundEventKind: InboundEventKind;
   canDetectMention: boolean;
 
@@ -130,6 +137,7 @@ export type DiscordMessagePreflightParams = DiscordMessagePreflightSharedFields 
   threadBindings: DiscordThreadBindingLookup;
   discordRestFetch?: typeof fetch;
   avatarResolver?: DiscordAvatarResolver;
+  precedingMessages?: readonly DiscordMessageEvent["message"][];
   data: DiscordMessageEvent;
   client: Client;
 };

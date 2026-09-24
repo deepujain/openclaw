@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { hostname as readHostName } from "node:os";
-import { isLoopbackHost } from "openclaw/plugin-sdk/ssrf-runtime";
+import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
+import { isLoopbackHost } from "openclaw/plugin-sdk/request-url";
 import type {
   CodexAppServerConnectionClass,
   CodexAppServerDefaultPolicy,
@@ -15,6 +16,7 @@ import type {
 } from "./config-contracts.js";
 import { selectGuardianSandbox } from "./config-exec-policy.js";
 import { DEFAULT_CODEX_APP_SERVER_NETWORK_PROXY_PROFILE_PREFIX } from "./config-parsing.js";
+import { stringifyCodexPolicy } from "./config-policy-json.js";
 import {
   parseAllowedApprovalPoliciesFromCodexRequirements,
   parseAllowedApprovalsReviewersFromCodexRequirements,
@@ -97,21 +99,21 @@ function resolveNetworkProxyPermissionProfileName(
     return explicitProfileName;
   }
   const suffix = createHash("sha256")
-    .update(stableStringifyJson({ version: 1, profile }))
+    .update(stringifyCodexPolicy({ version: 1, profile }))
     .digest("hex")
     .slice(0, 16);
   return `${DEFAULT_CODEX_APP_SERVER_NETWORK_PROXY_PROFILE_PREFIX}-${suffix}`;
 }
 
 function fingerprintCodexAppServerNetworkProxyConfigPatch(configPatch: JsonObject): string {
-  return createHash("sha256").update(stableStringifyJson(configPatch)).digest("hex");
+  return createHash("sha256").update(stringifyCodexPolicy(configPatch)).digest("hex");
 }
 
-function normalizeNetworkProxyPermissionMap<TPermission extends string>(
-  value: Record<string, TPermission> | undefined,
-): Record<string, TPermission> | undefined {
+function normalizeNetworkProxyPermissionMap(
+  value: Record<string, "allow" | "deny" | "none"> | undefined,
+): Record<string, "allow" | "deny"> | undefined {
   const entries = Object.entries(value ?? {})
-    .map(([key, permission]) => [key.trim(), permission] as const)
+    .map(([key, permission]) => [key.trim(), permission === "none" ? "deny" : permission] as const)
     .filter(([key]) => key.length > 0);
   return entries.length > 0 ? Object.fromEntries(entries) : undefined;
 }
@@ -122,22 +124,36 @@ function removeUndefinedJsonFields(value: Record<string, JsonValue | undefined>)
   );
 }
 
-function stableStringifyJson(value: JsonValue): string {
-  if (Array.isArray(value)) {
-    return `[${value.map((item) => stableStringifyJson(item)).join(",")}]`;
+/** Explicit MCP prompting must bypass Codex's unconditional Never-policy approval. */
+export function hasCodexMcpToolApprovalOverrides(
+  servers: NonNullable<OpenClawConfig["mcp"]>["servers"],
+  serverNames?: readonly string[],
+  projectedMcpServers?: Record<string, Record<string, unknown>>,
+): boolean {
+  const modes = new Map(
+    Object.entries(projectedMcpServers ?? {}).map(([name, server]) => [
+      name,
+      server.default_tools_approval_mode,
+    ]),
+  );
+  for (const name of serverNames ?? Object.keys(servers ?? {})) {
+    const server = servers?.[name];
+    const mode = server?.codex?.defaultToolsApprovalMode;
+    // Prepared names already include session overrides that can re-enable a saved disabled server.
+    if (mode !== undefined && (serverNames !== undefined || server?.enabled !== false)) {
+      modes.set(name, mode);
+    }
   }
-  if (value && typeof value === "object") {
-    return `{${Object.entries(value)
-      .toSorted(([left], [right]) => left.localeCompare(right))
-      .map(([key, item]) => `${JSON.stringify(key)}:${stableStringifyJson(item)}`)
-      .join(",")}}`;
-  }
-  return JSON.stringify(value);
+  return [...modes.values()].some((mode) => mode === "auto" || mode === "prompt");
 }
 
 export function withMcpElicitationsApprovalPolicy(
   policy: CodexAppServerEffectiveApprovalPolicy,
 ): CodexAppServerEffectiveApprovalPolicy {
+  // UnlessTrusted already allows MCP elicitation; granular would erase per-command approvals.
+  if (policy === "untrusted") {
+    return policy;
+  }
   if (typeof policy !== "string") {
     return {
       granular: {
@@ -170,10 +186,6 @@ export function withMcpElicitationsApprovalPolicy(
 
 export function resolveTransport(value: unknown): CodexAppServerTransportMode {
   return value === "websocket" || value === "unix" ? value : "stdio";
-}
-
-export function normalizeRemoteWorkspaceRoot(value: string | undefined): string | undefined {
-  return readNonEmptyString(value);
 }
 
 export function inferCodexAppServerConnectionClass(params: {
@@ -294,7 +306,8 @@ export function resolveDefaultCodexAppServerPolicy(params: {
   const yoloSandboxAllowed =
     allowedSandboxModes === undefined || allowedSandboxModes.has("danger-full-access");
   const yoloApprovalAllowed =
-    allowedApprovalPolicies === undefined || allowedApprovalPolicies.has("never");
+    allowedApprovalPolicies === undefined ||
+    (allowedApprovalPolicies.has("never") && !allowedApprovalPolicies.has("untrusted"));
   const yoloReviewerAllowed =
     allowedApprovalsReviewers === undefined || allowedApprovalsReviewers.has("user");
   if (!params.forceGuardian && yoloSandboxAllowed && yoloApprovalAllowed && yoloReviewerAllowed) {

@@ -8,16 +8,15 @@ import {
 } from "../../agents/agent-scope.js";
 import { resolvePersistedOverrideModelRef } from "../../agents/model-selection.js";
 import type { SessionEntry } from "../../config/sessions.js";
-import { resolveSessionAuthProfileOverrideSource } from "../../config/sessions/auth-profile-override-provenance.js";
+import {
+  resolveCollapsedSessionAuthPinSource,
+  resolveSessionAuthProfileOverrideSource,
+} from "../../config/sessions/auth-profile-override-provenance.js";
 import { resolveSessionModelOverrideRouteResolution } from "../../config/sessions/model-override-provenance.js";
 import { updateSessionEntry } from "../../config/sessions/session-accessor.js";
 import { mergeSessionSnapshotChanges } from "../../config/sessions/session-snapshot-merge.js";
 import { shouldPreserveUserFacingSessionStateForInputProvenance } from "../../sessions/input-provenance.js";
 import type { FollowupRun } from "./queue.js";
-
-function sessionEntryMatchesSnapshot(entry: SessionEntry, snapshot: SessionEntry): boolean {
-  return isDeepStrictEqual(entry, snapshot);
-}
 
 function sessionEntryOnlyUpdatedAtChanged(entry: SessionEntry, snapshot: SessionEntry): boolean {
   if (entry.updatedAt === snapshot.updatedAt) {
@@ -62,14 +61,15 @@ export function resolveRunAfterAutoFallbackPrimaryProbeRecheck(params: {
       delete fallbackRun.hasSessionModelOverride;
       delete fallbackRun.hasAutoFallbackProvenance;
     }
-    if (hasEntryModelOverride && params.entry?.modelOverrideSource) {
-      fallbackRun.modelOverrideSource = params.entry.modelOverrideSource;
+    const modelOverrideSource = params.entry?.modelOverrideSource;
+    if (hasEntryModelOverride && modelOverrideSource && modelOverrideSource !== "default") {
+      fallbackRun.modelOverrideSource = modelOverrideSource;
     } else {
       delete fallbackRun.modelOverrideSource;
     }
     if (hasEntryModelOverride && authProfileId) {
       fallbackRun.authProfileId = authProfileId;
-      const authProfileIdSource = resolveSessionAuthProfileOverrideSource(params.entry);
+      const authProfileIdSource = resolveCollapsedSessionAuthPinSource(params.entry);
       if (authProfileIdSource) {
         fallbackRun.authProfileIdSource = authProfileIdSource;
       } else {
@@ -178,7 +178,7 @@ export async function clearRecoveredAutoFallbackPrimaryProbeSelection(params: {
     return;
   }
   if (authoritativeEntry) {
-    if (sessionEntryMatchesSnapshot(currentEntry, activeSessionEntryBeforeUpdate)) {
+    if (isDeepStrictEqual(currentEntry, activeSessionEntryBeforeUpdate)) {
       params.activeSessionStore[params.sessionKey] = authoritativeEntry;
       return;
     }
@@ -193,7 +193,7 @@ export async function clearRecoveredAutoFallbackPrimaryProbeSelection(params: {
       next: authoritativeEntry,
       current: currentEntry,
     });
-  } else if (sessionEntryMatchesSnapshot(currentEntry, activeSessionEntryBeforeUpdate)) {
+  } else if (isDeepStrictEqual(currentEntry, activeSessionEntryBeforeUpdate)) {
     delete params.activeSessionStore[params.sessionKey];
   }
 }

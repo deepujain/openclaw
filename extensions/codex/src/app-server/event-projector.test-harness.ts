@@ -21,8 +21,10 @@ import {
   resetGlobalHookRunner,
 } from "openclaw/plugin-sdk/hook-runtime";
 import { createMockPluginRegistry } from "openclaw/plugin-sdk/plugin-test-runtime";
+import { closeOpenClawAgentDatabasesAsync } from "openclaw/plugin-sdk/sqlite-runtime-testing";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CodexAppServerEventProjector } from "./event-projector.js";
+import { createCodexTestHostCapabilities } from "./host-capability.test-support.js";
 import { createCodexTestModel, createCodexTestToolTerminalObserver } from "./test-support.js";
 
 export { readAttemptTerminal } from "./attempt-terminal.test-helper.js";
@@ -105,6 +107,7 @@ export async function createParams(): Promise<EmbeddedRunAttemptParams> {
     model: createCodexTestModel(),
     thinkLevel: "medium",
     observeToolTerminal: createCodexTestToolTerminalObserver(),
+    hostCapabilities: createCodexTestHostCapabilities(),
   } as EmbeddedRunAttemptParams;
 }
 
@@ -141,13 +144,14 @@ export function registerCodexEventProjectorTestLifecycle(): void {
     vi.restoreAllMocks();
     vi.unstubAllEnvs();
     for (const tempDir of tempDirs) {
+      await closeOpenClawAgentDatabasesAsync(tempDir);
       await fs.rm(tempDir, { recursive: true, force: true });
     }
     tempDirs.clear();
   });
 }
 
-export async function createProjectorWithHooks() {
+export async function createProjectorWithHooks(options?: CodexAppServerEventProjectorOptions) {
   const beforeCompaction = vi.fn();
   const afterCompaction = vi.fn();
   initializeGlobalHookRunner(
@@ -156,7 +160,7 @@ export async function createProjectorWithHooks() {
       { hookName: "after_compaction", handler: afterCompaction },
     ]),
   );
-  const projector = await createProjector();
+  const projector = await createProjector(undefined, options);
   return { projector, beforeCompaction, afterCompaction };
 }
 

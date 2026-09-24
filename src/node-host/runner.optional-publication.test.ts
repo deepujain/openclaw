@@ -15,6 +15,7 @@ const mocks = vi.hoisted(() => ({
   capturedGatewayClients: [] as Array<{
     request: Mock<(method: string, params?: unknown) => Promise<unknown>>;
     stop: ReturnType<typeof vi.fn>;
+    stopAndWait: ReturnType<typeof vi.fn<() => Promise<void>>>;
     updateNodeManifest: ReturnType<typeof vi.fn>;
   }>,
   nodePluginTools: [] as Array<Record<string, unknown>>,
@@ -22,6 +23,7 @@ const mocks = vi.hoisted(() => ({
   nodeHostCommands: [] as string[],
   nodeHostCaps: [] as string[],
   availabilityChanged: undefined as (() => void) | undefined,
+  closeMcpManager: vi.fn(async () => undefined),
   configureNodeHost: vi.fn(async (params: Parameters<typeof configureNodeHost>[0]) => ({
     version: 1 as const,
     nodeId: params.nodeId?.trim() || "node-test",
@@ -39,7 +41,7 @@ vi.mock("../config/config.js", () => ({
   getRuntimeConfig: vi.fn(() => ({ gateway: { handshakeTimeoutMs: 1_000 } })),
 }));
 
-vi.mock("../gateway/client-start-readiness.js", () => ({
+vi.mock("../../packages/gateway-client/src/readiness.js", () => ({
   startGatewayClientWhenEventLoopReady: mocks.startGatewayClientWhenEventLoopReady,
 }));
 
@@ -51,6 +53,7 @@ vi.mock("../gateway/client.js", async (importOriginal) => {
       const client = {
         request: vi.fn(async () => ({})),
         stop: vi.fn(),
+        stopAndWait: vi.fn(async () => {}),
         updateNodeManifest: vi.fn(),
       };
       mocks.capturedGatewayClientOptions.push(opts);
@@ -86,10 +89,12 @@ vi.mock("../infra/path-env.js", () => ({
 
 vi.mock("./config.js", () => ({
   configureNodeHost: mocks.configureNodeHost,
+  loadNodeHostConfig: async () => null,
 }));
 
 vi.mock("./plugin-node-host.js", () => ({
   ensureNodeHostPluginRegistry: vi.fn(async () => undefined),
+  notifyRegisteredNodeHostCommandDisconnect: vi.fn(async () => {}),
   listRegisteredNodeHostCapsAndCommands: vi.fn(() => ({
     commands: [...mocks.nodeHostCommands],
     caps: [...mocks.nodeHostCaps],
@@ -107,7 +112,7 @@ vi.mock("./mcp.js", () => ({
   startNodeHostMcpManager: vi.fn(async () => ({
     descriptors: [],
     callMcpTool: vi.fn(),
-    close: vi.fn(async () => {}),
+    close: mocks.closeMcpManager,
   })),
 }));
 
@@ -130,7 +135,7 @@ async function withReadyNodeHost(
     aborted: false,
     elapsedMs: 0,
   });
-  const processOnceSpy = vi.spyOn(process, "once");
+  const processOnSpy = vi.spyOn(process, "on");
   const previousExitCode = process.exitCode;
   let running: Promise<void> | undefined;
   try {
@@ -142,23 +147,23 @@ async function withReadyNodeHost(
     }
     await runTest({ client, options: mocks.capturedGatewayClientOptions.at(-1) });
   } finally {
-    const onSigterm = processOnceSpy.mock.calls.find(([event]) => event === "SIGTERM")?.[1];
+    const onSigterm = processOnSpy.mock.calls.find(([event]) => event === "SIGTERM")?.[1];
     try {
       onSigterm?.("SIGTERM");
       await running;
     } finally {
-      for (const [event, listener] of processOnceSpy.mock.calls) {
+      for (const [event, listener] of processOnSpy.mock.calls) {
         if ((event === "SIGINT" || event === "SIGTERM") && typeof listener === "function") {
           process.off(event, listener);
         }
       }
       process.exitCode = previousExitCode;
-      processOnceSpy.mockRestore();
+      processOnSpy.mockRestore();
     }
   }
 }
 
-describe("runNodeHost optional publications", () => {
+describe("runNodeHost connection and optional publications", () => {
   beforeEach(() => {
     mocks.capturedGatewayClientOptions.length = 0;
     mocks.capturedGatewayClients.length = 0;
@@ -176,6 +181,98 @@ describe("runNodeHost optional publications", () => {
     mocks.nodeHostCaps = [];
     mocks.availabilityChanged = undefined;
     vi.clearAllMocks();
+  });
+
+  it("exits after three identical permanent Gateway upgrade rejections", async () => {
+    await withReadyNodeHost(async ({ client, options }) => {
+      const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+      try {
+        const rejection = new GatewayClientRequestError({
+          code: "UNAVAILABLE",
+          message: "gateway rejected websocket upgrade (HTTP 403)",
+          details: {
+            reason: "websocket-upgrade-rejected",
+            httpStatus: 403,
+            gatewayErrorType: "proxy_attribution_required",
+            gatewayErrorMessage: "Configure gateway.trustedProxies narrowly",
+          },
+        });
+        options?.onConnectError?.(rejection);
+        options?.onConnectError?.(rejection);
+        expect(client.stopAndWait).not.toHaveBeenCalled();
+        options?.onConnectError?.(rejection);
+
+        await vi.waitFor(() => expect(process.exitCode).toBe(1));
+        expect(client.stopAndWait).toHaveBeenCalledOnce();
+        expect(mocks.closeMcpManager).toHaveBeenCalledOnce();
+        expect(stderr).toHaveBeenCalledWith(
+          "node host gateway permanently rejected connection (proxy_attribution_required): Configure gateway.trustedProxies narrowly; exiting\n",
+        );
+      } finally {
+        stderr.mockRestore();
+      }
+    });
+  });
+
+  it("keeps retrying transient upgrade failures and resets permanent rejection streaks", async () => {
+    await withReadyNodeHost(async ({ client, options }) => {
+      const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+      try {
+        const permanentRejection = new GatewayClientRequestError({
+          code: "UNAVAILABLE",
+          details: {
+            reason: "websocket-upgrade-rejected",
+            httpStatus: 403,
+            gatewayErrorType: "proxy_attribution_required",
+          },
+        });
+        const rejectTwice = () => {
+          options?.onConnectError?.(permanentRejection);
+          options?.onConnectError?.(permanentRejection);
+        };
+        const transientErrors = [
+          new Error("connect ECONNRESET"),
+          ...[
+            { httpStatus: 429, gatewayErrorType: "rate_limited" },
+            { httpStatus: 503, gatewayErrorType: "proxy_attribution_required" },
+            { httpStatus: 403 },
+            { httpStatus: 403, gatewayErrorType: "another_rejection" },
+          ].map(
+            (details) =>
+              new GatewayClientRequestError({
+                code: "UNAVAILABLE",
+                details: { reason: "websocket-upgrade-rejected", ...details },
+              }),
+          ),
+        ];
+
+        for (const transientError of transientErrors) {
+          rejectTwice();
+          options?.onConnectError?.(transientError);
+          expect(client.stopAndWait).not.toHaveBeenCalled();
+        }
+        rejectTwice();
+        options?.onHelloOk?.({
+          type: "hello-ok",
+          protocol: 4,
+          server: { version: "test", connId: "test-connection" },
+          features: { methods: [], events: [] },
+          snapshot: {
+            presence: [],
+            health: {},
+            stateVersion: { presence: 0, health: 0 },
+            uptimeMs: 0,
+          },
+          auth: { role: "node", scopes: [] },
+          policy: { maxPayload: 1, maxBufferedBytes: 1, tickIntervalMs: 1 },
+        });
+        rejectTwice();
+        expect(client.stopAndWait).not.toHaveBeenCalled();
+        expect(stderr).not.toHaveBeenCalledWith(expect.stringContaining("permanently rejected"));
+      } finally {
+        stderr.mockRestore();
+      }
+    });
   });
 
   it("learns unsupported optional publications once per connection without a request flood", async () => {

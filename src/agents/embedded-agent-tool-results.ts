@@ -7,12 +7,15 @@ import {
   readStringValue,
 } from "@openclaw/normalization-core/string-coerce";
 import {
-  redactSecrets,
+  redactModelVisibleSecrets,
+  redactModelVisibleSensitiveFieldValueWithConfig,
+  redactModelVisibleToolPayloadText,
   redactSensitiveFieldValue,
   redactToolPayloadText,
 } from "../logging/redact.js";
 import { truncateUtf16Safe } from "../utils.js";
 import { collectTextContentBlocks } from "./content-blocks.js";
+import { memoizeSanitizedToolResult } from "./embedded-agent-tool-result-cache.js";
 import {
   isToolResultError,
   readToolResultDetails,
@@ -32,6 +35,30 @@ const SENSITIVE_STRUCTURED_HEADER_FIELDS = new Set([
   "x-api-key",
   "x-auth-token",
 ]);
+
+/** Recognize work accepted by a tool whose background task owns completion. */
+export function isAsyncStartedToolResult(result: unknown): boolean {
+  const details = readToolResultDetails(result);
+  return details?.async === true && details.status === "started";
+}
+
+/** Preserve the accepted task's identity independently of result presentation. */
+export function readAsyncStartedTaskIds(result: unknown): {
+  asyncTaskRunId?: string;
+  asyncTaskId?: string;
+} {
+  const details = readToolResultDetails(result);
+  if (!details) {
+    return {};
+  }
+  const nestedTask = readRecord(details.task);
+  const asyncTaskRunId = readStringValue(details.runId) ?? readStringValue(nestedTask?.runId);
+  const asyncTaskId = readStringValue(details.taskId) ?? readStringValue(nestedTask?.taskId);
+  return {
+    ...(asyncTaskRunId ? { asyncTaskRunId } : {}),
+    ...(asyncTaskId ? { asyncTaskId } : {}),
+  };
+}
 
 function truncateToolText(text: string): string {
   if (text.length <= TOOL_RESULT_MAX_CHARS) {
@@ -69,11 +96,7 @@ export function capLiveExecResult(result: unknown): unknown {
 }
 
 function normalizeToolErrorText(text: string): string | undefined {
-  const trimmed = text.trim();
-  if (!trimmed) {
-    return undefined;
-  }
-  const firstLine = trimmed.split(/\r?\n/)[0]?.trim() ?? "";
+  const firstLine = text.trimStart().split(/\r?\n/, 1)[0]?.trim();
   if (!firstLine) {
     return undefined;
   }
@@ -188,6 +211,7 @@ function extractDirectErrorCodeField(value: unknown): string | undefined {
 }
 
 export function buildToolLifecycleErrorResult(error: unknown): {
+  content: { type: "text"; text: string }[];
   details: Record<string, unknown>;
 } {
   const errorRecord = readRecord(error);
@@ -197,6 +221,7 @@ export function buildToolLifecycleErrorResult(error: unknown): {
     readErrorCodeField(errorRecord?.gatewayCode) ?? readErrorCodeField(errorRecord?.code);
   const message = error instanceof Error ? error.message : String(error);
   return {
+    content: [{ type: "text", text: message }],
     details: {
       status: "error",
       error: message,
@@ -230,14 +255,14 @@ function redactStringsDeep(value: unknown, seen = new WeakSet<object>()): unknow
       return "[Circular]";
     }
     seen.add(value);
-    const out: Record<string, unknown> = {};
-    for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
-      out[key] =
-        typeof child === "string"
-          ? redactSensitiveFieldValue(key, child)
-          : redactStringsDeep(child, seen);
+    const entries = Object.entries(value as Record<string, unknown>);
+    for (const entry of entries) {
+      entry[1] =
+        typeof entry[1] === "string"
+          ? redactSensitiveFieldValue(entry[0], entry[1])
+          : redactStringsDeep(entry[1], seen);
     }
-    return out;
+    return Object.fromEntries(entries);
   }
   return value;
 }
@@ -246,15 +271,22 @@ export function sanitizeToolArgs(args: unknown): unknown {
   return redactStringsDeep(args);
 }
 
+/** A string result keeps its string type: only model-visible redaction is applied to it. */
+export function sanitizeToolResult(result: string): string;
+export function sanitizeToolResult(result: unknown): unknown;
 export function sanitizeToolResult(result: unknown): unknown {
   if (typeof result === "string") {
-    return redactToolPayloadText(result);
-  }
-  if (Array.isArray(result)) {
-    return redactSecrets(result);
+    return redactModelVisibleToolPayloadText(result);
   }
   if (!result || typeof result !== "object") {
     return result;
+  }
+  return memoizeSanitizedToolResult(result, () => sanitizeStructuredToolResult(result));
+}
+
+function sanitizeStructuredToolResult(result: object): object {
+  if (Array.isArray(result)) {
+    return redactModelVisibleSecrets(result);
   }
   const record = result as Record<string, unknown>;
   // Strip image data first so the deep redaction pass doesn't waste work
@@ -273,16 +305,15 @@ export function sanitizeToolResult(result: unknown): unknown {
         const bytes = data === undefined ? existingBytes : estimateBase64DecodedBytes(data);
         const cleaned = { ...entry };
         delete cleaned.data;
-        return Object.assign({}, cleaned, { bytes, omitted: true });
+        return Object.assign(cleaned, { bytes, omitted: true });
       }
       return entry;
     });
   }
   // Deep-redact the entire result so any top-level or nested string is
   // protected, not just `details` and text content blocks.
-  const baseline = redactSecrets(preCleaned);
-  const out: Record<string, unknown> = { ...baseline };
-  const content = Array.isArray(baseline.content) ? baseline.content : null;
+  const out = redactModelVisibleSecrets(preCleaned);
+  const content = Array.isArray(out.content) ? out.content : null;
   if (content) {
     out.content = content.map((item) => {
       if (!item || typeof item !== "object") {
@@ -290,7 +321,9 @@ export function sanitizeToolResult(result: unknown): unknown {
       }
       const entry = item as Record<string, unknown>;
       if (readStringValue(entry.type) === "text" && typeof entry.text === "string") {
-        return Object.assign({}, entry, { text: truncateToolText(entry.text) });
+        const text = truncateToolText(entry.text);
+        // Nonplain blocks can still be caller-owned; spread keeps JSON keys as own data.
+        return Object.assign({ ...entry }, { text });
       }
       return entry;
     });
@@ -340,7 +373,9 @@ function sanitizeStructuredToolResultValue(
     if (OPAQUE_STRUCTURED_RESULT_FIELDS.has(key)) {
       return `[opaque data omitted: ${value.length} chars]`;
     }
-    return truncateToolText(redactInlineDataUriValue(redactSensitiveFieldValue(key, value)));
+    return truncateToolText(
+      redactInlineDataUriValue(redactModelVisibleSensitiveFieldValueWithConfig(key, value)),
+    );
   }
   if (typeof value === "bigint") {
     return value.toString();
@@ -379,7 +414,7 @@ function stringifyStructuredToolResultContent(block: unknown): string | undefine
   }
   try {
     const serialized = JSON.stringify(sanitizeStructuredToolResultValue(record));
-    const redacted = serialized ? redactToolPayloadText(serialized) : serialized;
+    const redacted = serialized ? redactModelVisibleToolPayloadText(serialized) : serialized;
     return redacted && redacted !== "{}" ? redacted : undefined;
   } catch {
     return undefined;
@@ -406,7 +441,7 @@ function resolveToolResultContentBlocks(result: object): unknown[] {
 
 export function extractToolResultText(result: unknown): string | undefined {
   if (typeof result === "string") {
-    const trimmed = redactToolPayloadText(redactInlineDataUriValue(result)).trim();
+    const trimmed = redactModelVisibleToolPayloadText(redactInlineDataUriValue(result)).trim();
     return trimmed ? truncateToolText(trimmed) : undefined;
   }
   if (!result || typeof result !== "object") {

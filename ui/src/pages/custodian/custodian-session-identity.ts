@@ -1,4 +1,4 @@
-import type { ApplicationGateway } from "../../app/context.ts";
+import { generateUUID } from "../../lib/uuid.ts";
 import { getSafeLocalStorage } from "../../local-storage.ts";
 
 const CUSTODIAN_SESSION_STORAGE_KEY = "openclaw.custodian.session.v1";
@@ -8,13 +8,7 @@ function isStoredCustodianSessionId(value: string | null): value is string {
 }
 
 export function createCustodianSessionId(): string {
-  if (typeof crypto.randomUUID === "function") {
-    return `control-ui-onboarding-${crypto.randomUUID()}`;
-  }
-  const suffix = [...crypto.getRandomValues(new Uint32Array(4))]
-    .map((value) => value.toString(16).padStart(8, "0"))
-    .join("");
-  return `control-ui-onboarding-${suffix}`;
+  return `control-ui-onboarding-${generateUUID()}`;
 }
 
 export function persistCustodianSessionId(sessionId: string): void {
@@ -43,20 +37,4 @@ export function loadCustodianSessionId(): { sessionId: string; restored: boolean
   const sessionId = createCustodianSessionId();
   persistCustodianSessionId(sessionId);
   return { sessionId, restored: false };
-}
-
-export class CustodianSessionOwner {
-  private lastDeviceToken = "";
-
-  key(gateway: ApplicationGateway | null): string {
-    if (!gateway) {
-      return "";
-    }
-    const { gatewayUrl, token, password, bootstrapToken } = gateway.connection;
-    const auth = gateway.snapshot.hello?.auth;
-    if (auth) {
-      this.lastDeviceToken = auth.deviceToken ?? "";
-    }
-    return JSON.stringify([gatewayUrl, token, password, bootstrapToken, this.lastDeviceToken]);
-  }
 }

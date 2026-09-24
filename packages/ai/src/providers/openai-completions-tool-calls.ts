@@ -3,6 +3,7 @@ import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import type { ChatCompletionChunk } from "openai/resources/chat/completions.js";
 import { measureUtf8AppendBytes } from "../transports/openai-transport-shared.js";
 import { finalizeTerminalToolCallArguments } from "../transports/transport-stream-shared.js";
+import type { ToolCall } from "../types.js";
 
 type ChatCompletionToolCallDelta = ChatCompletionChunk.Choice.Delta.ToolCall;
 const MAX_BUFFERED_TOOL_CALL_ARGUMENT_BYTES = 256_000;
@@ -18,6 +19,57 @@ type OpenAICompletionsToolCallFinalizationOptions<TBlock extends object> = {
   allowSilentToolCallPromotion?: boolean;
   onConfirmedToolCall?: (block: TBlock, contentIndex: number) => void;
 };
+
+/** Keep encrypted provider reasoning attached to the first matching tool call. */
+export function createOpenAIEncryptedToolCallReasoningTracker() {
+  const firstBlocks = new Map<string, { block: ToolCall; signature?: string }>();
+  const pendingDetails = new Map<string, string>();
+  return {
+    rememberToolCall(id: string, block: ToolCall, previousId = id) {
+      const previous = firstBlocks.get(previousId);
+      if (previousId !== id && previous?.block === block) {
+        firstBlocks.delete(previousId);
+        if (previous.signature && block.thoughtSignature === previous.signature) {
+          delete block.thoughtSignature;
+        }
+      }
+      if (!id || firstBlocks.has(id)) {
+        return;
+      }
+      const pendingDetail = pendingDetails.get(id);
+      firstBlocks.set(id, { block, signature: pendingDetail });
+      if (pendingDetail) {
+        block.thoughtSignature = pendingDetail;
+        pendingDetails.delete(id);
+      }
+    },
+    consumeDetails(details: unknown) {
+      if (!Array.isArray(details)) {
+        return;
+      }
+      for (const detail of details) {
+        if (
+          !isRecord(detail) ||
+          detail.type !== "reasoning.encrypted" ||
+          typeof detail.id !== "string" ||
+          detail.id.length === 0 ||
+          typeof detail.data !== "string" ||
+          detail.data.length === 0
+        ) {
+          continue;
+        }
+        const serializedDetail = JSON.stringify(detail);
+        const matchingBlock = firstBlocks.get(detail.id);
+        if (matchingBlock) {
+          matchingBlock.signature = serializedDetail;
+          matchingBlock.block.thoughtSignature = serializedDetail;
+        } else {
+          pendingDetails.set(detail.id, serializedDetail);
+        }
+      }
+    },
+  };
+}
 
 /** Normalize the SDK's legacy single-function lane into its modern tool-call shape. */
 export function createOpenAICompletionsToolCallDeltaNormalizer(): (
@@ -114,7 +166,7 @@ export function createOpenAICompletionsToolCallDeltaNormalizer(): (
     }
 
     const functionCall = delta.function_call;
-    if (sawModernToolCall) {
+    if (sawModernToolCall || (!functionCall && !pendingLegacyToolCall)) {
       return [{ delta: ordinaryDelta, toolCalls: [] }];
     }
 

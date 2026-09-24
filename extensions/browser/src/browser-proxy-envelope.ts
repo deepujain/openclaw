@@ -3,7 +3,7 @@ import type { ResolvedBrowserProfile } from "./browser/config.js";
 /**
  * Browser node-proxy response envelope shared by the node host and Gateway.
  */
-import { parseBrowserErrorPayload, type BrowserNoDisplayErrorMetadata } from "./browser/errors.js";
+import { parseBrowserErrorPayload, type BrowserErrorPayload } from "./browser/errors.js";
 
 /** Additive opt-in for structured browser route errors over node.invoke. */
 export const BROWSER_PROXY_ERROR_ENVELOPE = "browser-v1" as const;
@@ -104,10 +104,6 @@ export function visitBrowserProxyFilePaths(
   }
 }
 
-type BrowserProxyErrorBody =
-  | { error: string }
-  | ({ error: string } & BrowserNoDisplayErrorMetadata);
-
 export type BrowserProxySuccess = {
   result: unknown;
   files?: BrowserProxyFile[];
@@ -117,23 +113,12 @@ export type BrowserProxySuccess = {
 type BrowserProxyFailure = {
   error: {
     status: number;
-    body: BrowserProxyErrorBody;
+    body: BrowserErrorPayload;
   };
   route?: BrowserProxyRoute;
 };
 
 export type BrowserProxyEnvelope = BrowserProxySuccess | BrowserProxyFailure;
-
-function normalizeBrowserProxyErrorBody(
-  value: unknown,
-  fallback?: string,
-): BrowserProxyErrorBody | null {
-  const parsed = parseBrowserErrorPayload(value);
-  if (parsed) {
-    return parsed;
-  }
-  return fallback ? { error: fallback } : null;
-}
 
 /** Build a route-failure envelope while allowing only closed Browser metadata. */
 export function createBrowserProxyFailure(
@@ -144,7 +129,7 @@ export function createBrowserProxyFailure(
   return {
     error: {
       status,
-      body: normalizeBrowserProxyErrorBody(body, `HTTP ${status}`) ?? { error: `HTTP ${status}` },
+      body: parseBrowserErrorPayload(body) ?? { error: `HTTP ${status}` },
     },
     ...(route ? { route } : {}),
   };
@@ -161,7 +146,8 @@ export function parseBrowserProxyRoute(value: unknown): BrowserProxyRoute | unde
   if (
     route.status !== "resolved" ||
     typeof route.profile !== "string" ||
-    !route.profile.trim() ||
+    !route.profile ||
+    route.profile.trim() !== route.profile ||
     (route.driver !== "openclaw" &&
       route.driver !== "existing-session" &&
       route.driver !== "extension")
@@ -170,7 +156,8 @@ export function parseBrowserProxyRoute(value: unknown): BrowserProxyRoute | unde
   }
   return {
     status: "resolved",
-    profile: route.profile.trim(),
+    // This is execution identity, not user input; normalization could name another profile.
+    profile: route.profile,
     driver: route.driver,
   };
 }
@@ -192,7 +179,7 @@ export function parseBrowserProxyFailure(value: unknown): BrowserProxyFailure | 
   ) {
     return null;
   }
-  const body = normalizeBrowserProxyErrorBody(candidate.body);
+  const body = parseBrowserErrorPayload(candidate.body);
   if (!body) {
     return null;
   }

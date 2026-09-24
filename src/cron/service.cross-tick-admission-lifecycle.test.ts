@@ -1,22 +1,23 @@
 // Cross-tick lifecycle regressions cover delayed capacity wakes and activation skips.
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  createCronRegressionState,
   createDueIsolatedJob,
-  noopLogger,
   setupCronRegressionFixtures,
 } from "../../test/helpers/cron/service-regression-fixtures.js";
 import { createDeferred } from "../../test/helpers/promise.js";
 import { DEFAULT_CRON_MAX_CONCURRENT_RUNS } from "../config/cron-limits.js";
 import { enqueueCommandInLane } from "../process/command-queue.js";
 import {
+  beginGatewayRestartSignalAdmission,
   GatewayDrainingError,
   getActiveGatewayRootWorkCount,
   resetGatewayWorkAdmission,
   runWithGatewayIndependentRootWorkAdmission,
 } from "../process/gateway-work-admission.js";
-import { stop } from "./service/ops-lifecycle.js";
+import { captureTaskDeliveryWork } from "../tasks/task-registry-delivery.test-support.js";
+import { start, stop } from "./service/ops-lifecycle.js";
 import { run } from "./service/ops-run.js";
-import { createCronServiceState } from "./service/state.js";
 import { onTimer } from "./service/timer.test-support.js";
 import * as cronStoreModule from "./store.js";
 import type { CronJob } from "./types.js";
@@ -31,7 +32,56 @@ describe("cron service cross-tick admission lifecycle", () => {
     vi.useRealTimers();
   });
 
+  it("retires a suspended timer across a scheduler stop and restart", async () => {
+    const store = fixtures.makeStorePath();
+    let nowMs = Date.parse("2026-02-06T10:08:00.000Z");
+    const job = createDueIsolatedJob({
+      id: "retired-scheduler-timer",
+      nowMs,
+      nextRunAtMs: nowMs + 1_000,
+    });
+    await cronStoreModule.saveCronStore(store.storePath, {
+      version: 1,
+      jobs: [job],
+    });
+
+    const runIsolatedAgentJob = vi.fn(async () => ({ status: "ok" as const }));
+    const state = createCronRegressionState({
+      storePath: store.storePath,
+      nowMs: () => nowMs,
+      runIsolatedAgentJob,
+    });
+    await start(state);
+    const restartSignal = beginGatewayRestartSignalAdmission();
+    expect(restartSignal).not.toBeNull();
+    const retiredTimer = onTimer(state);
+
+    try {
+      stop(state);
+      await start(state);
+      const restartedTimer = state.timer;
+      nowMs += 1_000;
+
+      expect(restartSignal?.rollback()).toBe(true);
+      await retiredTimer;
+
+      expect(runIsolatedAgentJob).not.toHaveBeenCalled();
+      expect(state.timer).toBe(restartedTimer);
+      expect(state.queuedRunReservationsByJobId.size).toBe(0);
+      expect(getActiveGatewayRootWorkCount()).toBe(0);
+      const persisted = await cronStoreModule.loadCronStore(store.storePath);
+      expect(persisted.jobs[0]?.state).toMatchObject({ nextRunAtMs: nowMs });
+      expect(persisted.jobs[0]?.state.queuedAtMs).toBeUndefined();
+      expect(persisted.jobs[0]?.state.runningAtMs).toBeUndefined();
+    } finally {
+      restartSignal?.rollback();
+      stop(state);
+      await retiredTimer;
+    }
+  });
+
   it("gives a waiter-delayed partial-batch wake an independent Gateway root", async () => {
+    using deliveries = captureTaskDeliveryWork();
     const store = fixtures.makeStorePath();
     const t0 = Date.parse("2026-02-06T10:09:00.000Z");
     const scheduledA = createDueIsolatedJob({
@@ -72,15 +122,17 @@ describe("cron service cross-tick admission lifecycle", () => {
     const directBStarted = createDeferred();
     const releaseDirectA = createDeferred<{ status: "ok"; summary: string }>();
     const releaseDirectB = createDeferred<{ status: "ok"; summary: string }>();
+    const pendingStarted = createDeferred();
     let pendingStartCount = 0;
     const releasePending = createDeferred<{ status: "ok"; summary: string }>();
-    const state = createCronServiceState({
-      cronEnabled: true,
+    const state = createCronRegressionState({
       storePath: store.storePath,
-      log: noopLogger,
       nowMs: () => t0,
-      enqueueSystemEvent: vi.fn(),
-      requestHeartbeat: vi.fn(),
+      onEvent: (event) => {
+        if (event.jobId === pending.id && event.action === "started") {
+          pendingStarted.resolve();
+        }
+      },
       runIsolatedAgentJob: vi.fn(async ({ job }: { job: CronJob }) => {
         switch (job.id) {
           case scheduledA.id:
@@ -128,17 +180,22 @@ describe("cron service cross-tick admission lifecycle", () => {
       releaseScheduledB.resolve({ status: "ok", summary: "scheduled b" });
       await Promise.all([directAStarted.promise, directBStarted.promise]);
       await timerRun;
+      await deliveries.settle();
 
       expect(state.runAdmission.capacityListener).toBeTypeOf("function");
       expect(getActiveGatewayRootWorkCount()).toBe(2);
 
       releaseDirectA.resolve({ status: "ok", summary: "direct a" });
-      await vi.waitFor(() => expect(pendingStartCount).toBe(1));
+      // The capacity wake still observes active receipts before admitting pending work.
+      await pendingStarted.promise;
+      expect(pendingStartCount).toBe(1);
       await directRunA;
+      await deliveries.settle();
       expect(getActiveGatewayRootWorkCount()).toBe(2);
 
       releaseDirectB.resolve({ status: "ok", summary: "direct b" });
       await directRunB;
+      await deliveries.settle();
       expect(getActiveGatewayRootWorkCount()).toBe(1);
 
       releasePending.resolve({ status: "ok", summary: "pending" });
@@ -155,7 +212,11 @@ describe("cron service cross-tick admission lifecycle", () => {
         directRunA ?? Promise.resolve(),
         directRunB ?? Promise.resolve(),
       ]);
-      stop(state);
+      try {
+        await deliveries.settle();
+      } finally {
+        stop(state);
+      }
     }
   });
 
@@ -196,13 +257,9 @@ describe("cron service cross-tick admission lifecycle", () => {
     const pendingStarted = createDeferred();
     const directRootRetired = createDeferred();
     const subordinateResult = createDeferred<unknown>();
-    const state = createCronServiceState({
-      cronEnabled: true,
+    const state = createCronRegressionState({
       storePath: store.storePath,
-      log: noopLogger,
       nowMs: () => t0,
-      enqueueSystemEvent: vi.fn(),
-      requestHeartbeat: vi.fn(),
       runIsolatedAgentJob: vi.fn(async ({ job }: { job: CronJob }) => {
         switch (job.id) {
           case scheduledA.id:
@@ -292,13 +349,9 @@ describe("cron service cross-tick admission lifecycle", () => {
       expect(job.id).toBe(pending.id);
       return { status: "ok" as const, summary: "pending" };
     });
-    const state = createCronServiceState({
-      cronEnabled: true,
+    const state = createCronRegressionState({
       storePath: store.storePath,
-      log: noopLogger,
       nowMs: () => t0,
-      enqueueSystemEvent: vi.fn(),
-      requestHeartbeat: vi.fn(),
       runIsolatedAgentJob,
     });
     state.runAdmission.active = DEFAULT_CRON_MAX_CONCURRENT_RUNS - 1;

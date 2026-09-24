@@ -5,7 +5,6 @@ import type { Command } from "commander";
 import {
   registerCommandGroups,
   shouldEagerRegisterSubcommands,
-  type CommandGroupEntry,
   type CommandGroupPlaceholder,
 } from "openclaw/plugin-sdk/cli-runtime";
 import { resolveBrowserLazySubcommand } from "../../cli-output-mode.js";
@@ -156,35 +155,6 @@ const browserCommandGroupDefinitions: readonly BrowserCommandGroupDefinition[] =
   },
 ];
 
-function buildBrowserCommandGroups(params: {
-  browser: Command;
-  parentOpts: (cmd: Command) => BrowserParentOpts;
-  pluginRoot?: string;
-}): CommandGroupEntry[] {
-  return browserCommandGroupDefinitions.map((entry) => ({
-    placeholders: entry.placeholders,
-    register: async () => await entry.register(params),
-  }));
-}
-
-function resolveBrowserParentOpts(cmd: Command): BrowserParentOpts {
-  return cmd.optsWithGlobals<BrowserParentOpts>();
-}
-
-function registerLazyBrowserCommands(
-  browser: Command,
-  parentOpts: (cmd: Command) => BrowserParentOpts,
-  argv: string[],
-  pluginRoot?: string,
-) {
-  const subcommand = resolveBrowserLazySubcommand(argv);
-  registerCommandGroups(browser, buildBrowserCommandGroups({ browser, parentOpts, pluginRoot }), {
-    eager: shouldEagerRegisterSubcommands(),
-    primary: subcommand,
-    registerPrimaryOnly: subcommand !== null,
-  });
-}
-
 /** Registers the Browser CLI command and its lazy-loaded subcommand groups. */
 export function registerBrowserCli(
   program: Command,
@@ -217,7 +187,19 @@ export function registerBrowserCli(
 
   addGatewayClientOptions(browser);
 
-  const parentOpts = resolveBrowserParentOpts;
+  const parentOpts = () => browser.opts<BrowserParentOpts>();
 
-  registerLazyBrowserCommands(browser, parentOpts, argv, pluginRoot);
+  const subcommand = resolveBrowserLazySubcommand(argv);
+  registerCommandGroups(
+    browser,
+    browserCommandGroupDefinitions.map((entry) => ({
+      placeholders: entry.placeholders,
+      register: async () => await entry.register({ browser, parentOpts, pluginRoot }),
+    })),
+    {
+      eager: shouldEagerRegisterSubcommands(),
+      primary: subcommand,
+      registerPrimaryOnly: subcommand !== null,
+    },
+  );
 }

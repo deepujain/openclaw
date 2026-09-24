@@ -1,13 +1,9 @@
-import type { EmbeddedRunAttemptParamsV2 as EmbeddedRunAttemptParams } from "openclaw/plugin-sdk/agent-harness-runtime";
-import {
-  resolveCodexAppServerReasoningEffort,
-  type CodexReasoningEffort,
-} from "./reasoning-effort.js";
 import {
   isCodexAppServerNativeAuthProfile,
   type CodexAppServerAuthProfileLookup,
-  type CodexAppServerThreadBinding,
-} from "./session-binding.js";
+} from "./auth-profile.js";
+import type { CodexAppServerHomeScope } from "./config-contracts.js";
+import type { CodexAppServerThreadBinding } from "./session-binding.js";
 
 export const CODEX_NATIVE_PERSONALITY_NONE = "none";
 
@@ -36,7 +32,10 @@ export function resolveCodexBindingModelProviderFallback(params: {
 
 export function resolveCodexAppServerThreadModelSelection(params: {
   provider: string;
+  homeScope?: CodexAppServerHomeScope;
   model: string;
+  requestModel?: string;
+  inheritBindingAuthProfile?: boolean;
   binding?: Pick<
     CodexAppServerThreadBinding,
     "threadId" | "authProfileId" | "model" | "modelProvider"
@@ -46,9 +45,13 @@ export function resolveCodexAppServerThreadModelSelection(params: {
   agentDir?: string;
   config?: CodexAppServerAuthProfileLookup["config"];
 }): { model: string; modelProvider?: string } {
-  const authProfileId = params.authProfileId ?? params.binding?.authProfileId;
+  const authProfileId =
+    params.inheritBindingAuthProfile === false
+      ? params.authProfileId
+      : (params.authProfileId ?? params.binding?.authProfileId);
   const explicitModelProvider = resolveCodexAppServerModelProvider({
     provider: params.provider,
+    homeScope: params.homeScope,
     authProfileId,
     authProfileStore: params.authProfileStore,
     agentDir: params.agentDir,
@@ -63,7 +66,8 @@ export function resolveCodexAppServerThreadModelSelection(params: {
       })
     : undefined;
   return resolveCodexAppServerRequestModelSelection({
-    model: params.model,
+    model: params.requestModel ?? params.model,
+    homeScope: params.homeScope,
     modelProvider: explicitModelProvider ?? bindingModelProvider,
     authProfileId,
     authProfileStore: params.authProfileStore,
@@ -74,6 +78,7 @@ export function resolveCodexAppServerThreadModelSelection(params: {
 
 export function resolveCodexAppServerRequestModelSelection(params: {
   model: string;
+  homeScope?: CodexAppServerHomeScope;
   modelProvider?: string | null;
   authProfileId?: string;
   authProfileStore?: CodexAppServerAuthProfileLookup["authProfileStore"];
@@ -94,6 +99,7 @@ export function resolveCodexAppServerRequestModelSelection(params: {
   const inferredProvider = model.slice(0, slashIndex);
   const inferredModelProvider = resolveCodexAppServerModelProvider({
     provider: inferredProvider,
+    homeScope: params.homeScope,
     authProfileId: params.authProfileId,
     authProfileStore: params.authProfileStore,
     agentDir: params.agentDir,
@@ -113,6 +119,7 @@ function hasProviderQualifiedModelRef(model: string | undefined): boolean {
 
 export function resolveCodexAppServerModelProvider(params: {
   provider: string;
+  homeScope?: CodexAppServerHomeScope;
   authProfileId?: string;
   authProfileStore?: CodexAppServerAuthProfileLookup["authProfileStore"];
   agentDir?: string;
@@ -125,25 +132,14 @@ export function resolveCodexAppServerModelProvider(params: {
     // native provider/auth selection instead of forcing the legacy OpenAI path.
     return undefined;
   }
-  if (isCodexAppServerNativeAuthProfile(params) && normalizedLower === "openai") {
-    // When OpenClaw is forwarding ChatGPT/Codex OAuth, `openai` is Codex's
-    // native provider id, not a public OpenAI API-key choice. Omit the override
-    // so app-server keeps its configured provider/auth pair for this session.
+  if (
+    normalizedLower === "openai" &&
+    (params.homeScope === "user" || isCodexAppServerNativeAuthProfile(params))
+  ) {
+    // User-home connections own native auth and provider selection, as do forwarded
+    // ChatGPT profiles. Keep that pair together; account/route checks still run
+    // at the auth boundary before starting a thread.
     return undefined;
   }
   return normalizedLower === "openai" ? "openai" : normalized;
-}
-
-// Provider catalog metadata owns model-specific effort support. Keeping this
-// bridge model-agnostic prevents the picker and native runtime from drifting.
-export function resolveReasoningEffort(
-  thinkLevel: EmbeddedRunAttemptParams["thinkLevel"] | "ultra",
-  modelId: string,
-  supportedReasoningEfforts?: readonly string[],
-): CodexReasoningEffort | null {
-  return resolveCodexAppServerReasoningEffort({
-    thinkLevel,
-    modelId,
-    supportedReasoningEfforts,
-  });
 }

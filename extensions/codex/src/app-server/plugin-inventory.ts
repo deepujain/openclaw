@@ -3,6 +3,7 @@
  * plugin-owned apps can be exposed to a native Codex thread.
  */
 import { embeddedAgentLog } from "openclaw/plugin-sdk/agent-harness-runtime";
+import { findCodexAppById } from "./app-identity.js";
 import type {
   CodexAppInventoryCache,
   CodexAppInventoryCacheRead,
@@ -66,6 +67,8 @@ export type CodexPluginOwnedApp = {
   accessible: boolean;
   enabled: boolean;
   needsAuth: boolean;
+  /** Current non-read-only tool keys; absent when Codex omits tool metadata. */
+  approvalOverrideToolConfigKeys?: readonly string[];
 };
 
 /** Inventory record for one configured Codex plugin policy. */
@@ -95,6 +98,7 @@ type ReadCodexPluginInventoryParams = {
   request: CodexPluginRuntimeRequest;
   appCache?: CodexAppInventoryCache;
   appCacheKey?: string;
+  appInventoryCacheKey?: string;
   configCwd?: string;
   metadataCache?: CodexPluginMetadataCache;
   nowMs?: number;
@@ -247,13 +251,26 @@ export async function readCodexPluginInventory(
         (unavailableByMarketplacePolicy || !summary.installed || !summary.enabled),
       authRequired: apps.some((app) => app.needsAuth || !app.accessible),
       appOwnership,
-      ownedAppIds,
+      ownedAppIds: Array.from(new Set([...ownedAppIds, ...apps.map((app) => app.id)])).toSorted(),
       apps,
     });
   }
 
+  // Saved configuration is a discovery request, not proof of a runtime plugin.
+  const missingKeys = new Set<string>();
+  for (const diagnostic of diagnostics) {
+    if (diagnostic.code === "plugin_missing" || diagnostic.code === "marketplace_missing") {
+      if (diagnostic.plugin) {
+        missingKeys.add(diagnostic.plugin.configKey);
+      }
+      embeddedAgentLog.error(diagnostic.message, { code: diagnostic.code });
+    }
+  }
   const inventory = {
-    policy,
+    policy: {
+      ...policy,
+      pluginPolicies: policy.pluginPolicies.filter((plugin) => !missingKeys.has(plugin.configKey)),
+    },
     records,
     diagnostics,
     ...(appInventory ? { appInventory } : {}),
@@ -426,7 +443,7 @@ function readCachedAppInventory(
   const request: CodexAppInventoryRequest = async (method, requestParams) =>
     (await params.request(method, requestParams)) as CodexAppServerRequestResult<typeof method>;
   return params.appCache.read({
-    key: params.appCacheKey,
+    key: params.appInventoryCacheKey ?? params.appCacheKey,
     request,
     nowMs: params.nowMs,
     suppressRefresh: params.suppressAppInventoryRefresh,
@@ -506,12 +523,11 @@ function resolveOwnedApps(params: {
     });
     return [];
   }
-  const appInfoById = new Map(
-    (params.appInventory?.snapshot?.apps ?? []).map((app) => [app.id, app] as const),
-  );
+  const appInfos = params.appInventory?.snapshot?.apps ?? [];
+  const installedApps = params.appInventory?.snapshot?.installedApps ?? [];
   return detailApps
     .map((app) => {
-      const info = appInfoById.get(app.id);
+      const info = findCodexAppById(appInfos, app.id);
       if (!info) {
         return {
           id: app.id,
@@ -521,17 +537,56 @@ function resolveOwnedApps(params: {
           needsAuth: true,
         };
       }
-      return {
-        id: app.id,
-        name: app.name,
-        accessible: info.isAccessible,
-        enabled: info.isEnabled,
-        // Modern plugin summaries carry no auth bit; account-authorized
-        // app/read metadata is the canonical connector access proof.
-        needsAuth: !info.isAccessible,
-      };
+      return Object.assign(
+        {
+          id: info.id,
+          name: app.name,
+          accessible: true,
+          enabled: findCodexAppById(installedApps, info.id)?.enabled ?? false,
+          // Modern plugin summaries carry no auth bit; account-authorized
+          // app/read metadata is the canonical connector access proof.
+          needsAuth: false,
+        },
+        resolveOwnedAppApprovalOverrideKeys(info),
+      );
     })
     .toSorted((left, right) => left.id.localeCompare(right.id));
+}
+
+/** Returns current tool keys whose overrides could bypass the requested reviewer. */
+export function resolveOwnedAppApprovalOverrideKeys(
+  app: Pick<CodexAppServerRequestResult<"app/read">["apps"][number], "name" | "toolSummaries">,
+): Pick<CodexPluginOwnedApp, "approvalOverrideToolConfigKeys"> {
+  if (!app.toolSummaries) {
+    return {};
+  }
+  const appName = app.name.trim();
+  const appNameLower = appName.toLowerCase();
+  // Agents: app/read includes disabled tools. Keep every non-read-only alias,
+  // including collisions with read-only titles; retired names cannot authorize
+  // a current tool and must not prevent the entire app from being admitted.
+  const keys = app.toolSummaries
+    .filter((tool) => !tool.isReadOnly)
+    .flatMap((tool) => resolveAppToolConfigKeys({ appName, appNameLower, tool }));
+  return { approvalOverrideToolConfigKeys: Array.from(new Set(keys)).toSorted() };
+}
+
+function resolveAppToolConfigKeys(params: {
+  appName: string;
+  appNameLower: string;
+  tool: { name: string; title?: string | null };
+}): string[] {
+  const keys = [params.tool.name];
+  if (params.tool.title) {
+    keys.push(params.tool.title);
+  }
+  if (params.appName) {
+    keys.push(`${params.appName}_${params.tool.name}`);
+  }
+  if (params.appNameLower && params.appNameLower !== params.appName) {
+    keys.push(`${params.appNameLower}_${params.tool.name}`);
+  }
+  return keys;
 }
 
 function findPluginSummary(

@@ -3,10 +3,14 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, expect, test } from "vitest";
-import { WORKER_EXECUTION_CONTEXT_PROTOCOL_FEATURE } from "../../packages/gateway-protocol/src/schema/worker-admission.js";
+import {
+  WORKER_EXECUTION_AUTHORITY_PROTOCOL_FEATURE,
+  WORKER_EXECUTION_CONTEXT_PROTOCOL_FEATURE,
+} from "../../packages/gateway-protocol/src/schema/worker-admission.js";
 import type { WorkerProvider, WorkerSshEndpoint } from "../plugins/types.js";
 import { runCommandWithTimeout, type CommandOptions, type SpawnResult } from "../process/exec.js";
 import {
+  closeOpenClawStateDatabaseAsync,
   closeOpenClawStateDatabaseForTest,
   openOpenClawStateDatabase,
   type OpenClawStateDatabase,
@@ -14,6 +18,7 @@ import {
 import { loadSessionEntry } from "./session-utils.js";
 import { writeSessionStore } from "./test-helpers.js";
 import {
+  bundleMcpRuntimeMocks,
   directSessionReq,
   sessionStoreEntry,
   setupGatewaySessionsHandlerTestHarness,
@@ -33,6 +38,7 @@ import { createWorkerTunnelManager } from "./worker-environments/tunnel.js";
 import { prepareLocalWorkspaceRsyncBoundary } from "./worker-environments/tunnel.test-support.js";
 import { rsyncArgvPort, sshArgvPort } from "./worker-environments/worker-ssh-argv.test-support.js";
 import { createWorkerWorkspaceOperationCoordinator } from "./worker-environments/workspace-operation-coordinator.js";
+import { createWorkerWorkspaceRecoveryFixture } from "./worker-environments/workspace-recovery.test-support.js";
 
 const { createSessionStoreDir } = setupGatewaySessionsHandlerTestHarness();
 const PRIMARY_PORT = 2222;
@@ -45,7 +51,10 @@ const BUNDLE_HASH = "a".repeat(64);
 const RECEIPT = {
   bundleHash: BUNDLE_HASH,
   openclawVersion: "2026.8.1",
-  protocolFeatures: [WORKER_EXECUTION_CONTEXT_PROTOCOL_FEATURE],
+  protocolFeatures: [
+    WORKER_EXECUTION_CONTEXT_PROTOCOL_FEATURE,
+    WORKER_EXECUTION_AUTHORITY_PROTOCOL_FEATURE,
+  ],
 };
 const INSTALLATION: WorkerInstallationArtifact = {
   install: "bundle",
@@ -282,6 +291,7 @@ afterEach(async () => {
   workerService = undefined;
   await tunnelManager?.stopAll();
   tunnelManager = undefined;
+  await closeOpenClawStateDatabaseAsync();
   closeOpenClawStateDatabaseForTest();
   database = undefined;
   if (root) {
@@ -290,7 +300,7 @@ afterEach(async () => {
   }
 });
 
-test("preserves ordered fallback through restart, workspace sync, and safe session retirement", async () => {
+test("preserves ordered fallback through inventory rehydration, workspace sync, and safe session retirement", async () => {
   root = await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()), "openclaw-worker-order-"));
   const stateDir = path.join(root, "state");
   const remoteHome = path.join(root, "remote-home");
@@ -310,6 +320,7 @@ test("preserves ordered fallback through restart, workspace sync, and safe sessi
   const events = runner.events;
   const provider: WorkerProvider = {
     id: "ordered-fallback",
+    resolveAllocation: async () => ({ leaseId: "lease-original-order", sharedHost: false }),
     supportedExecutionModes: ["remote-exec"],
     provision: async () => {
       events.push("provider:provision");
@@ -323,7 +334,7 @@ test("preserves ordered fallback through restart, workspace sync, and safe sessi
   };
 
   database = openOpenClawStateDatabase({ env: { OPENCLAW_STATE_DIR: stateDir } });
-  const environmentStore = createWorkerEnvironmentStore({ database, now: () => 2_000 });
+  const environmentStore = await createWorkerEnvironmentStore({ database, now: () => 2_000 });
   const placements = createWorkerSessionPlacementStore({ database, now: () => 3_000 });
   tunnelManager = createWorkerTunnelManager({ runner });
   const environmentService = createWorkerEnvironmentService({
@@ -349,11 +360,9 @@ test("preserves ordered fallback through restart, workspace sync, and safe sessi
         state: "bootstrapping",
         sshEndpoint: SSH_ENDPOINT,
       });
-      closeOpenClawStateDatabaseForTest();
-      events.push("gateway:reopen");
-      database = openOpenClawStateDatabase({ env: { OPENCLAW_STATE_DIR: stateDir } });
+      events.push("inventory:rehydrate");
       expect(
-        createWorkerEnvironmentStore({ database, now: () => 2_000 }).get(ENVIRONMENT_ID),
+        (await createWorkerEnvironmentStore({ database, now: () => 2_000 })).get(ENVIRONMENT_ID),
       ).toMatchObject({ state: "bootstrapping", sshEndpoint: SSH_ENDPOINT });
       return await bootstrapWorker(
         {
@@ -373,12 +382,10 @@ test("preserves ordered fallback through restart, workspace sync, and safe sessi
     tunnelManager,
     generateWorkerCredential: () => "original-order-credential",
     liveEvents: {
-      apply: () => ({ ok: true, result: { ackedSeq: 1 } }),
-      bindSession: () => true,
+      apply: async () => ({ ok: true, result: { ackedSeq: 1 } }),
       clear: () => {},
       clearEnvironment: () => {},
       rotateCredential: () => true,
-      start: () => {},
     },
     executeInference: async () => ({
       type: "error",
@@ -412,15 +419,17 @@ test("preserves ordered fallback through restart, workspace sync, and safe sessi
     runnerAvailability: { read: () => undefined, version: () => 0 },
     workspaceOperations: createWorkerWorkspaceOperationCoordinator(),
     runLocalBarrier: async ({ startDispatch }) => startDispatch(),
-    runRecoveryBarrier: async ({ run }) => await run(localWorkspace),
+    runRecoveryBarrier: async ({ run }) => await run({ kind: "local", path: localWorkspace }),
     runActivationBarrier: async ({ activate }) => activate(),
     runMoveBarrier: async ({ begin }) => begin(),
     resolveMoveDestination: async () => undefined,
-    runReclaimBarrier: async ({ begin, reclaim }) => await reclaim(localWorkspace, begin()),
+    runReclaimPreparation: async ({ run, authorize }) => await run(authorize),
+    runReclaimBarrier: async ({ begin, reclaim }) =>
+      await reclaim({ kind: "local", path: localWorkspace }, begin()),
     runFailedReclaimBarrier: async ({ reclaim }) => await reclaim(),
-    resolveWorkspacePath: async () => localWorkspace,
-    reportWorkspaceResultConflict: async () => {},
-    resolveWorkspaceResultConflict: async () => undefined,
+    ...createWorkerWorkspaceRecoveryFixture({
+      resolveWorkspace: async () => ({ kind: "local", path: localWorkspace }),
+    }),
   });
 
   const active = await dispatch.dispatch({
@@ -446,6 +455,13 @@ test("preserves ordered fallback through restart, workspace sync, and safe sessi
 
   await createSessionStoreDir();
   await writeSessionStore({ entries: { [SESSION_KEY]: sessionStoreEntry(SESSION_ID) } });
+  bundleMcpRuntimeMocks.retireSessionMcpRuntime.mockImplementationOnce(async ({ sessionId }) => {
+    expect(sessionId).toBe(SESSION_ID);
+    expect(loadSessionEntry(SESSION_KEY).entry?.sessionId).toBe(SESSION_ID);
+    expect(placements.get(SESSION_ID)?.state).toBe("reclaimed");
+    events.push("session:cleanup");
+    return true;
+  });
   const deleted = await directSessionReq(
     "sessions.delete",
     { key: SESSION_KEY },
@@ -456,7 +472,8 @@ test("preserves ordered fallback through restart, workspace sync, and safe sessi
           retireSessionPlacement: (
             retirement: Parameters<typeof placements.retireSessionPlacement>[0],
           ) => {
-            expect(loadSessionEntry(SESSION_KEY).entry?.sessionId).toBe(SESSION_ID);
+            expect(loadSessionEntry(SESSION_KEY).entry).toBeUndefined();
+            expect(placements.get(SESSION_ID)?.state).toBe("reclaimed");
             events.push("placement:retire");
             placements.retireSessionPlacement(retirement);
           },
@@ -471,7 +488,7 @@ test("preserves ordered fallback through restart, workspace sync, and safe sessi
   expect(loadSessionEntry(SESSION_KEY).entry).toBeUndefined();
   expectOrdered(events, [
     "provider:provision",
-    "gateway:reopen",
+    "inventory:rehydrate",
     `bootstrap:preflight:${PRIMARY_PORT}`,
     `bootstrap:preflight:${FALLBACK_PORT}`,
     `bootstrap:transfer:${FALLBACK_PORT}`,
@@ -483,6 +500,7 @@ test("preserves ordered fallback through restart, workspace sync, and safe sessi
     "workspace:renew-quiescence",
     "provider:destroy",
     "placement:reclaimed",
+    "session:cleanup",
     "placement:retire",
     "session:deleted",
   ]);

@@ -36,7 +36,11 @@ import {
 import { rememberRecentOutboundMessage } from "./dedupe.js";
 import type { WhatsAppReadReceiptTarget } from "./durable-receive.js";
 import { extractText } from "./extract.js";
-import { attachEmitterListener, closeInboundMonitorSocket } from "./lifecycle.js";
+import {
+  attachEmitterListener,
+  closeInboundMonitorSocket,
+  type WhatsAppSocketListen,
+} from "./lifecycle.js";
 import { DisconnectReason } from "./runtime-api.js";
 import type { WebListenerCloseReason } from "./types.js";
 
@@ -199,11 +203,8 @@ export async function createWhatsAppAttachedSocketSession(options: SocketSession
     );
   };
 
-  const rememberOutboundMessage = (remoteJid: string, result: unknown) => {
-    const messageId =
-      typeof result === "object" && result && "key" in result
-        ? ((result as { key?: { id?: string } }).key?.id ?? "")
-        : "";
+  const rememberOutboundMessage = (remoteJid: string, result: WAMessage | undefined) => {
+    const messageId = result?.key?.id;
     if (!messageId) {
       return;
     }
@@ -212,10 +213,7 @@ export async function createWhatsAppAttachedSocketSession(options: SocketSession
       remoteJid,
       messageId,
     });
-    const message =
-      typeof result === "object" && result && "message" in result
-        ? (result as { message?: proto.IMessage }).message
-        : undefined;
+    const message = result?.message;
     rememberBaileysMessage(remoteJid, messageId, message);
     // Baileys derives the participant for fromMe quotes from its own userJid.
     // Retain only the facts needed to avoid the cache-miss fromMe=false fallback.
@@ -388,7 +386,7 @@ export async function createWhatsAppAttachedSocketSession(options: SocketSession
   };
 
   const socketOperations: WhatsAppSocketOperationAdapter = {
-    sendMessage: (jid, content, sendOptions) => sendTrackedMessage(jid, content, sendOptions),
+    sendMessage: sendTrackedMessage,
     sendPresenceUpdate: async (presenceLocal, jid) => {
       const currentSock = getCurrentSock();
       if (!currentSock) {
@@ -410,16 +408,8 @@ export async function createWhatsAppAttachedSocketSession(options: SocketSession
     );
   };
 
-  const attachSockListener = (event: string, listener: (...args: unknown[]) => void) =>
-    attachEmitterListener(
-      sock.ev as unknown as {
-        on: (event: string, listener: (...args: unknown[]) => void) => void;
-        off?: (event: string, listener: (...args: unknown[]) => void) => void;
-        removeListener?: (event: string, listener: (...args: unknown[]) => void) => void;
-      },
-      event,
-      listener,
-    );
+  const attachSockListener: WhatsAppSocketListen = (event, listener) =>
+    attachEmitterListener(sock.ev, event, listener);
 
   const handleConnectionUpdate = (update: Partial<ConnectionState>) => {
     try {
@@ -445,10 +435,7 @@ export async function createWhatsAppAttachedSocketSession(options: SocketSession
 
   let detachConnectionUpdate: (() => void) | undefined;
   const start = () => {
-    detachConnectionUpdate ??= attachSockListener(
-      "connection.update",
-      handleConnectionUpdate as unknown as (...args: unknown[]) => void,
-    );
+    detachConnectionUpdate ??= attachSockListener("connection.update", handleConnectionUpdate);
   };
   const stop = () => {
     detachConnectionUpdate?.();

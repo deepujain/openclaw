@@ -3,10 +3,13 @@ import fsSync from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
+import { sameFileIdentity } from "@openclaw/fs-safe/advanced";
 import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
 import { valid as validSemver } from "semver";
 import { BUNDLED_RUNTIME_SIDECAR_PATHS } from "../plugins/runtime-sidecar-paths.js";
 import { pathExists } from "../utils.js";
+import { resolveBunGlobalInstallOwner } from "./detect-package-manager.js";
 import {
   applyNpmFreshnessBypassEnv,
   applyPosixNpmScriptShellEnv,
@@ -17,32 +20,34 @@ import {
   PACKAGE_DIST_INVENTORY_RELATIVE_PATH,
   readPackageDistInventoryIfPresent,
 } from "./package-dist-inventory.js";
-import { readPackageVersion } from "./package-json.js";
+import { readPackageName, readPackageVersion } from "./package-json.js";
 import { applyPathPrepend } from "./path-prepend.js";
 import { parseSemver } from "./runtime-guard.js";
+import {
+  createFreeBsdPkgOwnershipInspection,
+  FreeBsdPkgOwnershipError,
+  PKG_INSPECTION_TIMEOUT_MS,
+  type FreeBsdPkgOwnershipInspection,
+} from "./update-freebsd-pkg-ownership.js";
+import { collectGitRuntimeErrors, type GitRuntimeIdentity } from "./update-git-runtime.js";
+import type { CommandRunner } from "./update-global-command-runner.js";
+import { resolvePnpmGlobalDirFromGlobalRoot } from "./update-native-package-owner.js";
+import {
+  inspectNpmLauncher,
+  probeNpmGlobalPrefix,
+  readPackageManagerProbeValue,
+  resolveNpmGlobalPrefixLayoutFromGlobalRoot,
+} from "./update-npm-prefix.js";
+import type { UpdateRecovery } from "./update-recovery.js";
 
 /** Supported package managers for OpenClaw global install and update flows. */
 export type GlobalInstallManager = "npm" | "pnpm" | "bun";
-
-/** Runs package-manager commands with timeout and environment control. */
-export type CommandRunner = (
-  argv: string[],
-  options: { timeoutMs: number; cwd?: string; env?: NodeJS.ProcessEnv },
-) => Promise<{
-  stdout: string;
-  stderr: string;
-  code: number | null;
-  signal?: NodeJS.Signals | null;
-  killed?: boolean;
-  termination?: "exit" | "timeout" | "no-output-timeout" | "signal";
-}>;
 
 type ResolvedGlobalInstallCommand = {
   manager: GlobalInstallManager;
   command: string;
   pnpmIsolated?: {
     layoutVersion: number;
-    globalBinDir?: string;
   };
 };
 
@@ -62,7 +67,6 @@ export type ResolvedGlobalInstallTarget = ResolvedGlobalInstallCommand & {
 };
 
 const PRIMARY_PACKAGE_NAME = "openclaw";
-const ALL_PACKAGE_NAMES = [PRIMARY_PACKAGE_NAME] as const;
 const GLOBAL_RENAME_PREFIX = ".";
 /** npm-compatible spec used when the user asks to install the moving main branch. */
 const OPENCLAW_MAIN_PACKAGE_SPEC = "github:openclaw/openclaw#main";
@@ -76,19 +80,10 @@ const OMITTED_PRIVATE_QA_BUNDLED_PLUGIN_ROOTS = new Set([
   "dist/extensions/qa-lab",
 ]);
 
-/** npm prefix layout paths needed to install, stage, and expose global bins. */
-export type NpmGlobalPrefixLayout = {
-  prefix: string;
-  globalRoot: string;
-  binDir: string;
-};
-
-type NpmLifecyclePolicy = "unflagged" | "allow-scripts";
-
-type SupportedNpmLifecyclePolicy = NpmLifecyclePolicy;
+type NpmLifecyclePolicy = "unflagged" | "allow-scripts-advisory" | "allow-scripts";
 
 type NpmLifecyclePolicyGate =
-  | { policy: SupportedNpmLifecyclePolicy | null; error: null }
+  | { policy: NpmLifecyclePolicy | null; error: null }
   | { policy: null; error: string };
 
 /** Selects npm's lifecycle policy from the version of the owning executable. */
@@ -97,9 +92,11 @@ function resolveNpmLifecyclePolicy(version: string): NpmLifecyclePolicy | null {
   if (!parsed) {
     return null;
   }
-  return parsed.major >= 12 || (parsed.major === 11 && parsed.minor >= 16)
+  return parsed.major >= 12
     ? "allow-scripts"
-    : "unflagged";
+    : parsed.major === 11 && parsed.minor >= 16
+      ? "allow-scripts-advisory"
+      : "unflagged";
 }
 
 /** Resolves the owning npm policy once, before any update mutation. */
@@ -110,7 +107,7 @@ export function resolveNpmLifecyclePolicyGate(
     return { policy: null, error: null };
   }
   const policy = installTarget.npmOwner?.lifecyclePolicy ?? null;
-  if (policy === "unflagged" || policy === "allow-scripts") {
+  if (policy === "unflagged" || policy === "allow-scripts-advisory" || policy === "allow-scripts") {
     return { policy, error: null };
   }
   return {
@@ -139,22 +136,6 @@ async function resolveNpmOwner(params: {
   };
 }
 
-function normalizePackageTarget(value: string): string {
-  return value.trim();
-}
-
-/** Reads the command value after package-manager warnings printed on stdout. */
-export function readPackageManagerProbeValue(stdout: string): string {
-  const lines = stdout.split(/\r?\n/u);
-  for (let index = lines.length - 1; index >= 0; index -= 1) {
-    const value = lines[index]?.trim();
-    if (value) {
-      return value;
-    }
-  }
-  return "";
-}
-
 function normalizePackageVersionForComparison(value: string | null | undefined): string | null {
   const trimmed = value?.trim();
   if (!trimmed) {
@@ -165,7 +146,7 @@ function normalizePackageVersionForComparison(value: string | null | undefined):
 
 /** Returns true when a user target requests the moving main-branch package spec. */
 function isMainPackageTarget(value: string): boolean {
-  return normalizeLowercaseStringOrEmpty(normalizePackageTarget(value)) === "main";
+  return normalizeLowercaseStringOrEmpty(value) === "main";
 }
 
 /**
@@ -173,7 +154,7 @@ function isMainPackageTarget(value: string): boolean {
  * rather than being treated as registry dist-tags.
  */
 function isExplicitPackageInstallSpec(value: string): boolean {
-  const trimmed = normalizePackageTarget(value);
+  const trimmed = value.trim();
   if (!trimmed) {
     return false;
   }
@@ -189,8 +170,12 @@ function isRelativePackageInstallPath(value: string): boolean {
   return /^(?:\.{1,2})(?:[\\/]|$)/u.test(value);
 }
 
-function resolveNpmInstallScriptsAllowFlag(spec: string, installCwd?: string | null): string {
-  const normalized = normalizePackageTarget(spec);
+function resolveNpmInstallScriptsAllowFlag(
+  spec: string,
+  installCwd: string | null | undefined,
+  policy: NpmLifecyclePolicy,
+): string {
+  const normalized = spec.trim();
   const unaliased = stripPrimaryPackageAlias(normalized);
   let identity =
     isExplicitPackageInstallSpec(normalized) ||
@@ -200,10 +185,42 @@ function resolveNpmInstallScriptsAllowFlag(spec: string, installCwd?: string | n
     path.isAbsolute(unaliased)
       ? unaliased
       : PRIMARY_PACKAGE_NAME;
-  identity = resolveNpmAliasPackageName(identity) ?? identity;
-  if (installCwd && path.isAbsolute(identity)) {
-    // npm resolves relative allow-scripts identities against its cwd. Relativize
-    // first so commas in ancestor directories do not split the policy value.
+  const alias = resolveNpmAliasPackageName(identity);
+  identity = alias ?? identity;
+  const filePrefix = /^file:/iu.test(identity) ? "file:" : "";
+  const archivePath = identity.slice(filePrefix.length);
+  const gitShorthand =
+    !/^~[\\/]/u.test(identity) && /^[^./@\s:#][^/\s:@#]*\/[^/\s:@#]+(?:#[\s\S]*)?$/u.test(identity);
+  const localArchive =
+    !alias &&
+    !gitShorthand &&
+    /\.(?:tgz|tar\.gz|tar)$/iu.test(archivePath) &&
+    (filePrefix || path.isAbsolute(archivePath) || !/^[a-z][a-z0-9+.-]*:/iu.test(archivePath));
+  let absoluteArchive = "";
+  if (localArchive) {
+    const npmPath = process.platform === "win32" ? archivePath.replaceAll("\\", "/") : archivePath;
+    // Escape raw paths before URL normalization so literal %, #, and ? retain their identity.
+    let fileUrl = `file:${encodeURI(npmPath).replace(/[?#]/gu, encodeURIComponent)}`;
+    fileUrl = fileUrl
+      .replace(/^file:\/\/(?=[^/])/u, "file:/")
+      .replace(/^file:\/{1,3}(?=\.\.?(?:\/|$))/u, "file:");
+    const specPath = decodeURIComponent(new URL(fileUrl).pathname);
+    let resolvedPath = decodeURIComponent(
+      new URL(fileUrl, `${pathToFileURL(path.resolve(installCwd || process.cwd())).href}/`)
+        .pathname,
+    );
+    if (process.platform === "win32") {
+      resolvedPath = resolvedPath.replace(/^\/+([a-z]:\/)/iu, "$1");
+    }
+    absoluteArchive = /^\/~(?:\/|$)/u.test(specPath)
+      ? path.resolve(os.homedir(), specPath.slice(3))
+      : path.resolve(installCwd || process.cwd(), resolvedPath);
+  }
+  // Tarballs match the absolute npm resolved identity; directory links accept relative paths.
+  // Keep the npm 11 comma-path identity: its advisory/strict decision stays npm-owned.
+  if (absoluteArchive && (policy !== "allow-scripts-advisory" || !absoluteArchive.includes(","))) {
+    identity = `${filePrefix}${absoluteArchive}`;
+  } else if (installCwd && path.isAbsolute(identity)) {
     const relativeIdentity = path.relative(installCwd, identity) || ".";
     identity =
       path.isAbsolute(relativeIdentity) ||
@@ -215,7 +232,7 @@ function resolveNpmInstallScriptsAllowFlag(spec: string, installCwd?: string | n
   }
   if (identity.includes(",")) {
     throw new Error(
-      "npm cannot allow lifecycle scripts for an install target containing a comma; rename the package or source path",
+      "npm cannot allow lifecycle scripts for this install target; use a package URL or local path without commas",
     );
   }
   return `--allow-scripts=${identity || PRIMARY_PACKAGE_NAME}`;
@@ -240,7 +257,7 @@ function resolveNpmAliasPackageName(spec: string): string | null {
 }
 
 function stripPrimaryPackageAlias(spec: string): string {
-  const normalized = normalizePackageTarget(spec);
+  const normalized = spec.trim();
   const prefix = `${PRIMARY_PACKAGE_NAME}@`;
   return normalized.toLowerCase().startsWith(prefix)
     ? normalized.slice(prefix.length).trim()
@@ -257,7 +274,7 @@ export function resolveExpectedInstalledVersionFromSpec(
   spec: string,
 ): string | null {
   const normalizedPackageName = packageName.trim();
-  const normalizedSpec = normalizePackageTarget(spec);
+  const normalizedSpec = spec.trim();
   if (!normalizedPackageName || !normalizedSpec.startsWith(`${normalizedPackageName}@`)) {
     return null;
   }
@@ -268,15 +285,30 @@ export function resolveExpectedInstalledVersionFromSpec(
 }
 
 /**
- * Verifies that a global package root looks like a packaged OpenClaw install
- * and, when supplied, matches the expected concrete version.
+ * Verifies packaged installs, or the exact checkout built by a Git update.
+ * An explicit package spec alone never authorizes a source checkout.
  */
 export async function collectInstalledGlobalPackageErrors(params: {
   packageRoot: string;
   expectedVersion?: string | null;
+  expectedGitCheckout?: GitRuntimeIdentity;
 }): Promise<string[]> {
   const errors: string[] = [];
-  errors.push(...(await collectSourceCheckoutInstallErrors(params.packageRoot)));
+  if (params.expectedGitCheckout) {
+    const installedRoot = await fs.realpath(params.packageRoot).catch(() => null);
+    if (installedRoot !== params.expectedGitCheckout.root) {
+      errors.push(
+        `expected checkout ${params.expectedGitCheckout.root}, found ${installedRoot ?? "<missing>"}`,
+      );
+    } else {
+      errors.push(...(await collectGitRuntimeErrors(params.expectedGitCheckout)));
+      if (!(await pathExists(path.join(installedRoot, "openclaw.mjs")))) {
+        errors.push(`missing ${path.join(installedRoot, "openclaw.mjs")}`);
+      }
+    }
+  } else {
+    errors.push(...(await collectSourceCheckoutInstallErrors(params.packageRoot)));
+  }
   const installedVersion = await readPackageVersion(params.packageRoot);
   const expectedComparable = normalizePackageVersionForComparison(params.expectedVersion);
   const installedComparable = normalizePackageVersionForComparison(installedVersion);
@@ -285,14 +317,37 @@ export async function collectInstalledGlobalPackageErrors(params: {
       `expected installed version ${expectedComparable}, found ${installedComparable ?? "<missing>"}`,
     );
   }
-  errors.push(
-    ...(await collectInstalledPackageDistErrors({
-      packageRoot: params.packageRoot,
-      installedVersion,
-      expectedVersion: params.expectedVersion,
-    })),
-  );
+  if (!params.expectedGitCheckout) {
+    errors.push(
+      ...(await collectInstalledPackageDistErrors({
+        packageRoot: params.packageRoot,
+        installedVersion,
+        expectedVersion: params.expectedVersion,
+      })),
+    );
+  }
   return errors;
+}
+
+// Call only before potentially state-mutating work. Package file validity
+// cannot undo lifecycle state changes or a rejected Doctor result.
+export async function verifyPackageUpdateRecovery(
+  root: string | null | undefined,
+): Promise<UpdateRecovery> {
+  const version = root ? await readPackageVersion(root).catch(() => null) : null;
+  if (
+    root &&
+    version &&
+    (
+      await collectInstalledGlobalPackageErrors({
+        packageRoot: root,
+        expectedVersion: version,
+      }).catch(() => ["verification failed"])
+    ).length === 0
+  ) {
+    return { serviceRestartSafe: true, version };
+  }
+  return { serviceRestartSafe: false, reason: "runtime-verification-failed" };
 }
 
 async function collectSourceCheckoutInstallErrors(packageRoot: string): Promise<string[]> {
@@ -364,7 +419,7 @@ async function collectInstalledPackageDistErrors(params: {
 
   const criticalErrors = await collectInstalledPathErrors({
     packageRoot: params.packageRoot,
-    expectedFiles: await collectLegacyInstalledPackageDistPaths(params.packageRoot),
+    expectedFiles: criticalPaths,
     actualFiles: null,
     missingMessage: (relativePath) => `missing bundled runtime sidecar ${relativePath}`,
   });
@@ -381,10 +436,6 @@ async function collectInstalledPackageDistErrors(params: {
     ];
   }
   return criticalErrors;
-}
-
-async function collectLegacyInstalledPackageDistPaths(packageRoot: string): Promise<string[]> {
-  return await collectCriticalInstalledPackageDistPaths(packageRoot);
 }
 
 async function collectCriticalInstalledPackageDistPaths(packageRoot: string): Promise<string[]> {
@@ -448,11 +499,25 @@ async function collectInstalledPathErrors(params: {
  * Explicit tarball, URL, git, and main-branch specs bypass registry lookup.
  */
 export function canResolveRegistryVersionForPackageTarget(value: string): boolean {
-  const trimmed = normalizePackageTarget(value);
+  const trimmed = stripPrimaryPackageAlias(value);
   if (!trimmed) {
     return true;
   }
   return !isMainPackageTarget(trimmed) && !isExplicitPackageInstallSpec(trimmed);
+}
+
+/** Same-version registry targets are no-ops; explicit artifacts still require validation/install. */
+export function isPackageTargetAlreadyCurrent(params: {
+  currentVersion: string | null;
+  targetVersion: string | null;
+  target: string;
+}): boolean {
+  return (
+    params.currentVersion !== null &&
+    params.targetVersion !== null &&
+    params.currentVersion === params.targetVersion &&
+    canResolveRegistryVersionForPackageTarget(params.target)
+  );
 }
 
 async function resolvePortableGitPathPrepend(): Promise<string[]> {
@@ -510,7 +575,7 @@ export function resolveGlobalInstallSpec(params: {
   if (override) {
     return override;
   }
-  const target = normalizePackageTarget(params.tag);
+  const target = params.tag.trim();
   if (isMainPackageTarget(target)) {
     return OPENCLAW_MAIN_PACKAGE_SPEC;
   }
@@ -552,88 +617,17 @@ async function tryRealpath(targetPath: string): Promise<string> {
 }
 
 function resolveBunGlobalRoot(): string {
-  const bunInstall = process.env.BUN_INSTALL?.trim() || path.join(os.homedir(), ".bun");
-  return path.join(bunInstall, "install", "global", "node_modules");
+  return (
+    resolveBunGlobalInstallOwner()?.globalRoot ??
+    path.join(os.homedir(), ".bun", "install", "global", "node_modules")
+  );
 }
 
 function inferNpmPrefixFromPackageRoot(pkgRoot?: string | null): string | null {
-  const nodeModulesDir = inferGlobalRootFromPackageRoot(pkgRoot);
-  if (!nodeModulesDir) {
-    return null;
-  }
-  const parentDir = path.dirname(nodeModulesDir);
-  if (path.basename(parentDir) === "lib") {
-    return path.dirname(parentDir);
-  }
-  if (
-    process.platform === "win32" &&
-    normalizeLowercaseStringOrEmpty(path.basename(parentDir)) === "npm"
-  ) {
-    return parentDir;
-  }
-  return null;
-}
-
-/**
- * Infers npm prefix, package root, and bin paths from an npm global root.
- * Direct `node_modules` roots are accepted only when the caller opts into them.
- */
-export function resolveNpmGlobalPrefixLayoutFromGlobalRoot(
-  globalRoot?: string | null,
-  options: { allowDirectNodeModulesRoot?: boolean } = {},
-): NpmGlobalPrefixLayout | null {
-  const trimmed = globalRoot?.trim();
-  if (!trimmed) {
-    return null;
-  }
-  const normalized = path.resolve(trimmed);
-  if (path.basename(normalized) !== "node_modules") {
-    return null;
-  }
-  const parentDir = path.dirname(normalized);
-  if (path.basename(parentDir) === "lib") {
-    const prefix = path.dirname(parentDir);
-    return {
-      prefix,
-      globalRoot: normalized,
-      binDir: path.join(prefix, "bin"),
-    };
-  }
-  if (process.platform === "win32") {
-    return {
-      prefix: parentDir,
-      globalRoot: normalized,
-      binDir: parentDir,
-    };
-  }
-  if (options.allowDirectNodeModulesRoot) {
-    return {
-      prefix: parentDir,
-      globalRoot: normalized,
-      binDir: path.join(normalized, ".bin"),
-    };
-  }
-  return null;
-}
-
-/**
- * Derives npm's global package and bin directories from a prefix root.
- * Used for staged installs where OpenClaw creates the prefix itself.
- */
-export function resolveNpmGlobalPrefixLayoutFromPrefix(prefix: string): NpmGlobalPrefixLayout {
-  const resolvedPrefix = path.resolve(prefix);
-  if (process.platform === "win32") {
-    return {
-      prefix: resolvedPrefix,
-      globalRoot: path.join(resolvedPrefix, "node_modules"),
-      binDir: resolvedPrefix,
-    };
-  }
-  return {
-    prefix: resolvedPrefix,
-    globalRoot: path.join(resolvedPrefix, "lib", "node_modules"),
-    binDir: path.join(resolvedPrefix, "bin"),
-  };
+  return (
+    resolveNpmGlobalPrefixLayoutFromGlobalRoot(inferGlobalRootFromPackageRoot(pkgRoot))?.prefix ??
+    null
+  );
 }
 
 function splitNormalizedPathParts(value: string): string[] {
@@ -739,13 +733,7 @@ function isDirectNpmNodeModulesRoot(globalRoot: string | null): boolean {
 }
 
 function inferBunGlobalRootFromPackageRoot(pkgRoot?: string | null): string | null {
-  const directGlobalRoot = inferGlobalRootFromPackageRoot(pkgRoot);
-  if (!directGlobalRoot) {
-    return null;
-  }
-  return path.resolve(directGlobalRoot) === path.resolve(resolveBunGlobalRoot())
-    ? directGlobalRoot
-    : null;
+  return pkgRoot ? (resolveBunGlobalInstallOwner(pkgRoot)?.globalRoot ?? null) : null;
 }
 
 function inferPnpmGlobalRootFromPackageRoot(pkgRoot?: string | null): string | null {
@@ -932,27 +920,6 @@ async function isPnpmIsolatedGlobalPackageRoot(pkgRoot?: string | null): Promise
   return Boolean(await resolvePnpmIsolatedGlobalPackage({ globalRoot, pkgRoot }));
 }
 
-/**
- * Resolves pnpm's global-dir from its active global package root.
- * pnpm 10 used `<globalDir>/<version>/node_modules`; pnpm 11 uses
- * `<globalDir>/v<version>` with isolated package projects below it.
- */
-export function resolvePnpmGlobalDirFromGlobalRoot(globalRoot?: string | null): string | null {
-  const trimmed = globalRoot?.trim();
-  if (!trimmed) {
-    return null;
-  }
-  const normalized = path.resolve(trimmed);
-  if (/^v\d+$/u.test(path.basename(normalized))) {
-    return path.dirname(normalized);
-  }
-  if (path.basename(normalized) !== "node_modules") {
-    return null;
-  }
-  const layoutDir = path.dirname(normalized);
-  return /^\d+$/u.test(path.basename(layoutDir)) ? path.dirname(layoutDir) : null;
-}
-
 async function isPnpmGlobalPackageRoot(pkgRoot?: string | null): Promise<boolean> {
   if (await isPnpmIsolatedGlobalPackageRoot(pkgRoot)) {
     return true;
@@ -972,6 +939,36 @@ async function isPnpmGlobalPackageRoot(pkgRoot?: string | null): Promise<boolean
     (await pathExists(path.join(layoutDir, "pnpm-lock.yaml"))) ||
     (await pathExists(path.join(layoutDir, "package.json")))
   );
+}
+
+/** Resolves an installed pnpm project's identity and its active OpenClaw package link. */
+export async function resolvePnpmGlobalInstallOwner(
+  pkgRoot: string,
+): Promise<{ ownerRoot: string; packageRoot: string } | null> {
+  const globalRoot = inferPnpmGlobalRootFromPackageRoot(pkgRoot);
+  if (!globalRoot || (await readPackageName(pkgRoot)) !== PRIMARY_PACKAGE_NAME) {
+    return null;
+  }
+  let ownerRoot: string | null;
+  let packageRoot: string;
+  if (inferPnpmIsolatedGlobalRootFromPackageRoot(pkgRoot)) {
+    const active = await resolvePnpmIsolatedGlobalPackage({ globalRoot, pkgRoot });
+    if (!active) {
+      return null;
+    }
+    ownerRoot = await resolvePnpmIsolatedInstallOwner(active.packageRoot);
+    packageRoot = active.packageRoot;
+  } else {
+    if (!(await isPnpmGlobalPackageRoot(pkgRoot))) {
+      return null;
+    }
+    ownerRoot = await fs.realpath(path.dirname(globalRoot)).catch(() => null);
+    packageRoot = resolvePackageRootFromGlobalRoot({ globalRoot });
+  }
+  if (!ownerRoot || (await readPackageName(packageRoot)) !== PRIMARY_PACKAGE_NAME) {
+    return null;
+  }
+  return { ownerRoot, packageRoot };
 }
 
 function resolvePreferredGlobalManagerCommand(
@@ -1008,7 +1005,7 @@ function normalizeGlobalInstallCommand(
 }
 
 function resolveBunGlobalInstallSpec(spec: string): string {
-  const trimmed = normalizePackageTarget(spec);
+  const trimmed = spec.trim();
   if (normalizeLowercaseStringOrEmpty(trimmed).startsWith(`${PRIMARY_PACKAGE_NAME}@`)) {
     return trimmed;
   }
@@ -1043,7 +1040,7 @@ async function resolveGlobalRoot(
 ): Promise<string | null> {
   const resolved = normalizeGlobalInstallCommand(managerOrCommand, pkgRoot);
   if (resolved.manager === "bun") {
-    return resolveBunGlobalRoot();
+    return inferBunGlobalRootFromPackageRoot(pkgRoot) ?? resolveBunGlobalRoot();
   }
   const argv = [resolved.command, "root", "-g"];
   const res = await runCommand(argv, { timeoutMs }).catch(() => null);
@@ -1065,7 +1062,10 @@ export async function resolveGlobalInstallTarget(params: {
   pkgRoot?: string | null;
   honorPackageRoot?: boolean;
   packageName?: string;
+  pkgOwnership?: FreeBsdPkgOwnershipInspection;
 }): Promise<ResolvedGlobalInstallTarget> {
+  const pkgOwnership = params.pkgOwnership ?? createFreeBsdPkgOwnershipInspection(params.timeoutMs);
+  await pkgOwnership.assertUnowned(params.pkgRoot);
   const requestedCommand = normalizeGlobalInstallCommand(params.manager, params.pkgRoot);
   const requestedPnpmGlobalRoot =
     requestedCommand.manager === "pnpm"
@@ -1077,17 +1077,11 @@ export async function resolveGlobalInstallTarget(params: {
         )
       : null;
   const inferredPnpmIsolatedGlobalRoot = inferPnpmIsolatedGlobalRootFromPackageRoot(params.pkgRoot);
-  const pnpmIsolatedPackage = inferredPnpmIsolatedGlobalRoot
-    ? await resolvePnpmIsolatedGlobalPackage({
-        globalRoot: inferredPnpmIsolatedGlobalRoot,
-        packageName: params.packageName,
-        pkgRoot: params.pkgRoot,
-      })
-    : await resolvePnpmIsolatedGlobalPackage({
-        globalRoot: requestedPnpmGlobalRoot,
-        packageName: params.packageName,
-        pkgRoot: params.pkgRoot,
-      });
+  const pnpmIsolatedPackage = await resolvePnpmIsolatedGlobalPackage({
+    globalRoot: inferredPnpmIsolatedGlobalRoot || requestedPnpmGlobalRoot,
+    packageName: params.packageName,
+    pkgRoot: params.pkgRoot,
+  });
   const hasPnpmIsolatedMetadata = pnpmIsolatedPackage
     ? true
     : await hasPnpmIsolatedProjectMetadata(params.pkgRoot, params.packageName);
@@ -1115,12 +1109,6 @@ export async function resolveGlobalInstallTarget(params: {
       : honoredDirectNpmRoot
         ? resolveInstallCommandForManager(params.manager, "npm", params.pkgRoot)
         : normalizeGlobalInstallCommand(params.manager, params.pkgRoot);
-  const globalRoot =
-    requestedCommand.manager === "pnpm" &&
-    command.manager === requestedCommand.manager &&
-    command.command === requestedCommand.command
-      ? requestedPnpmGlobalRoot
-      : await resolveGlobalRoot(command, params.runCommand, params.timeoutMs, params.pkgRoot);
   const pkgRootGlobalRoot = command.manager === "pnpm" ? pnpmPackageRootGlobalRoot : null;
   // The detected npm owner applies to the running package, so its prefix is
   // authoritative. PATH's npm may belong to another Node installation and
@@ -1135,7 +1123,11 @@ export async function resolveGlobalInstallTarget(params: {
     pkgRootGlobalRoot ??
     (command.manager === "npm" ? honoredPackageRootGlobalRoot : null) ??
     npmPackageRootGlobalRoot ??
-    globalRoot;
+    (requestedCommand.manager === "pnpm" &&
+    command.manager === requestedCommand.manager &&
+    command.command === requestedCommand.command
+      ? requestedPnpmGlobalRoot
+      : await resolveGlobalRoot(command, params.runCommand, params.timeoutMs, params.pkgRoot));
   const pnpmIsolatedLayoutVersion =
     pnpmIsolatedPackage?.layoutVersion ??
     resolvePnpmIsolatedLayoutVersion(verifiedPnpmIsolatedGlobalRoot);
@@ -1150,6 +1142,12 @@ export async function resolveGlobalInstallTarget(params: {
       ? (pnpmIsolatedPackage?.packageRoot ??
         (verifiedPnpmIsolatedGlobalRoot && params.pkgRoot ? params.pkgRoot : fallbackPackageRoot))
       : fallbackPackageRoot;
+  if (process.platform === "freebsd" && !packageRoot) {
+    throw new FreeBsdPkgOwnershipError("pkg-ownership-unavailable", "paths");
+  }
+  // Manager discovery can outlive the planning snapshot. The selected
+  // destination starts a fresh inspection before its runtime is selected.
+  await createFreeBsdPkgOwnershipInspection(params.timeoutMs).assertUnowned(packageRoot);
   const npmOwner =
     command.manager === "npm"
       ? await resolveNpmOwner({
@@ -1180,16 +1178,59 @@ export async function resolveGlobalInstallTarget(params: {
   };
 }
 
-/**
- * Identifies which global package manager owns an existing package root.
- * Command probes are checked first, then pnpm/bun layout fingerprints.
- */
+async function inspectNpmGlobalOwner(
+  runCommand: CommandRunner,
+  pkgRoot: string,
+  timeoutMs: number,
+  diagnostics: string[],
+): Promise<boolean> {
+  const layout = resolveNpmGlobalPrefixLayoutFromGlobalRoot(
+    inferGlobalRootFromPackageRoot(pkgRoot),
+  );
+  if (!layout) {
+    diagnostics.push("npm install layout: no global prefix");
+    return false;
+  }
+  const selected = await probeNpmGlobalPrefix(
+    runCommand,
+    timeoutMs,
+    resolvePreferredGlobalManagerCommand("npm", pkgRoot),
+    diagnostics,
+  );
+  const pkgReal = await tryRealpath(pkgRoot);
+  if (
+    selected &&
+    (await tryRealpath(path.join(selected.globalRoot, PRIMARY_PACKAGE_NAME))) === pkgReal
+  ) {
+    return true;
+  }
+  const { launcher, launcherTarget } = await inspectNpmLauncher(layout);
+  diagnostics.push(`npm install prefix: ${layout.prefix}`, `npm launcher: ${launcher}`);
+  if (!launcherTarget) {
+    return false;
+  }
+  const relative = path.relative(pkgReal, launcherTarget);
+  return (
+    relative !== "" &&
+    relative !== ".." &&
+    !relative.startsWith(`..${path.sep}`) &&
+    !path.isAbsolute(relative)
+  );
+}
+
+/** Identifies a global owner from command probes and installed layout evidence. */
 export async function detectGlobalInstallManagerForRoot(
   runCommand: CommandRunner,
   pkgRoot: string,
   timeoutMs: number,
+  diagnostics: string[] = [],
 ): Promise<GlobalInstallManager | null> {
   const pkgReal = await tryRealpath(pkgRoot);
+  diagnostics.push(`package root: ${pkgRoot} (resolved: ${pkgReal})`);
+  const bunOwner = resolveBunGlobalInstallOwner(pkgRoot) ?? resolveBunGlobalInstallOwner(pkgReal);
+  if (bunOwner) {
+    return (await isPnpmGlobalPackageRoot(pkgRoot)) ? "pnpm" : "bun";
+  }
 
   const candidates: Array<{
     manager: "npm" | "pnpm";
@@ -1201,27 +1242,21 @@ export async function detectGlobalInstallManagerForRoot(
 
   for (const { manager, argv } of candidates) {
     const res = await runCommand(argv, { timeoutMs }).catch(() => null);
+    const globalRoot = res?.code === 0 ? readPackageManagerProbeValue(res.stdout) : "";
+    diagnostics.push(`${argv.join(" ")}: ${globalRoot || "unavailable"}`);
     if (!res || res.code !== 0) {
       continue;
     }
-    const globalRoot = readPackageManagerProbeValue(res.stdout);
     if (!globalRoot) {
       continue;
     }
     const globalReal = await tryRealpath(globalRoot);
-    if (manager === "pnpm") {
-      for (const name of ALL_PACKAGE_NAMES) {
-        if (await resolvePnpmIsolatedGlobalPackage({ globalRoot, packageName: name, pkgRoot })) {
-          return "pnpm";
-        }
-      }
+    if (manager === "pnpm" && (await resolvePnpmIsolatedGlobalPackage({ globalRoot, pkgRoot }))) {
+      return "pnpm";
     }
-    for (const name of ALL_PACKAGE_NAMES) {
-      const expected = path.join(globalReal, name);
-      const expectedReal = await tryRealpath(expected);
-      if (path.resolve(expectedReal) === path.resolve(pkgReal)) {
-        return manager;
-      }
+    const expectedReal = await tryRealpath(path.join(globalReal, PRIMARY_PACKAGE_NAME));
+    if (path.resolve(expectedReal) === path.resolve(pkgReal)) {
+      return manager;
     }
   }
 
@@ -1229,21 +1264,11 @@ export async function detectGlobalInstallManagerForRoot(
     return "pnpm";
   }
 
-  const bunGlobalRoot = resolveBunGlobalRoot();
-  const bunGlobalReal = await tryRealpath(bunGlobalRoot);
-  for (const name of ALL_PACKAGE_NAMES) {
-    const bunExpected = path.join(bunGlobalReal, name);
-    const bunExpectedReal = await tryRealpath(bunExpected);
-    if (path.resolve(bunExpectedReal) === path.resolve(pkgReal)) {
-      return "bun";
-    }
-  }
-
   if (resolveNpmCommandBesidePackageRoot(pkgRoot)) {
     return "npm";
   }
 
-  return null;
+  return (await inspectNpmGlobalOwner(runCommand, pkgRoot, timeoutMs, diagnostics)) ? "npm" : null;
 }
 
 /**
@@ -1259,18 +1284,14 @@ export async function detectGlobalInstallManagerByPresence(
     if (!root) {
       continue;
     }
-    for (const name of ALL_PACKAGE_NAMES) {
-      if (await pathExists(path.join(root, name))) {
-        return manager;
-      }
+    if (await pathExists(path.join(root, PRIMARY_PACKAGE_NAME))) {
+      return manager;
     }
   }
 
   const bunRoot = resolveBunGlobalRoot();
-  for (const name of ALL_PACKAGE_NAMES) {
-    if (await pathExists(path.join(bunRoot, name))) {
-      return "bun";
-    }
+  if (await pathExists(path.join(bunRoot, PRIMARY_PACKAGE_NAME))) {
+    return "bun";
   }
   return null;
 }
@@ -1285,21 +1306,11 @@ export function globalInstallArgs(
   pkgRoot?: string | null,
   installPrefix?: string | null,
   installCwd?: string | null,
-  npmLifecyclePolicy: SupportedNpmLifecyclePolicy = "allow-scripts",
+  npmLifecyclePolicy: NpmLifecyclePolicy = "allow-scripts",
 ): string[] {
   const resolved = normalizeGlobalInstallCommand(managerOrCommand, pkgRoot);
   if (resolved.manager === "pnpm") {
-    return [
-      resolved.command,
-      "add",
-      "-g",
-      ...(installPrefix ? ["--global-dir", installPrefix] : []),
-      ...(resolved.pnpmIsolated?.globalBinDir
-        ? ["--global-bin-dir", resolved.pnpmIsolated.globalBinDir]
-        : []),
-      PNPM_OPENCLAW_BUILD_ALLOWLIST_FLAG,
-      spec,
-    ];
+    return [resolved.command, "add", "-g", PNPM_OPENCLAW_BUILD_ALLOWLIST_FLAG, spec];
   }
   if (resolved.manager === "bun") {
     return [
@@ -1314,8 +1325,8 @@ export function globalInstallArgs(
     resolved.command,
     "i",
     "-g",
-    ...(npmLifecyclePolicy === "allow-scripts"
-      ? [resolveNpmInstallScriptsAllowFlag(spec, installCwd)]
+    ...(npmLifecyclePolicy !== "unflagged"
+      ? [resolveNpmInstallScriptsAllowFlag(spec, installCwd, npmLifecyclePolicy)]
       : []),
     ...(installPrefix ? ["--prefix", installPrefix] : []),
     spec,
@@ -1336,7 +1347,7 @@ export function globalInstallFallbackArgs(
   pkgRoot?: string | null,
   installPrefix?: string | null,
   installCwd?: string | null,
-  npmLifecyclePolicy: SupportedNpmLifecyclePolicy = "allow-scripts",
+  npmLifecyclePolicy: NpmLifecyclePolicy = "allow-scripts",
 ): string[] | null {
   const resolved = normalizeGlobalInstallCommand(managerOrCommand, pkgRoot);
   if (resolved.manager !== "npm") {
@@ -1346,8 +1357,8 @@ export function globalInstallFallbackArgs(
     resolved.command,
     "i",
     "-g",
-    ...(npmLifecyclePolicy === "allow-scripts"
-      ? [resolveNpmInstallScriptsAllowFlag(spec, installCwd)]
+    ...(npmLifecyclePolicy !== "unflagged"
+      ? [resolveNpmInstallScriptsAllowFlag(spec, installCwd, npmLifecyclePolicy)]
       : []),
     ...(installPrefix ? ["--prefix", installPrefix] : []),
     spec,
@@ -1371,6 +1382,7 @@ export async function cleanupGlobalRenameDirs(params: {
     return { removed };
   }
   const prefix = `${GLOBAL_RENAME_PREFIX}${name}-`;
+  const inspectionDeadline = Date.now() + PKG_INSPECTION_TIMEOUT_MS;
   let entries: string[];
   try {
     entries = await fs.readdir(root);
@@ -1387,9 +1399,27 @@ export async function cleanupGlobalRenameDirs(params: {
       if (!stat.isDirectory()) {
         continue;
       }
+      if (process.platform === "freebsd") {
+        // A matching rename pattern does not establish ownership of its files.
+        const remainingMs = inspectionDeadline - Date.now();
+        if (remainingMs <= 0) {
+          break;
+        }
+        await createFreeBsdPkgOwnershipInspection(remainingMs).assertUnowned(target);
+        const current = await fs.lstat(target);
+        if (!current.isDirectory() || !sameFileIdentity(stat, current)) {
+          continue;
+        }
+      }
       await fs.rm(target, { recursive: true, force: true });
       removed.push(entry);
-    } catch {
+    } catch (error) {
+      if (
+        error instanceof FreeBsdPkgOwnershipError &&
+        error.reason === "pkg-ownership-unavailable"
+      ) {
+        break;
+      }
       // ignore cleanup failures
     }
   }

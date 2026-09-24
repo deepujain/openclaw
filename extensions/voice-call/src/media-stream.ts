@@ -24,8 +24,9 @@ import {
   type TalkSessionController,
 } from "openclaw/plugin-sdk/realtime-voice";
 import { truncateUtf16Safe } from "openclaw/plugin-sdk/text-utility-runtime";
-import { type RawData, WebSocket, WebSocketServer } from "ws";
+import type { RawData } from "ws";
 import { canonicalizeVoiceCallMediaBase64 } from "./media-base64.js";
+import { WebSocket, WebSocketServer } from "./websocket.js";
 
 /**
  * Configuration for the media stream handler.
@@ -50,15 +51,15 @@ export interface MediaStreamConfig {
   /** Validate whether to accept a media stream for the given call ID. Missing validator rejects. */
   shouldAcceptStream?: (params: { callId: string; streamSid: string; token?: string }) => boolean;
   /** Callback when transcript is received */
-  onTranscript?: (callId: string, transcript: string) => void;
+  onTranscript?: (callId: string, transcript: string, streamSid: string) => void;
   /** Callback for partial transcripts (streaming UI) */
-  onPartialTranscript?: (callId: string, partial: string) => void;
+  onPartialTranscript?: (callId: string, partial: string, streamSid: string) => void;
   /** Callback when stream connects */
   onConnect?: (callId: string, streamSid: string) => void;
   /** Callback when realtime transcription is ready for the stream */
   onTranscriptionReady?: (callId: string, streamSid: string) => void;
   /** Callback when speech starts (barge-in) */
-  onSpeechStart?: (callId: string) => void;
+  onSpeechStart?: (callId: string, streamSid: string) => void;
   /** Callback when stream disconnects */
   onDisconnect?: (callId: string, streamSid: string) => void;
   /** Callback for common Talk events emitted by the telephony STT/TTS adapter. */
@@ -85,13 +86,6 @@ type TtsQueueEntry = {
 
 type PendingPlaybackMark = {
   settle: (error?: Error, ignoreLateAck?: boolean) => void;
-};
-
-type StreamSendResult = {
-  sent: boolean;
-  readyState?: number;
-  bufferedBeforeBytes: number;
-  bufferedAfterBytes: number;
 };
 
 type PendingConnection = {
@@ -401,7 +395,7 @@ export class MediaStreamHandler {
             payload: { callId: callSid, streamSid, text: partial, role: "user" },
           });
         }
-        this.config.onPartialTranscript?.(callSid, partial);
+        this.config.onPartialTranscript?.(callSid, partial, streamSid);
       },
       onTranscript: (transcript) => {
         const session = this.sessions.get(streamSid);
@@ -420,14 +414,14 @@ export class MediaStreamHandler {
             payload: { callId: callSid, streamSid, text: transcript, role: "user" },
           });
         }
-        this.config.onTranscript?.(callSid, transcript);
+        this.config.onTranscript?.(callSid, transcript, streamSid);
       },
       onSpeechStart: () => {
         const session = this.sessions.get(streamSid);
         if (session) {
           this.ensureActiveTurn(session);
         }
-        this.config.onSpeechStart?.(callSid);
+        this.config.onSpeechStart?.(callSid, streamSid);
       },
       onError: (error) => {
         console.warn("[MediaStream] Transcription session error:", error.message);
@@ -615,61 +609,25 @@ export class MediaStreamHandler {
   /**
    * Send a message to a stream's WebSocket if available.
    */
-  private sendToStream(streamSid: string, message: unknown): StreamSendResult {
-    const session = this.sessions.get(streamSid);
+  private sendToStream(streamSid: string, message: unknown): boolean {
+    const session = this.getOpenSession(streamSid);
     if (!session) {
-      return {
-        sent: false,
-        bufferedBeforeBytes: 0,
-        bufferedAfterBytes: 0,
-      };
+      return false;
     }
-
-    const readyState = session.ws.readyState;
-    const bufferedBeforeBytes = session.ws.bufferedAmount;
-    if (readyState !== WebSocket.OPEN) {
-      return {
-        sent: false,
-        readyState,
-        bufferedBeforeBytes,
-        bufferedAfterBytes: session.ws.bufferedAmount,
-      };
-    }
-    if (bufferedBeforeBytes > MAX_WS_BUFFERED_BYTES) {
+    if (session.ws.bufferedAmount > MAX_WS_BUFFERED_BYTES) {
       session.ws.close(1013, "Backpressure: send buffer exceeded");
-      return {
-        sent: false,
-        readyState,
-        bufferedBeforeBytes,
-        bufferedAfterBytes: session.ws.bufferedAmount,
-      };
+      return false;
     }
 
     try {
       session.ws.send(JSON.stringify(message));
-      const bufferedAfterBytes = session.ws.bufferedAmount;
-      if (bufferedAfterBytes > MAX_WS_BUFFERED_BYTES) {
+      if (session.ws.bufferedAmount > MAX_WS_BUFFERED_BYTES) {
         session.ws.close(1013, "Backpressure: send buffer exceeded");
-        return {
-          sent: false,
-          readyState,
-          bufferedBeforeBytes,
-          bufferedAfterBytes,
-        };
+        return false;
       }
-      return {
-        sent: true,
-        readyState,
-        bufferedBeforeBytes,
-        bufferedAfterBytes,
-      };
+      return true;
     } catch {
-      return {
-        sent: false,
-        readyState,
-        bufferedBeforeBytes,
-        bufferedAfterBytes: session.ws.bufferedAmount,
-      };
+      return false;
     }
   }
 
@@ -677,7 +635,7 @@ export class MediaStreamHandler {
    * Send audio to a specific stream (for TTS playback).
    * Audio should be mu-law encoded at 8kHz mono.
    */
-  sendAudio(streamSid: string, muLawAudio: Buffer): StreamSendResult {
+  sendAudio(streamSid: string, muLawAudio: Buffer): boolean {
     const session = this.getOpenSession(streamSid);
     if (session) {
       this.emitTalkEvent(session, {
@@ -696,7 +654,7 @@ export class MediaStreamHandler {
   /**
    * Send a mark event to track audio playback position.
    */
-  sendMark(streamSid: string, name: string): StreamSendResult {
+  sendMark(streamSid: string, name: string): boolean {
     return this.sendToStream(streamSid, {
       event: "mark",
       streamSid,
@@ -760,8 +718,7 @@ export class MediaStreamHandler {
       signal.addEventListener("abort", onAbort, { once: true });
     });
 
-    const result = this.sendMark(streamSid, name);
-    if (!result.sent) {
+    if (!this.sendMark(streamSid, name)) {
       pending.settle(new Error("Telephony stream playback failed: completion mark not delivered"));
     }
     return acknowledgement;
@@ -770,7 +727,7 @@ export class MediaStreamHandler {
   /**
    * Clear audio buffer (interrupt playback).
    */
-  clearAudio(streamSid: string): StreamSendResult {
+  clearAudio(streamSid: string): boolean {
     this.invalidatePlaybackMarks(streamSid);
     return this.sendToStream(streamSid, { event: "clear", streamSid });
   }

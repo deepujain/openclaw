@@ -1,4 +1,3 @@
-// Discord plugin module implements client behavior.
 import type { APIInteraction } from "discord-api-types/v10";
 import type { DiscordCommandDeployHashStore } from "../command-deploy-store.js";
 import { DiscordCommandDeployer, type DeployCommandOptions } from "./command-deploy.js";
@@ -162,6 +161,10 @@ export class Client {
 
   async fetchMember(guildId: string, userId: string): Promise<GuildMember> {
     return await this.entityCache.fetchMember(guildId, userId);
+  }
+
+  async fetchGuildEmojis<T>(guildId: string, fetcher: () => Promise<T>): Promise<T> {
+    return await this.entityCache.fetchGuildEmojis(guildId, fetcher);
   }
 
   async deployCommands(options: DeployCommandOptions = {}) {

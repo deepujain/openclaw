@@ -8,7 +8,6 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import { formatErrorMessage } from "../../src/infra/errors.ts";
-import { createPluginStateKeyedStore } from "../../src/plugin-state/plugin-state-store.ts";
 import { readBoundedResponseText } from "../lib/bounded-response.mjs";
 import {
   maskIdentifier,
@@ -158,10 +157,14 @@ class CliArgumentError extends Error {
   override name = "CliArgumentError";
 }
 
-function remainingTimeoutMs(deadlineMs: number, nowMs = Date.now()): number {
+function remainingTimeoutMs(
+  deadlineMs: number,
+  timeoutError?: () => Error,
+  nowMs = Date.now(),
+): number {
   const remaining = Math.floor(deadlineMs - nowMs);
   if (!Number.isFinite(deadlineMs) || remaining <= 0) {
-    throw new Error("Discord ACP smoke exceeded total timeout.");
+    throw timeoutError?.() ?? new Error("Discord ACP smoke exceeded total timeout.");
   }
   return Math.max(1, remaining);
 }
@@ -560,7 +563,7 @@ async function requestDiscordJson<T>(params: {
 
   for (let attempt = 0; attempt <= retries; attempt += 1) {
     const controller = new AbortController();
-    const fetchTimeoutMs = remainingTimeoutMs(deadlineMs);
+    const fetchTimeoutMs = remainingTimeoutMs(deadlineMs, timeoutError);
     const response = await withTimeout({
       operation: fetchImpl(`${DISCORD_API_BASE}${params.path}`, {
         method: params.method,
@@ -574,7 +577,7 @@ async function requestDiscordJson<T>(params: {
     });
 
     if (response.status === 429) {
-      const bodyTimeoutMs = remainingTimeoutMs(deadlineMs);
+      const bodyTimeoutMs = remainingTimeoutMs(deadlineMs, timeoutError);
       const body = (await withTimeout({
         operation: readDiscordResponseJson({
           response,
@@ -593,7 +596,7 @@ async function requestDiscordJson<T>(params: {
       })) as { retry_after?: number };
       const waitSeconds = typeof body.retry_after === "number" ? body.retry_after : 1;
       const waitMs = Math.ceil(waitSeconds * 1000);
-      const remainingMs = remainingTimeoutMs(deadlineMs);
+      const remainingMs = remainingTimeoutMs(deadlineMs, timeoutError);
       if (waitMs >= remainingMs) {
         throw new Error(
           `${params.errorPrefix} ${params.method} ${redactDiscordApiPath(params.path)} exceeded total timeout before retry.`,
@@ -604,7 +607,7 @@ async function requestDiscordJson<T>(params: {
     }
 
     if (!response.ok) {
-      const bodyTimeoutMs = remainingTimeoutMs(deadlineMs);
+      const bodyTimeoutMs = remainingTimeoutMs(deadlineMs, timeoutError);
       const text = await withTimeout({
         operation: readDiscordResponseText({
           response,
@@ -627,7 +630,7 @@ async function requestDiscordJson<T>(params: {
       return undefined as T;
     }
 
-    const bodyTimeoutMs = remainingTimeoutMs(deadlineMs);
+    const bodyTimeoutMs = remainingTimeoutMs(deadlineMs, timeoutError);
     return (await withTimeout({
       operation: readDiscordResponseJson({
         response,
@@ -644,18 +647,6 @@ async function requestDiscordJson<T>(params: {
   throw new Error(
     `${params.errorPrefix} ${params.method} ${redactDiscordApiPath(params.path)} exceeded retry budget.`,
   );
-}
-
-async function readThreadBindings(stateDir: string): Promise<ThreadBindingRecord[]> {
-  const store = createPluginStateKeyedStore<ThreadBindingRecord>("discord", {
-    namespace: THREAD_BINDINGS_NAMESPACE,
-    maxEntries: THREAD_BINDINGS_MAX_ENTRIES,
-    env: { ...process.env, OPENCLAW_STATE_DIR: stateDir },
-  });
-  const entries = await store.entries();
-  return entries
-    .map((entry) => entry.value)
-    .filter((entry) => Boolean(entry?.threadId && entry?.targetSessionKey));
 }
 
 function normalizeBoundAt(record: ThreadBindingRecord): number {
@@ -802,6 +793,14 @@ async function run(argv = process.argv.slice(2)): Promise<SuccessResult | Failur
     };
   }
 
+  // Argument-only invocations need no state runtime; initialize before any live send.
+  const { createPluginStateKeyedStore } =
+    await import("../../src/plugin-state/plugin-state-store.ts");
+  const bindingsStore = createPluginStateKeyedStore<ThreadBindingRecord>("discord", {
+    namespace: THREAD_BINDINGS_NAMESPACE,
+    maxEntries: THREAD_BINDINGS_MAX_ENTRIES,
+    env: { ...process.env, OPENCLAW_STATE_DIR: args.stateDir },
+  });
   const smokeId = `acp-smoke-${Date.now()}-${randomUUID().slice(0, 8)}`;
   const startedAt = Date.now();
   const deadline = startedAt + args.timeoutMs;
@@ -948,7 +947,9 @@ async function run(argv = process.argv.slice(2)): Promise<SuccessResult | Failur
   try {
     while (Date.now() < deadline && !winningBinding) {
       try {
-        const entries = await readThreadBindings(args.stateDir);
+        const entries = (await bindingsStore.entries())
+          .map((entry) => entry.value)
+          .filter((entry) => Boolean(entry?.threadId && entry?.targetSessionKey));
         latestCandidates = resolveCandidateBindings({
           entries,
           minBoundAt: minBindingBoundAt,
@@ -1096,14 +1097,12 @@ async function main(argv = process.argv.slice(2)): Promise<number> {
     writeStdoutLine(usage());
     return 0;
   }
-  const result = await run(argv).catch(
-    (err: unknown): FailureResult => ({
-      ok: false,
-      stage: "unexpected",
-      smokeId: "n/a",
-      error: safeErrorMessage(err),
-    }),
-  );
+  const result = await run(argv).catch((err: unknown): FailureResult => ({
+    ok: false,
+    stage: "unexpected",
+    smokeId: "n/a",
+    error: safeErrorMessage(err),
+  }));
   printOutput({
     json: hasFlag("--json", argv),
     payload: result,

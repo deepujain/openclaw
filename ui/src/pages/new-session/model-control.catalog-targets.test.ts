@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
+import { createDeferred as deferred } from "../../../../test/helpers/promise.js";
 import type { ModelCatalogEntry } from "../../api/types.ts";
-import { contextWith, deferred, renderControl } from "./model-control.test-support.ts";
+import { contextWith, renderControl } from "./model-control.test-support.ts";
 import { NewSessionModelControl } from "./model-control.ts";
 
 const models: ModelCatalogEntry[] = [
@@ -12,7 +13,7 @@ function catalogCalls(request: ReturnType<typeof vi.fn>) {
 }
 
 describe("new-session CLI-agent model targets", () => {
-  it("retries failed discovery with model metadata when the picker reopens", async () => {
+  it("retries only failed discovery when the picker reopens", async () => {
     const { context, request } = contextWith(models, "openclaw", ["sessions.catalog.list"]);
     request.mockImplementation((method: string) => {
       if (method === "sessions.catalog.list") {
@@ -23,7 +24,7 @@ describe("new-session CLI-agent model targets", () => {
                 {
                   id: "anthropic",
                   label: "Claude Code",
-                  capabilities: { createSession: { model: "anthropic/claude-sonnet-4-6" } },
+                  capabilities: { startTerminal: true },
                   hosts: [],
                 },
               ],
@@ -54,7 +55,8 @@ describe("new-session CLI-agent model targets", () => {
     picker!.dispatchEvent(new Event("toggle"));
 
     await vi.waitFor(() => {
-      expect(request.mock.calls.filter(([method]) => method === "chat.metadata")).toHaveLength(2);
+      expect(request.mock.calls.filter(([method]) => method === "models.list")).toHaveLength(1);
+      expect(request.mock.calls.some(([, params]) => params?.refresh)).toBe(false);
       expect(catalogCalls(request)).toHaveLength(2);
     });
     await vi.waitFor(() => {
@@ -72,7 +74,7 @@ describe("new-session CLI-agent model targets", () => {
     expect(catalogCalls(request)).toHaveLength(2);
   });
 
-  it("retries both catalogs from the visible discovery error action", async () => {
+  it("retries only failed discovery from its visible error action", async () => {
     const { context, request } = contextWith(models, "openclaw", ["sessions.catalog.list"]);
     request.mockImplementation((method: string) => {
       if (method === "sessions.catalog.list") {
@@ -96,7 +98,7 @@ describe("new-session CLI-agent model targets", () => {
     });
 
     await vi.waitFor(() => {
-      expect(request.mock.calls.filter(([method]) => method === "chat.metadata")).toHaveLength(2);
+      expect(request.mock.calls.filter(([method]) => method === "models.list")).toHaveLength(1);
       expect(catalogCalls(request)).toHaveLength(2);
     });
     expect(
@@ -124,7 +126,7 @@ describe("new-session CLI-agent model targets", () => {
               {
                 id: "new-owner",
                 label: "New owner",
-                capabilities: { createSession: { model: "openai/gpt-5.6-luna" } },
+                capabilities: { startTerminal: true },
                 hosts: [],
               },
             ],
@@ -148,7 +150,7 @@ describe("new-session CLI-agent model targets", () => {
         {
           id: "stale-owner",
           label: "Stale owner",
-          capabilities: { createSession: { model: "anthropic/claude-sonnet-4-6" } },
+          capabilities: { startTerminal: true },
           hosts: [],
         },
       ],
@@ -183,7 +185,7 @@ describe("new-session CLI-agent model targets", () => {
         {
           id: "research-owner",
           label: "Research owner",
-          capabilities: { createSession: { model: "openai/gpt-5.6-luna" } },
+          capabilities: { startTerminal: true },
           hosts: [],
         },
       ],
@@ -199,7 +201,7 @@ describe("new-session CLI-agent model targets", () => {
         {
           id: "main-owner",
           label: "Main owner",
-          capabilities: { createSession: { model: "anthropic/claude-sonnet-4-6" } },
+          capabilities: { startTerminal: true },
           hosts: [],
         },
       ],

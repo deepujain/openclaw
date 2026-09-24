@@ -1,14 +1,10 @@
-// Matrix plugin module implements approval native behavior.
 import {
   createChannelApprovalCapability,
   createApproverRestrictedNativeApprovalCapability,
   splitChannelApprovalCapability,
 } from "openclaw/plugin-sdk/approval-delivery-runtime";
 import { createLazyChannelApprovalNativeRuntimeAdapter } from "openclaw/plugin-sdk/approval-handler-adapter-runtime";
-import type {
-  ChannelApprovalKind,
-  ChannelApprovalNativeRuntimeAdapter,
-} from "openclaw/plugin-sdk/approval-handler-runtime";
+import type { ChannelApprovalKind } from "openclaw/plugin-sdk/approval-handler-runtime";
 import {
   createChannelNativeOriginTargetResolver,
   resolveApprovalRequestSessionConversation,
@@ -16,6 +12,7 @@ import {
 import type {
   ExecApprovalRequest,
   PluginApprovalRequest,
+  SystemAgentApprovalRequest,
 } from "openclaw/plugin-sdk/approval-runtime";
 import type { ChannelApprovalCapability } from "openclaw/plugin-sdk/channel-contract";
 import {
@@ -23,7 +20,7 @@ import {
   normalizeOptionalStringifiedId,
 } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { getMatrixApprovalAuthApprovers, matrixApprovalAuth } from "./approval-auth.js";
-import { normalizeMatrixApproverId } from "./approval-ids.js";
+import { isMatrixApprovalReactionAuthorizedSender } from "./approval-reaction-auth.js";
 import {
   getMatrixApprovalApprovers,
   getMatrixExecApprovalApprovers,
@@ -39,7 +36,7 @@ import { normalizeMatrixUserId } from "./matrix/monitor/allowlist.js";
 import { resolveMatrixTargetIdentity } from "./matrix/target-ids.js";
 import type { CoreConfig } from "./types.js";
 
-type ApprovalRequest = ExecApprovalRequest | PluginApprovalRequest;
+type ApprovalRequest = ExecApprovalRequest | PluginApprovalRequest | SystemAgentApprovalRequest;
 type MatrixOriginTarget = { to: string; threadId?: string };
 
 function normalizeComparableTarget(value: string): string {
@@ -127,20 +124,6 @@ function hasAnyMatrixApprovalApprovers(params: {
   );
 }
 
-function isMatrixPluginAuthorizedSender(params: {
-  cfg: CoreConfig;
-  accountId?: string | null;
-  senderId?: string | null;
-}): boolean {
-  const normalizedSenderId = params.senderId
-    ? normalizeMatrixApproverId(params.senderId)
-    : undefined;
-  if (!normalizedSenderId) {
-    return false;
-  }
-  return getMatrixApprovalAuthApprovers(params).includes(normalizedSenderId);
-}
-
 function resolveSuppressionAccountId(params: {
   target: { accountId?: string | null };
   request: { request: { turnSourceAccountId?: string | null } };
@@ -155,7 +138,7 @@ function resolveSuppressionAccountId(params: {
 const resolveMatrixOriginTarget = createChannelNativeOriginTargetResolver({
   channel: "matrix",
   shouldHandleRequest: ({ cfg, accountId, approvalKind, request }) => {
-    if (approvalKind !== "exec" && approvalKind !== "plugin") {
+    if (approvalKind !== "exec" && approvalKind !== "plugin" && approvalKind !== "system-agent") {
       return false;
     }
     return shouldHandleMatrixApprovalRequest({
@@ -176,14 +159,10 @@ const resolveMatrixOriginTarget = createChannelNativeOriginTargetResolver({
     if (!sessionConversation) {
       return null;
     }
-    const target = resolveMatrixNativeTarget(sessionConversation.id);
-    if (!target) {
-      return null;
-    }
-    return {
-      to: target,
-      threadId: normalizeOptionalStringifiedId(sessionConversation.threadId),
-    };
+    return resolveSessionMatrixOriginTarget({
+      to: sessionConversation.id,
+      threadId: sessionConversation.threadId,
+    });
   },
 });
 
@@ -225,10 +204,11 @@ const matrixNativeApprovalCapability = createApproverRestrictedNativeApprovalCap
   isExecAuthorizedSender: ({ cfg, accountId, senderId }) =>
     isMatrixExecApprovalAuthorizedSender({ cfg, accountId, senderId }),
   isPluginAuthorizedSender: ({ cfg, accountId, senderId }) =>
-    isMatrixPluginAuthorizedSender({
+    isMatrixApprovalReactionAuthorizedSender({
       cfg: cfg as CoreConfig,
       accountId,
       senderId,
+      approvalKind: "plugin",
     }),
   isNativeDeliveryEnabled: ({ cfg, accountId }) =>
     isMatrixExecApprovalClientEnabled({ cfg, accountId }),
@@ -240,7 +220,8 @@ const matrixNativeApprovalCapability = createApproverRestrictedNativeApprovalCap
   resolveApproverDmTargets: resolveMatrixApproverDmTargets,
   notifyOriginWhenDmOnly: true,
   nativeRuntime: createLazyChannelApprovalNativeRuntimeAdapter({
-    eventKinds: ["exec", "plugin"],
+    capabilityBoundary: true,
+    eventKinds: ["exec", "plugin", "system-agent"],
     isConfigured: ({ cfg, accountId }) =>
       isMatrixAnyApprovalClientEnabled({
         cfg,
@@ -253,9 +234,7 @@ const matrixNativeApprovalCapability = createApproverRestrictedNativeApprovalCap
         approvalKind,
         request,
       }),
-    load: async () =>
-      (await import("./approval-handler.runtime.js"))
-        .matrixApprovalNativeRuntime as unknown as ChannelApprovalNativeRuntimeAdapter,
+    load: async () => (await import("./approval-handler.runtime.js")).matrixApprovalNativeRuntime,
   }),
 });
 

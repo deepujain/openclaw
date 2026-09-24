@@ -3,17 +3,21 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { withEnv, withEnvAsync } from "../../test-utils/env.js";
+import type { OpenClawConfig } from "../../config/types.openclaw.js";
+import { withEnvAsync } from "../../test-utils/env.js";
 import { bumpSkillsSnapshotVersion, getSkillsSnapshotVersion } from "../runtime/refresh-state.js";
 import { resolveReusableWorkspaceSkillSnapshot } from "../runtime/session-snapshot.js";
 import { writeSkill } from "../test-support/e2e-test-helpers.js";
+import { resolveWorkshopSkillsDir } from "../workshop/skills-root.js";
 import { buildSkillSnapshot } from "./workspace-skill-prompt.js";
 import { syncWorkspaceSkills } from "./workspace-skill-sync.runtime.js";
 
-const mockResolvePluginSkillDirs = vi.hoisted(() => vi.fn(() => [] as string[]));
+const mockResolvePluginSkillRoots = vi.hoisted(() =>
+  vi.fn(() => [] as Array<{ dir: string; rejectHardlinks: boolean }>),
+);
 
 vi.mock("./plugin-skills.js", () => ({
-  resolvePluginSkillDirs: mockResolvePluginSkillDirs,
+  resolvePluginSkillRoots: mockResolvePluginSkillRoots,
 }));
 
 async function pathExists(filePath: string): Promise<boolean> {
@@ -44,11 +48,11 @@ async function syncSourceSkillsToTarget(sourceWorkspace: string, targetWorkspace
   });
 }
 
-function buildWorkspaceSkillsPrompt(
+async function buildWorkspaceSkillsPrompt(
   workspaceDir: string,
   opts?: Parameters<typeof buildSkillSnapshot>[1],
-): string {
-  return buildSkillSnapshot(workspaceDir, opts).prompt;
+): Promise<string> {
+  return (await buildSkillSnapshot(workspaceDir, opts)).prompt;
 }
 
 async function expectSyncedSkillConfinement(params: {
@@ -99,16 +103,18 @@ afterAll(async () => {
 });
 
 describe("syncWorkspaceSkills", () => {
-  const buildPrompt = (
+  const buildPrompt = async (
     workspaceDir: string,
     opts?: Parameters<typeof buildWorkspaceSkillsPrompt>[1],
   ) =>
-    withEnv({ HOME: workspaceDir }, () =>
-      buildWorkspaceSkillsPrompt(workspaceDir, {
-        bundledSkillsDir: path.join(workspaceDir, ".bundled"),
-        managedSkillsDir: path.join(workspaceDir, ".managed"),
-        ...opts,
-      }),
+    await withEnvAsync(
+      { HOME: workspaceDir },
+      async () =>
+        await buildWorkspaceSkillsPrompt(workspaceDir, {
+          bundledSkillsDir: path.join(workspaceDir, ".bundled"),
+          managedSkillsDir: path.join(workspaceDir, ".managed"),
+          ...opts,
+        }),
     );
 
   const cloneSourceTemplate = async () => {
@@ -150,7 +156,7 @@ describe("syncWorkspaceSkills", () => {
       },
     ]);
 
-    const prompt = buildPrompt(targetWorkspace, {
+    const prompt = await buildPrompt(targetWorkspace, {
       bundledSkillsDir: path.join(targetWorkspace, ".bundled"),
       managedSkillsDir: path.join(targetWorkspace, ".managed"),
     });
@@ -184,7 +190,7 @@ describe("syncWorkspaceSkills", () => {
       description: "Prompt-hidden skill",
       frontmatterExtra: "disable-model-invocation: true",
     });
-    const skillsSnapshot = buildSkillSnapshot(sourceWorkspace, {
+    const skillsSnapshot = await buildSkillSnapshot(sourceWorkspace, {
       bundledSkillsDir,
       managedSkillsDir,
       snapshotVersion: getSkillsSnapshotVersion(sourceWorkspace),
@@ -212,50 +218,110 @@ describe("syncWorkspaceSkills", () => {
     expect(await pathExists(path.join(targetWorkspace, "skills", "hidden", "SKILL.md"))).toBe(true);
   });
 
-  it("replaces same-name execution skills when the execution root changes", async () => {
-    const agentWorkspace = await createCaseDir("agent-workspace");
-    const firstExecutionWorkspace = await createCaseDir("execution-a");
-    const secondExecutionWorkspace = await createCaseDir("execution-b");
-    const targetWorkspace = await createCaseDir("target");
-    const skillName = "shared-execution-skill";
-    await writeSkill({
-      dir: path.join(firstExecutionWorkspace, "skills", skillName),
-      name: skillName,
-      description: "Execution root A",
-    });
-    await writeSkill({
-      dir: path.join(secondExecutionWorkspace, "skills", skillName),
-      name: skillName,
-      description: "Execution root B",
-    });
-    const resolveSnapshot = (executionWorkspace: string) =>
-      resolveReusableWorkspaceSkillSnapshot({
-        workspaceDir: agentWorkspace,
-        executionSkillsDir: path.join(executionWorkspace, "skills"),
-        config: {},
-        skillFilter: [skillName],
-        snapshotVersion: getSkillsSnapshotVersion(agentWorkspace),
-        watch: false,
-      }).snapshot;
-    const syncSnapshot = async (executionWorkspace: string) =>
-      await syncWorkspaceSkills({
-        sourceWorkspaceDir: agentWorkspace,
-        targetWorkspaceDir: targetWorkspace,
-        bundledSkillsDir: path.join(agentWorkspace, ".bundled"),
-        managedSkillsDir: path.join(agentWorkspace, ".managed"),
-        skillsSnapshot: resolveSnapshot(executionWorkspace),
-      });
-
-    await syncSnapshot(firstExecutionWorkspace);
-    await syncSnapshot(secondExecutionWorkspace);
-
-    const materializedSkill = await fs.readFile(
-      path.join(targetWorkspace, "skills", skillName, "SKILL.md"),
-      "utf8",
-    );
-    expect(materializedSkill).toContain("Execution root B");
-    expect(materializedSkill).not.toContain("Execution root A");
-  });
+  it.each([
+    { source: "execution", snapshot: true },
+    { source: "execution-project", snapshot: true },
+    { source: "execution-project", snapshot: "v2026.9.2" },
+    { source: "workspace", snapshot: true },
+    { source: "workspace", snapshot: false },
+    { source: "workshop", snapshot: true },
+    { source: "workshop", snapshot: false },
+  ] as const)(
+    "replaces same-name $source skills with snapshot=$snapshot",
+    async ({ source, snapshot }) => {
+      const agentWorkspace = await createCaseDir("agent-workspace");
+      const firstWorkspace = await createCaseDir("source-a");
+      const secondWorkspace = await createCaseDir("source-b");
+      const targetWorkspace = await createCaseDir("target");
+      const skillName = "shared-skill";
+      const config = {
+        plugins: { enabled: false },
+        agents: {
+          entries: {
+            alpha: { agentDir: path.join(firstWorkspace, "agent"), workspace: agentWorkspace },
+            beta: { agentDir: path.join(secondWorkspace, "agent"), workspace: agentWorkspace },
+          },
+        },
+      } satisfies OpenClawConfig;
+      const roots = [
+        { agentId: "alpha", workspace: firstWorkspace },
+        { agentId: "beta", workspace: secondWorkspace },
+      ].map(({ agentId, workspace }) => ({
+        agentId: source === "workshop" ? agentId : undefined,
+        workspaceDir: source === "workspace" ? workspace : agentWorkspace,
+        executionWorkspaceDir: source.startsWith("execution") ? workspace : undefined,
+        skillDir: path.join(
+          source === "workshop"
+            ? resolveWorkshopSkillsDir(config, agentId)
+            : source === "execution-project"
+              ? path.join(workspace, ".agents", "skills")
+              : path.join(workspace, "skills"),
+          skillName,
+        ),
+        description: `${agentId}'s procedure`,
+      }));
+      for (const root of roots) {
+        await writeSkill({ dir: root.skillDir, name: skillName, description: root.description });
+        await fs.writeFile(path.join(root.skillDir, "instructions.txt"), root.description);
+      }
+      const snapshotVersion = getSkillsSnapshotVersion(agentWorkspace);
+      for (const root of [roots[0]!, roots[1]!, roots[0]!]) {
+        const persistedSnapshot =
+          snapshot === "v2026.9.2"
+            ? JSON.stringify({
+                prompt: "",
+                skills: [],
+                skillFilter: [skillName],
+                version: snapshotVersion,
+                promptFormatVersion: 4,
+                skillRoots: {
+                  agentWorkspaceDir: root.workspaceDir,
+                  executionSkillsDir: path.join(root.executionWorkspaceDir!, "skills"),
+                },
+              })
+            : undefined;
+        const skillsSnapshot = snapshot
+          ? (
+              await resolveReusableWorkspaceSkillSnapshot({
+                workspaceDir: root.workspaceDir,
+                executionWorkspaceDir: root.executionWorkspaceDir,
+                agentId: root.agentId,
+                config,
+                skillFilter: [skillName],
+                snapshotVersion,
+                watch: false,
+                existingSnapshot: persistedSnapshot ? JSON.parse(persistedSnapshot) : undefined,
+              })
+            ).snapshot
+          : undefined;
+        const usage = await syncWorkspaceSkills({
+          sourceWorkspaceDir: root.workspaceDir,
+          targetWorkspaceDir: targetWorkspace,
+          agentId: root.agentId,
+          config,
+          skillFilter: [skillName],
+          bundledSkillsDir: path.join(agentWorkspace, ".bundled"),
+          managedSkillsDir: path.join(agentWorkspace, ".managed"),
+          skillsSnapshot,
+        });
+        const syncedSkillDir = path.join(targetWorkspace, "skills", skillName);
+        expect(await fs.readFile(path.join(syncedSkillDir, "SKILL.md"), "utf8")).toContain(
+          root.description,
+        );
+        expect(await fs.readFile(path.join(syncedSkillDir, "instructions.txt"), "utf8")).toBe(
+          root.description,
+        );
+        expect(usage).toEqual([
+          {
+            readPath: path.join(syncedSkillDir, "SKILL.md"),
+            skillFile: path.join(root.skillDir, "SKILL.md"),
+            skillName,
+            skillSource: "workspace",
+          },
+        ]);
+      }
+    },
+  );
 
   it("rejects path-like tampering without deriving read paths from the manifest", async () => {
     const sourceWorkspace = await createCaseDir("source");
@@ -269,7 +335,7 @@ describe("syncWorkspaceSkills", () => {
         description: `${name} skill`,
       });
     }
-    const skillsSnapshot = buildSkillSnapshot(sourceWorkspace, {
+    const skillsSnapshot = await buildSkillSnapshot(sourceWorkspace, {
       bundledSkillsDir,
       managedSkillsDir,
       snapshotVersion: getSkillsSnapshotVersion(sourceWorkspace),
@@ -325,7 +391,7 @@ describe("syncWorkspaceSkills", () => {
       });
     }
     const snapshotVersion = getSkillsSnapshotVersion(sourceWorkspace);
-    const firstSnapshot = buildSkillSnapshot(sourceWorkspace, {
+    const firstSnapshot = await buildSkillSnapshot(sourceWorkspace, {
       bundledSkillsDir,
       managedSkillsDir,
       skillFilter: ["alpha", "beta"],
@@ -342,7 +408,7 @@ describe("syncWorkspaceSkills", () => {
     const preservedMarker = path.join(targetWorkspace, "skills", "alpha", "preserved.txt");
     await fs.writeFile(preservedMarker, "preserved");
 
-    const secondSnapshot = buildSkillSnapshot(sourceWorkspace, {
+    const secondSnapshot = await buildSkillSnapshot(sourceWorkspace, {
       bundledSkillsDir,
       managedSkillsDir,
       skillFilter: ["alpha", "gamma"],
@@ -375,7 +441,7 @@ describe("syncWorkspaceSkills", () => {
     await writeSkill({ dir: sourceSkillDir, name: "alpha", description: "Alpha skill" });
     await fs.writeFile(path.join(sourceSkillDir, "asset.txt"), "before");
     await fs.writeFile(path.join(sourceSkillDir, "removed.txt"), "stale");
-    const firstSnapshot = buildSkillSnapshot(sourceWorkspace, {
+    const firstSnapshot = await buildSkillSnapshot(sourceWorkspace, {
       bundledSkillsDir,
       managedSkillsDir,
       snapshotVersion: getSkillsSnapshotVersion(sourceWorkspace),
@@ -391,7 +457,7 @@ describe("syncWorkspaceSkills", () => {
     await fs.writeFile(path.join(sourceSkillDir, "asset.txt"), "after");
     await fs.rm(path.join(sourceSkillDir, "removed.txt"));
     const nextVersion = bumpSkillsSnapshotVersion({ workspaceDir: sourceWorkspace });
-    const secondSnapshot = buildSkillSnapshot(sourceWorkspace, {
+    const secondSnapshot = await buildSkillSnapshot(sourceWorkspace, {
       bundledSkillsDir,
       managedSkillsDir,
       snapshotVersion: nextVersion,
@@ -420,7 +486,7 @@ describe("syncWorkspaceSkills", () => {
     const sourceSkillDir = path.join(sourceWorkspace, "skills", "alpha");
     await writeSkill({ dir: sourceSkillDir, name: "alpha", description: "Alpha skill" });
     await fs.writeFile(path.join(sourceSkillDir, "asset.txt"), "before");
-    const firstSnapshot = buildSkillSnapshot(sourceWorkspace, {
+    const firstSnapshot = await buildSkillSnapshot(sourceWorkspace, {
       bundledSkillsDir,
       managedSkillsDir,
       snapshotVersion: getSkillsSnapshotVersion(sourceWorkspace),
@@ -436,7 +502,7 @@ describe("syncWorkspaceSkills", () => {
 
     await fs.writeFile(path.join(sourceSkillDir, "asset.txt"), "after");
     const nextVersion = bumpSkillsSnapshotVersion({ workspaceDir: sourceWorkspace });
-    const secondSnapshot = buildSkillSnapshot(sourceWorkspace, {
+    const secondSnapshot = await buildSkillSnapshot(sourceWorkspace, {
       bundledSkillsDir,
       managedSkillsDir,
       snapshotVersion: nextVersion,
@@ -510,7 +576,7 @@ describe("syncWorkspaceSkills", () => {
       managedSkillsDir: path.join(sourceWorkspace, ".managed"),
     });
 
-    const prompt = buildPrompt(targetWorkspace, {
+    const prompt = await buildPrompt(targetWorkspace, {
       bundledSkillsDir: path.join(targetWorkspace, ".bundled"),
       managedSkillsDir: path.join(targetWorkspace, ".managed"),
     });
@@ -546,7 +612,7 @@ describe("syncWorkspaceSkills", () => {
 
       await syncSourceSkillsToTarget(sourceWorkspace, targetWorkspace);
 
-      const prompt = buildPrompt(targetWorkspace, {
+      const prompt = await buildPrompt(targetWorkspace, {
         bundledSkillsDir: path.join(targetWorkspace, ".bundled"),
         managedSkillsDir: path.join(targetWorkspace, ".managed"),
       });
@@ -612,14 +678,14 @@ describe("syncWorkspaceSkills", () => {
       body: "# Image Lab\n",
     });
 
-    withEnv({ GEMINI_API_KEY: undefined }, () => {
-      const missingPrompt = buildPrompt(workspaceDir, {
+    await withEnvAsync({ GEMINI_API_KEY: undefined }, async () => {
+      const missingPrompt = await buildPrompt(workspaceDir, {
         managedSkillsDir: path.join(workspaceDir, ".managed"),
         config: { skills: { entries: { "image-lab": { apiKey: "" } } } },
       });
       expect(missingPrompt).not.toContain("image-lab");
 
-      const enabledPrompt = buildPrompt(workspaceDir, {
+      const enabledPrompt = await buildPrompt(workspaceDir, {
         managedSkillsDir: path.join(workspaceDir, ".managed"),
         config: {
           skills: { entries: { "image-lab": { apiKey: "test-key" } } }, // pragma: allowlist secret
@@ -641,14 +707,14 @@ describe("syncWorkspaceSkills", () => {
       description: "Beta skill",
     });
 
-    const filteredPrompt = buildPrompt(workspaceDir, {
+    const filteredPrompt = await buildPrompt(workspaceDir, {
       managedSkillsDir: path.join(workspaceDir, ".managed"),
       skillFilter: ["alpha"],
     });
     expect(filteredPrompt).toContain("alpha");
     expect(filteredPrompt).not.toContain("beta");
 
-    const emptyPrompt = buildPrompt(workspaceDir, {
+    const emptyPrompt = await buildPrompt(workspaceDir, {
       managedSkillsDir: path.join(workspaceDir, ".managed"),
       skillFilter: [],
     });
@@ -727,7 +793,7 @@ describe("syncWorkspaceSkills", () => {
     expect((await fs.lstat(syncedSkillDir)).isSymbolicLink()).toBe(false);
     expect(await pathExists(path.join(targetWorkspace, "skills", ".hidden-target"))).toBe(false);
     expect(
-      buildWorkspaceSkillsPrompt(targetWorkspace, {
+      await buildWorkspaceSkillsPrompt(targetWorkspace, {
         bundledSkillsDir: path.join(targetWorkspace, ".bundled"),
         managedSkillsDir: path.join(targetWorkspace, ".managed"),
         skillFilter: [skillName],
@@ -758,7 +824,9 @@ describe("syncWorkspaceSkills for plugin skills", () => {
       process.platform === "win32" ? "junction" : "dir",
     );
 
-    mockResolvePluginSkillDirs.mockReturnValueOnce([realPluginSkillDir]);
+    mockResolvePluginSkillRoots.mockReturnValueOnce([
+      { dir: realPluginSkillDir, rejectHardlinks: true },
+    ]);
 
     const skillUsagePaths = await syncWorkspaceSkills({
       sourceWorkspaceDir: sourceWorkspace,
@@ -771,10 +839,12 @@ describe("syncWorkspaceSkills for plugin skills", () => {
     const syncedSkillDir = path.join(targetWorkspace, "skills", "wiki-maintainer");
     const syncedSkillMd = path.join(syncedSkillDir, "SKILL.md");
     const syncedStat = await fs.lstat(syncedSkillDir);
-    const prompt = buildWorkspaceSkillsPrompt(targetWorkspace, {
-      bundledSkillsDir: path.join(targetWorkspace, ".bundled"),
-      managedSkillsDir: path.join(targetWorkspace, ".managed"),
-    }).replaceAll("\\", "/");
+    const prompt = (
+      await buildWorkspaceSkillsPrompt(targetWorkspace, {
+        bundledSkillsDir: path.join(targetWorkspace, ".bundled"),
+        managedSkillsDir: path.join(targetWorkspace, ".managed"),
+      })
+    ).replaceAll("\\", "/");
 
     expect(await pathExists(syncedSkillMd)).toBe(true);
     expect(syncedStat.isSymbolicLink()).toBe(false);
@@ -827,7 +897,10 @@ describe("syncWorkspaceSkills for plugin skills", () => {
       process.platform === "win32" ? "junction" : "dir",
     );
 
-    mockResolvePluginSkillDirs.mockReturnValueOnce([realSkillA, realSkillB]);
+    mockResolvePluginSkillRoots.mockReturnValueOnce([
+      { dir: realSkillA, rejectHardlinks: true },
+      { dir: realSkillB, rejectHardlinks: true },
+    ]);
 
     await syncWorkspaceSkills({
       sourceWorkspaceDir: sourceWorkspace,
@@ -870,7 +943,7 @@ describe("syncWorkspaceSkills for plugin skills", () => {
 
     // Mock returns an allowed root that doesn't include the escaped skill
     const allowedRoot = await createCaseDir("allowed-root");
-    mockResolvePluginSkillDirs.mockReturnValueOnce([allowedRoot]);
+    mockResolvePluginSkillRoots.mockReturnValueOnce([{ dir: allowedRoot, rejectHardlinks: true }]);
 
     await syncWorkspaceSkills({
       sourceWorkspaceDir: sourceWorkspace,

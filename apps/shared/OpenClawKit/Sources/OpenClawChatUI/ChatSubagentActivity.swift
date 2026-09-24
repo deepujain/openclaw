@@ -22,6 +22,7 @@ enum ChatSubagentActivitySource: Sendable {
 
 struct ChatSubagentActivity: Identifiable, Equatable, Sendable {
     let id: String
+    let title: String?
     let status: ChatSubagentActivityStatus
     let snippet: String?
     let diffStat: ChatToolDiffStat?
@@ -47,7 +48,10 @@ struct ChatSubagentActivityState: Equatable, Sendable {
         else { return }
         let previous = self.activitiesByID[task.id]
         let fallbackSnippet = Self.firstNonBlank(task.lastactivity, task.progresssummary, task.lasttoolname)
-        let snippet = if !status.isWorking, previous != nil, Self.nonBlank(task.lastactivity) == nil {
+        let snippet = if !status.isWorking,
+                         previous != nil,
+                         ChatPayloadDecoding.trimmedNonEmptyString(task.lastactivity) == nil
+        {
             previous?.snippet
         } else {
             fallbackSnippet ?? previous?.snippet
@@ -66,12 +70,14 @@ struct ChatSubagentActivityState: Equatable, Sendable {
         }
         self.activitiesByID[task.id] = ChatSubagentActivity(
             id: task.id,
+            title: ChatPayloadDecoding.trimmedNonEmptyString(task.title),
             status: status,
             snippet: snippet,
             diffStat: Self.diffStat(task.diffstat) ?? previous?.diffStat,
             updatedAt: updatedAt,
             terminalObservedAt: terminalObservedAt,
-            terminalSummary: Self.nonBlank(task.terminalsummary) ?? previous?.terminalSummary)
+            terminalSummary: ChatPayloadDecoding.trimmedNonEmptyString(task.terminalsummary)
+                ?? previous?.terminalSummary)
     }
 
     mutating func remove(taskID: String) {
@@ -144,12 +150,7 @@ struct ChatSubagentActivityState: Equatable, Sendable {
     }
 
     private static func firstNonBlank(_ values: String?...) -> String? {
-        values.lazy.compactMap(self.nonBlank).first
-    }
-
-    private static func nonBlank(_ value: String?) -> String? {
-        let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed?.isEmpty == false ? trimmed : nil
+        values.lazy.compactMap(ChatPayloadDecoding.trimmedNonEmptyString).first
     }
 }
 

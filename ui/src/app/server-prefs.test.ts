@@ -1,13 +1,15 @@
 /* @vitest-environment jsdom */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { createDeferred } from "../../../test/helpers/promise.js";
 import { GatewayRequestError, type GatewayBrowserClient } from "../api/gateway.ts";
 import { createStorageMock } from "../test-helpers/storage.ts";
 import { waitForFast } from "../test-helpers/wait-for.ts";
+import { changedServerUiPrefs } from "./server-prefs-intent.ts";
+import { extractServerUiPrefs } from "./server-prefs-state.ts";
 import { configWithPrefs, createServerPrefsWriter } from "./server-prefs.test-support.ts";
 import {
   applyServerUiPrefs,
-  changedServerUiPrefs,
   flushServerUiPrefs,
   pushServerUiPrefs,
   resetServerUiPref,
@@ -40,6 +42,7 @@ describe("server pref extraction", () => {
         configWithPrefs({
           theme: "knot",
           themeMode: "dark",
+          accent: "#AbC123",
           locale: "de",
           chatShowThinking: false,
           chatSendShortcut: "modifier-enter",
@@ -55,11 +58,31 @@ describe("server pref extraction", () => {
     expect(onApplied).toHaveBeenCalledWith({
       theme: "knot",
       themeMode: "dark",
+      accent: "#abc123",
       locale: "de",
       chatShowThinking: false,
       chatSendShortcut: "modifier-enter",
       sidebarEntries: ["route:usage", "session:agent:main:test"],
     });
+  });
+
+  it.each([
+    ["#AbC123", "#abc123"],
+    ["#000000", "#000000"],
+    ["#abc", undefined],
+    ["abc123", undefined],
+    ["#abc123ff", undefined],
+    ["#gg0000", undefined],
+  ])("validates and normalizes server and locally mirrored accents %s", (value, expected) => {
+    expect(extractServerUiPrefs(configWithPrefs({ accent: value }))).toEqual(
+      expected ? { accent: expected } : {},
+    );
+    const { gatewayUrl } = loadSettings();
+    localStorage.setItem(
+      `openclaw.control.settings.v1:${gatewayUrl}`,
+      JSON.stringify({ gatewayUrl, accent: value }),
+    );
+    expect(loadSettings().accent).toBe(expected);
   });
 
   it("ignores invalid values and configs without prefs", () => {
@@ -126,7 +149,12 @@ describe("server pref extraction", () => {
 
     const beforeReset = loadSettings();
     const afterReset = resetServerUiPref("theme", state);
-    expect(changedServerUiPrefs(beforeReset, afterReset)).toEqual({ theme: null });
+    expect(changedServerUiPrefs(beforeReset, afterReset)).toEqual({
+      theme: null,
+      accent: "theme",
+      fontUi: null,
+      fontChat: null,
+    });
   });
 });
 
@@ -310,18 +338,24 @@ describe("changedServerUiPrefs", () => {
     const previous = loadSettings();
     const withOverrides = {
       ...previous,
+      accent: "#48d6c2",
       chatPersistCommentary: false,
       chatFollowUpMode: "queue" as const,
     };
     expect(changedServerUiPrefs(previous, withOverrides)).toEqual({
+      accent: "#48d6c2",
       chatPersistCommentary: false,
       chatFollowUpMode: "queue",
     });
 
-    // Clearing the follow-up override must propagate as an explicit removal.
+    // Clearing user overrides must propagate as explicit merge-patch removals.
     expect(
-      changedServerUiPrefs(withOverrides, { ...withOverrides, chatFollowUpMode: undefined }),
-    ).toEqual({ chatFollowUpMode: null });
+      changedServerUiPrefs(withOverrides, {
+        ...withOverrides,
+        accent: undefined,
+        chatFollowUpMode: undefined,
+      }),
+    ).toEqual({ accent: null, chatFollowUpMode: null });
   });
 
   it("pushes an explicit locale removal when returning to System", () => {
@@ -398,6 +432,7 @@ describe("clearable pref removal from the server", () => {
       configWithPrefs({
         theme: "knot",
         themeMode: "dark",
+        accent: "#48d6c2",
         chatSendShortcut: "modifier-enter",
       }),
       { onApplied },
@@ -409,24 +444,17 @@ describe("clearable pref removal from the server", () => {
       theme: "claw",
       themeMode: "system",
     });
+    expect(reset.accent).toBeUndefined();
     expect(reset.chatSendShortcut).toBe("enter");
     const persisted = JSON.parse(
       localStorage.getItem(`openclaw.control.settings.v1:${reset.gatewayUrl}`) ?? "{}",
     ) as Record<string, unknown>;
+    expect(Object.hasOwn(persisted, "accent")).toBe(false);
     expect(Object.hasOwn(persisted, "chatSendShortcut")).toBe(false);
   });
 });
 
 describe("pushServerUiPrefs", () => {
-  const deferred = () => {
-    let resolve!: (value: unknown) => void;
-    let reject!: (reason?: unknown) => void;
-    const promise = new Promise<unknown>((resolvePromise, rejectPromise) => {
-      resolve = resolvePromise;
-      reject = rejectPromise;
-    });
-    return { promise, reject, resolve };
-  };
   const pendingKey = (scope: string) => `openclaw.control.serverPrefs.pending.v1:${scope}`;
   const lastSeenKey = (scope: string) => `openclaw.control.serverPrefs.v1:${scope}`;
   const readPending = (scope: string) =>
@@ -435,7 +463,7 @@ describe("pushServerUiPrefs", () => {
 
   it("does not publish a server theme change shadowed by pending local intent", async () => {
     const scope = "ws://gw";
-    const requestGate = deferred();
+    const requestGate = createDeferred<unknown>();
     const request = vi.fn<(method: string, params?: unknown) => Promise<unknown>>(
       () => requestGate.promise,
     );
@@ -507,6 +535,7 @@ describe("pushServerUiPrefs", () => {
 
   it("retains rejected appearance edits as device-local state with local-only reset", async () => {
     const scope = "ws://gw";
+    patchSettings({ gatewayUrl: scope });
     const config = configWithPrefs({
       theme: "claw",
       locale: "de",
@@ -634,7 +663,7 @@ describe("pushServerUiPrefs", () => {
 
   it("merges this tab's edit with sibling persisted pending keys", () => {
     const scope = "ws://gw";
-    const flight = deferred();
+    const flight = createDeferred<unknown>();
     const request = vi.fn<(method: string, params?: unknown) => Promise<unknown>>(
       () => flight.promise,
     );
@@ -649,7 +678,7 @@ describe("pushServerUiPrefs", () => {
 
   it("settles only this tab's acknowledged keys from sibling persisted pending", async () => {
     const scope = "ws://gw";
-    const flight = deferred();
+    const flight = createDeferred<unknown>();
     const request = vi.fn<(method: string, params?: unknown) => Promise<unknown>>(
       () => flight.promise,
     );
@@ -680,7 +709,7 @@ describe("pushServerUiPrefs", () => {
 
   it("overwrites only a same-key sibling value when this tab persists later", () => {
     const scope = "ws://gw";
-    const flight = deferred();
+    const flight = createDeferred<unknown>();
     const request = vi.fn<(method: string, params?: unknown) => Promise<unknown>>(
       () => flight.promise,
     );
@@ -798,8 +827,8 @@ describe("pushServerUiPrefs", () => {
   });
 
   it("ignores a superseded request rejection while its replacement is pending", async () => {
-    const first = deferred();
-    const second = deferred();
+    const first = createDeferred<unknown>();
+    const second = createDeferred<unknown>();
     let calls = 0;
     const request = vi.fn<(method: string, params?: unknown) => Promise<unknown>>(() => {
       calls += 1;

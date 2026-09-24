@@ -1,10 +1,32 @@
 // @vitest-environment node
 import { describe, expect, it } from "vitest";
+import { isCronSessionDisplayKey } from "../../../src/shared/session-list-visibility.ts";
 import {
   resolveChannelSessionInfo,
   resolveSessionDisplayName,
+  resolveSessionWorkContext,
   resolveSessionWorkSubtitle,
 } from "./session-display.ts";
+
+describe("isCronSessionDisplayKey", () => {
+  it.each([
+    ["cron:job", true],
+    [" CRON:JOB ", true],
+    ["agent:ops:cron:job", true],
+    ["agent:ops:cron:job:run:one", true],
+    ["agent:ops::cron:job", true],
+    ["agent: :cron:job", true],
+    ["agent:ops:cron:", false],
+    ["agent:ops:cron::", false],
+    ["agent::cron:job", false],
+    [":agent:ops:cron:job", false],
+    ["agent:ops:custom:cron:job", false],
+    ["agent:ops:main", false],
+    ["", false],
+  ] as const)("retains automation classification for %j", (key, expected) => {
+    expect(isCronSessionDisplayKey(key)).toBe(expected);
+  });
+});
 
 describe("resolveSessionDisplayName", () => {
   it("uses the same friendly main-thread name for every agent", () => {
@@ -235,6 +257,14 @@ describe("resolveSessionWorkSubtitle", () => {
   it("combines repo, branch, and node host", () => {
     expect(
       resolveSessionWorkSubtitle({
+        repository: {
+          url: "https://github.com/openclaw/openclaw.git",
+          branch: "openclaw/cloud-task",
+        },
+      }),
+    ).toBe("openclaw ⎇ openclaw/cloud-task");
+    expect(
+      resolveSessionWorkSubtitle({
         worktree: { branch: "openclaw/session-ui", repoRoot: "/repo/clawdbot" },
       }),
     ).toBe("clawdbot ⎇ session-ui");
@@ -258,6 +288,97 @@ describe("resolveSessionWorkSubtitle", () => {
         execNode: "11c38726acc6fac280357576c87acc6fac280357",
       }),
     ).toBe("clawdbot ⎇ wt-1 · …0357");
+  });
+});
+
+describe("resolveSessionWorkContext", () => {
+  it("projects only repository or authoritative workspace facts", () => {
+    expect(
+      resolveSessionWorkContext({
+        worktree: { branch: "openclaw/session-ui", repoRoot: "/repo/openclaw" },
+        spawnedCwd: "/worktrees/session-ui/packages/ui",
+      }),
+    ).toEqual({
+      kind: "project",
+      name: "openclaw",
+      path: "/repo/openclaw",
+      cwd: "/worktrees/session-ui/packages/ui",
+      branch: "session-ui",
+    });
+    expect(
+      resolveSessionWorkContext({
+        spawnedWorkspaceDir: "/workspaces/release-notes",
+        spawnedCwd: "/stale/cwd",
+      }),
+    ).toEqual({
+      kind: "workspace",
+      name: "release-notes",
+      path: "/workspaces/release-notes",
+    });
+    expect(
+      resolveSessionWorkContext({
+        execNode: "remote-node",
+        execCwd: "/remote/workspace",
+        spawnedWorkspaceDir: "/local/workspace",
+        worktree: { branch: "openclaw/local-branch", repoRoot: "/gateway/repo" },
+      }),
+    ).toEqual({ kind: "workspace", name: "workspace", path: "/remote/workspace" });
+    expect(resolveSessionWorkContext({ execCwd: "/stale/local-routing-cwd" })).toBeUndefined();
+    expect(
+      resolveSessionWorkContext({
+        repository: {
+          url: "https://github.com/example/project.git",
+          branch: "openclaw/feature-cloud",
+        },
+        execNode: "cloud-node",
+        execCwd: "/remote/project",
+        worktree: { branch: "stale-local-branch", repoRoot: "/gateway/repo" },
+      }),
+    ).toEqual({
+      kind: "project",
+      name: "project",
+      path: "https://github.com/example/project",
+      cwd: "/remote/project",
+      branch: "openclaw/feature-cloud",
+    });
+    expect(
+      resolveSessionWorkContext({
+        repository: {
+          url: "https://github.com/example/project.git",
+          branch: "openclaw/feature-cloud",
+        },
+        spawnedCwd: "/gateway/unrelated",
+      }),
+    ).toEqual({
+      kind: "project",
+      name: "project",
+      path: "https://github.com/example/project",
+      cwd: undefined,
+      branch: "openclaw/feature-cloud",
+    });
+    expect(
+      resolveSessionWorkContext({
+        repository: { url: "https://github.com/example/project.git", branch: "main" },
+        placement: {
+          state: "reclaimed",
+          providerId: "example",
+          profileId: "test",
+          generation: 1,
+          createdAtMs: 1,
+          updatedAtMs: 2,
+          stateChangedAtMs: 2,
+          remoteWorkspaceDir: "/cloud/project",
+        },
+        execCwd: "/gateway/stale-routing",
+        spawnedCwd: "/gateway/unrelated",
+      }),
+    ).toEqual({
+      kind: "project",
+      name: "project",
+      path: "https://github.com/example/project",
+      cwd: "/cloud/project",
+      branch: "main",
+    });
   });
 });
 

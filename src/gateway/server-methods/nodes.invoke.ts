@@ -11,36 +11,27 @@ import {
   isBrowserProxyNodeInvokeCommand,
   isPrivateNodeInvokeCommand,
 } from "../../infra/node-commands.js";
+import { awaitWithinDeadline, ABSOLUTE_DEADLINE_EXPIRED } from "../../utils/absolute-deadline.js";
 import { isForbiddenBrowserProxyMutation } from "../node-browser-proxy-policy.js";
 import { isNodeCommandAllowed, resolveNodeCommandAllowlist } from "../node-command-policy.js";
 import { applyPluginNodeInvokePolicy } from "../node-invoke-plugin-policy.js";
+import { invokeNodeWithReadinessRetry } from "../node-invoke-readiness.js";
 import { sanitizeNodeInvokeParamsForForwarding } from "../node-invoke-sanitize.js";
 import { enqueuePendingNodeAction, removePendingNodeAction } from "../node-runtime-state.js";
-import {
-  captureNodeWakeLifecycle,
-  NODE_WAKE_RECONNECT_RETRY_WAIT_MS,
-  NODE_WAKE_RECONNECT_WAIT_MS,
-  releaseNodeWakeLifecycle,
-} from "../node-wake-state.js";
+import { captureNodeWakeLifecycle, releaseNodeWakeLifecycle } from "../node-wake-state.js";
 import { ADMIN_SCOPE } from "../operator-scopes.js";
 import { buildNodeCommandRejectionHint } from "./node-command-rejection-hint.js";
 import { nodeInvokePolicy } from "./nodes-policy.js";
 import { handleNodeInvokeProgress } from "./nodes.handlers.invoke-progress.js";
 import { handleNodeInvokeResult } from "./nodes.handlers.invoke-result.js";
 import {
-  respondInvalidParams,
   respondUnavailableOnNodeInvokeErrorWithProvenance,
-  respondUnavailableOnThrow,
   parseGatewayPayload,
 } from "./nodes.helpers.js";
 import {
   isForwardedNodeInvokeApprovalAuthorityActive,
   resolveNodeInvokeRuntimeAuthorityError,
 } from "./nodes.invoke-authority.js";
-import {
-  awaitNodeInvokeWithinDeadline,
-  NODE_INVOKE_DEADLINE_EXPIRED,
-} from "./nodes.invoke-deadline.js";
 import { shouldQueueAsPendingForegroundAction } from "./nodes.invoke-foreground.js";
 import { emitTalkPttNodeEvent } from "./nodes.invoke-talk-events.js";
 import { toPendingParamsJSON } from "./nodes.pending.js";
@@ -49,35 +40,18 @@ import {
   resolveDispatchableNodeSession,
   respondPairingChanged,
 } from "./nodes.shared.js";
-import {
-  maybeSendNodeWakeNudge,
-  maybeWakeNodeWithApns,
-  waitForNodeReconnect,
-} from "./nodes.wake.js";
+import { wakeNodeForReconnect } from "./nodes.wake-reconnect.js";
+import { maybeSendNodeWakeNudge, maybeWakeNodeWithApns } from "./nodes.wake.js";
+import { respondUnavailableOnThrow } from "./response.js";
 import type { GatewayRequestHandlers } from "./types.js";
+import { assertValidParams } from "./validation.js";
 
 export const nodeInvokeHandlers: GatewayRequestHandlers = {
   "node.invoke": async ({ params, respond, context, client, req, signal }) => {
-    if (!validateNodeInvokeParams(params)) {
-      respondInvalidParams({
-        respond,
-        method: "node.invoke",
-        validator: validateNodeInvokeParams,
-      });
+    if (!assertValidParams(params, validateNodeInvokeParams, "node.invoke", respond)) {
       return;
     }
-    const p = params as {
-      nodeId: string;
-      command: string;
-      params?: unknown;
-      timeoutMs?: number;
-      idempotencyKey: string;
-      sessionKey?: string;
-      turnSourceChannel?: string;
-      turnSourceTo?: string;
-      turnSourceAccountId?: string;
-      turnSourceThreadId?: string | number;
-    };
+    const p = params;
     const nodeId = normalizeOptionalString(p.nodeId) ?? "";
     const command = normalizeOptionalString(p.command) ?? "";
     const sessionKey = normalizeOptionalString(p.sessionKey);
@@ -142,10 +116,14 @@ export const nodeInvokeHandlers: GatewayRequestHandlers = {
       return;
     }
     const invokeDeadlineAtMs =
-      typeof p.timeoutMs === "number" && p.timeoutMs > 0 ? Date.now() + p.timeoutMs : undefined;
+      typeof p.timeoutMs === "number" && p.timeoutMs > 0
+        ? performance.now() + p.timeoutMs
+        : undefined;
     let nodeCommandDispatched = false;
     const resolveRemainingInvokeTimeoutMs = () =>
-      invokeDeadlineAtMs === undefined ? p.timeoutMs : Math.max(0, invokeDeadlineAtMs - Date.now());
+      invokeDeadlineAtMs === undefined
+        ? p.timeoutMs
+        : Math.max(0, invokeDeadlineAtMs - performance.now());
     const respondIfInvokeExpired = () => {
       if (invokeDeadlineAtMs === undefined || resolveRemainingInvokeTimeoutMs() !== 0) {
         return false;
@@ -161,11 +139,12 @@ export const nodeInvokeHandlers: GatewayRequestHandlers = {
       return true;
     };
     await respondUnavailableOnThrow(respond, async () => {
-      const generation = await awaitNodeInvokeWithinDeadline(
+      const generation = await awaitWithinDeadline(
         () => captureNodePairingGeneration(nodeId),
         invokeDeadlineAtMs,
+        () => performance.now(),
       );
-      if (generation === NODE_INVOKE_DEADLINE_EXPIRED) {
+      if (generation === ABSOLUTE_DEADLINE_EXPIRED) {
         respondIfInvokeExpired();
         return;
       }
@@ -180,11 +159,12 @@ export const nodeInvokeHandlers: GatewayRequestHandlers = {
       let releaseApprovalHandoff: (() => void) | undefined;
       try {
         const continuePairingWork = async (): Promise<boolean> => {
-          const pairingCurrent = await awaitNodeInvokeWithinDeadline(
+          const pairingCurrent = await awaitWithinDeadline(
             () => isNodePairingWorkCurrent({ nodeId, generation, lifecycle: wakeLifecycle }),
             invokeDeadlineAtMs,
+            () => performance.now(),
           );
-          if (pairingCurrent === NODE_INVOKE_DEADLINE_EXPIRED) {
+          if (pairingCurrent === ABSOLUTE_DEADLINE_EXPIRED) {
             respondIfInvokeExpired();
             return false;
           }
@@ -210,99 +190,22 @@ export const nodeInvokeHandlers: GatewayRequestHandlers = {
             `node wake start node=${nodeId} req=${wakeReqId} command=${command}`,
           );
 
-          // Wake attempts can be shared; expire this caller without aborting a
-          // push that another live invocation still owns.
-          const wake = await awaitNodeInvokeWithinDeadline(
-            () =>
-              maybeWakeNodeWithApns(nodeId, {
-                cfg,
-                lifecycle: wakeLifecycle,
-                generation,
-              }),
-            invokeDeadlineAtMs,
-          );
-          if (wake === NODE_INVOKE_DEADLINE_EXPIRED) {
-            respondIfInvokeExpired();
-            return;
-          }
-          context.logGateway.info(
-            `node wake stage=wake1 node=${nodeId} req=${wakeReqId} ` +
-              `available=${wake.available} throttled=${wake.throttled} ` +
-              `path=${wake.path} durationMs=${wake.durationMs} ` +
-              `apnsStatus=${wake.apnsStatus ?? -1} apnsReason=${wake.apnsReason ?? "-"}`,
-          );
-          if (respondIfInvokeExpired()) {
-            return;
-          }
-          if (wake.available) {
-            const waitStartedAtMs = Date.now();
-            const remainingTimeoutMs = resolveRemainingInvokeTimeoutMs();
-            const waitTimeoutMs =
-              invokeDeadlineAtMs === undefined
-                ? NODE_WAKE_RECONNECT_WAIT_MS
-                : Math.min(NODE_WAKE_RECONNECT_WAIT_MS, remainingTimeoutMs ?? 0);
-            const reconnected = await waitForNodeReconnect({
+          // Wake attempts can be shared; each stage retains this caller's deadline.
+          for (const force of [false, true]) {
+            const wake = await wakeNodeForReconnect({
               nodeId,
               context,
-              timeoutMs: waitTimeoutMs,
+              cfg,
+              generation,
               lifecycle: wakeLifecycle,
-              pairingGeneration: generation.key,
+              requestId: wakeReqId,
+              source: "invoke",
+              force,
+              deadlineAtMs: invokeDeadlineAtMs,
             });
-            const waitDurationMs = Math.max(0, Date.now() - waitStartedAtMs);
-            context.logGateway.info(
-              `node wake stage=wait1 node=${nodeId} req=${wakeReqId} ` +
-                `reconnected=${reconnected} timeoutMs=${waitTimeoutMs} durationMs=${waitDurationMs}`,
-            );
-          }
-          if (!(await continuePairingWork()) || respondIfInvokeExpired()) {
-            return;
-          }
-          nodeSession = resolveDispatchableNodeSession(
-            context.nodeRegistry.getForPairingGeneration(nodeId, generation.key),
-          );
-          if (!nodeSession && wake.available) {
-            const retryWake = await awaitNodeInvokeWithinDeadline(
-              () =>
-                maybeWakeNodeWithApns(nodeId, {
-                  force: true,
-                  cfg,
-                  lifecycle: wakeLifecycle,
-                  generation,
-                }),
-              invokeDeadlineAtMs,
-            );
-            if (retryWake === NODE_INVOKE_DEADLINE_EXPIRED) {
+            if (wake === ABSOLUTE_DEADLINE_EXPIRED) {
               respondIfInvokeExpired();
               return;
-            }
-            context.logGateway.info(
-              `node wake stage=wake2 node=${nodeId} req=${wakeReqId} force=true ` +
-                `available=${retryWake.available} throttled=${retryWake.throttled} ` +
-                `path=${retryWake.path} durationMs=${retryWake.durationMs} ` +
-                `apnsStatus=${retryWake.apnsStatus ?? -1} apnsReason=${retryWake.apnsReason ?? "-"}`,
-            );
-            if (respondIfInvokeExpired()) {
-              return;
-            }
-            if (retryWake.available) {
-              const waitStartedAtMs = Date.now();
-              const remainingTimeoutMs = resolveRemainingInvokeTimeoutMs();
-              const waitTimeoutMs =
-                invokeDeadlineAtMs === undefined
-                  ? NODE_WAKE_RECONNECT_RETRY_WAIT_MS
-                  : Math.min(NODE_WAKE_RECONNECT_RETRY_WAIT_MS, remainingTimeoutMs ?? 0);
-              const reconnected = await waitForNodeReconnect({
-                nodeId,
-                context,
-                timeoutMs: waitTimeoutMs,
-                lifecycle: wakeLifecycle,
-                pairingGeneration: generation.key,
-              });
-              const waitDurationMs = Math.max(0, Date.now() - waitStartedAtMs);
-              context.logGateway.info(
-                `node wake stage=wait2 node=${nodeId} req=${wakeReqId} ` +
-                  `reconnected=${reconnected} timeoutMs=${waitTimeoutMs} durationMs=${waitDurationMs}`,
-              );
             }
             if (!(await continuePairingWork()) || respondIfInvokeExpired()) {
               return;
@@ -310,13 +213,16 @@ export const nodeInvokeHandlers: GatewayRequestHandlers = {
             nodeSession = resolveDispatchableNodeSession(
               context.nodeRegistry.getForPairingGeneration(nodeId, generation.key),
             );
+            if (nodeSession || !wake.available) {
+              break;
+            }
           }
           if (!nodeSession) {
             if (respondIfInvokeExpired()) {
               return;
             }
             const totalDurationMs = Math.max(0, Date.now() - wakeFlowStartedAtMs);
-            const nudge = await awaitNodeInvokeWithinDeadline(
+            const nudge = await awaitWithinDeadline(
               () =>
                 maybeSendNodeWakeNudge(nodeId, {
                   cfg,
@@ -324,8 +230,9 @@ export const nodeInvokeHandlers: GatewayRequestHandlers = {
                   generation,
                 }),
               invokeDeadlineAtMs,
+              () => performance.now(),
             );
-            if (nudge === NODE_INVOKE_DEADLINE_EXPIRED) {
+            if (nudge === ABSOLUTE_DEADLINE_EXPIRED) {
               respondIfInvokeExpired();
               return;
             }
@@ -390,7 +297,7 @@ export const nodeInvokeHandlers: GatewayRequestHandlers = {
           }
         }
 
-        const forwardedParams = sanitizeNodeInvokeParamsForForwarding({
+        const forwardedParams = await sanitizeNodeInvokeParamsForForwarding({
           nodeId,
           command,
           rawParams: p.params,
@@ -432,7 +339,7 @@ export const nodeInvokeHandlers: GatewayRequestHandlers = {
             manager: context.execApprovalManager,
             authority: forwardedParams.approvalAuthority,
           });
-        const policyResult = await awaitNodeInvokeWithinDeadline(
+        const policyResult = await awaitWithinDeadline(
           () =>
             applyPluginNodeInvokePolicy({
               context,
@@ -448,6 +355,7 @@ export const nodeInvokeHandlers: GatewayRequestHandlers = {
                 threadId: p.turnSourceThreadId,
               },
               timeoutMs: p.timeoutMs,
+              deadlineAtMs: invokeDeadlineAtMs,
               signal: invocationLifecycle,
               resolveRemainingTimeoutMs: resolveRemainingInvokeTimeoutMs,
               onNodeCommandDispatched: () => {
@@ -462,8 +370,9 @@ export const nodeInvokeHandlers: GatewayRequestHandlers = {
               ...(nodeInvokeStream ? { nodeInvokeStream } : {}),
             }),
           invokeDeadlineAtMs,
+          () => performance.now(),
         );
-        if (policyResult === NODE_INVOKE_DEADLINE_EXPIRED) {
+        if (policyResult === ABSOLUTE_DEADLINE_EXPIRED) {
           respondIfInvokeExpired();
           return;
         }
@@ -525,16 +434,17 @@ export const nodeInvokeHandlers: GatewayRequestHandlers = {
           );
           return;
         }
+        const resolveDispatchAuthorization = (dispatchCfg: typeof cfg) =>
+          isNodeCommandAllowed({
+            command,
+            declaredCommands: dispatchSession.commands,
+            allowlist: resolveNodeCommandAllowlist(dispatchCfg, {
+              ...dispatchSession,
+              approvedCommands: dispatchSession.commands,
+            }),
+          });
         const dispatchCfg = context.getRuntimeConfig();
-        const dispatchAllowlist = resolveNodeCommandAllowlist(dispatchCfg, {
-          ...dispatchSession,
-          approvedCommands: dispatchSession.commands,
-        });
-        const dispatchAllowed = isNodeCommandAllowed({
-          command,
-          declaredCommands: dispatchSession.commands,
-          allowlist: dispatchAllowlist,
-        });
+        const dispatchAllowed = resolveDispatchAuthorization(dispatchCfg);
         if (!dispatchAllowed.ok) {
           respond(
             false,
@@ -574,13 +484,14 @@ export const nodeInvokeHandlers: GatewayRequestHandlers = {
           );
           return;
         }
-        const res = await context.nodeRegistry.invoke({
+        const res = await invokeNodeWithReadinessRetry(context.nodeRegistry, {
           nodeId,
           expectedConnId: nodeSession.connId,
           expectedPairingGeneration: generation.key,
           command,
           params: forwardedParams.params,
           timeoutMs: dispatchTimeoutMs,
+          deadlineAtMs: invokeDeadlineAtMs,
           signal: invocationLifecycle,
           idempotencyKey: p.idempotencyKey,
           ...(sessionKey ? { sessionKey } : {}),
@@ -627,12 +538,20 @@ export const nodeInvokeHandlers: GatewayRequestHandlers = {
               ttlMs: nodeInvokePolicy.pendingActionTtlMs,
               maxPerNode: nodeInvokePolicy.pendingActionMaxPerNode,
             });
-            const wake = await maybeWakeNodeWithApns(nodeId, {
-              cfg,
-              lifecycle: wakeLifecycle,
-              generation,
-            });
-            if (!(await continuePairingWork())) {
+            const wake = await awaitWithinDeadline(
+              () =>
+                maybeWakeNodeWithApns(nodeId, {
+                  cfg,
+                  lifecycle: wakeLifecycle,
+                  generation,
+                }),
+              invokeDeadlineAtMs,
+              () => performance.now(),
+            );
+            if (wake === ABSOLUTE_DEADLINE_EXPIRED || !(await continuePairingWork())) {
+              if (wake === ABSOLUTE_DEADLINE_EXPIRED) {
+                respondIfInvokeExpired();
+              }
               if (queued.created) {
                 removePendingNodeAction({
                   nodeId,

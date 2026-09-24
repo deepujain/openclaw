@@ -3,11 +3,12 @@ import { WORKBOARD_STATUSES, type WorkboardCard } from "@openclaw/workboard-cont
 import { formatErrorMessage } from "openclaw/plugin-sdk/error-runtime";
 import { parseStrictPositiveInteger } from "openclaw/plugin-sdk/number-runtime";
 import type { OpenClawPluginApi } from "../api.js";
+import { redactClaimToken } from "./card-redaction.js";
 import {
   dispatchAndStartWorkboardCards,
   type WorkboardDispatchStartOptions,
 } from "./dispatcher.js";
-import type { WorkboardStore } from "./store.js";
+import { WorkboardCardConflictError, type WorkboardStore } from "./store.js";
 import {
   resolveAgentWorkboardWorkspaceRuntime,
   resolveConfiguredWorkboardWorkspaceAccess,
@@ -19,12 +20,56 @@ export type GatewayMethodContext = Parameters<
   Parameters<OpenClawPluginApi["registerGatewayMethod"]>[1]
 >[0];
 type GatewayRespond = GatewayMethodContext["respond"];
+type WorkboardGatewayResultHandler = (context: GatewayMethodContext) => unknown;
+type WorkboardGatewayScope = NonNullable<
+  NonNullable<Parameters<OpenClawPluginApi["registerGatewayMethod"]>[2]>["scope"]
+>;
 
 export function respondError(respond: GatewayRespond, error: unknown) {
+  if (error instanceof WorkboardCardConflictError) {
+    respond(false, undefined, {
+      code: "workboard_conflict",
+      message: error.message,
+      details: {
+        type: "workboard_card_conflict",
+        card: redactClaimToken(error.current),
+      },
+    });
+    return;
+  }
   respond(false, undefined, {
     code: "workboard_error",
     message: formatErrorMessage(error),
   });
+}
+
+export function registerWorkboardResultMethods(
+  api: OpenClawPluginApi,
+  methods: ReadonlyArray<
+    readonly [method: string, scope: WorkboardGatewayScope, handler: WorkboardGatewayResultHandler]
+  >,
+): void {
+  for (const [method, scope, handler] of methods) {
+    api.registerGatewayMethod(
+      method,
+      async (context) => {
+        try {
+          context.respond(true, await handler(context));
+        } catch (error) {
+          respondError(context.respond, error);
+        }
+      },
+      { scope },
+    );
+  }
+}
+
+export function readExpectedUpdatedAt(params: Record<string, unknown>): number | undefined {
+  const value = params.expectedUpdatedAt;
+  if (value !== undefined && (typeof value !== "number" || !Number.isFinite(value))) {
+    throw new Error("expectedUpdatedAt must be a finite number.");
+  }
+  return value;
 }
 
 export function readId(params: Record<string, unknown>): string {

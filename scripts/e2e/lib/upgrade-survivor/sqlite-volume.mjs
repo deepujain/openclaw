@@ -1,6 +1,14 @@
 import fs from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import {
+  readSqliteTranscriptPayload,
+  sqliteTranscriptPayloadColumns,
+} from "../../../lib/sqlite-transcript-payload.mjs";
+import {
+  assertUpgradeVolumeSharedState,
+  seedUpgradeVolumeSharedState,
+} from "./sqlite-volume-shared-state.mjs";
 
 const VOLUME_AGENT_IDS = ["main", "ops"];
 const VOLUME_CRON_CREATED_AT_MS = Date.parse("2026-07-01T10:00:00.000Z");
@@ -56,7 +64,7 @@ function readPositiveIntegerEnv(name, fallback) {
   return value;
 }
 
-function getVolumeSpec() {
+export function getVolumeSpec() {
   return {
     sessions: readPositiveIntegerEnv("OPENCLAW_UPGRADE_SURVIVOR_VOLUME_SESSIONS", 4800),
     eventsPerSession: readPositiveIntegerEnv(
@@ -67,7 +75,7 @@ function getVolumeSpec() {
   };
 }
 
-function getVolumeSessionFixture(index) {
+export function getVolumeSessionFixture(index) {
   const agentId = VOLUME_AGENT_IDS[index % VOLUME_AGENT_IDS.length];
   const paddedIndex = String(index).padStart(6, "0");
   const sessionId =
@@ -104,7 +112,7 @@ function getVolumeSessionsDir(stateDir, agentId) {
   return path.join(stateDir, "agents", agentId, "sessions");
 }
 
-function getVolumeTranscriptEvent(index, sessionId, sequence) {
+export function getVolumeTranscriptEvent(index, sessionId, sequence) {
   if (sequence === 0) {
     return {
       type: "session",
@@ -267,6 +275,7 @@ function seedUpgradeVolumeCronJobs(stateDir) {
 export function seedUpgradeVolume(stateDir) {
   seedUpgradeVolumeSessions(stateDir);
   seedUpgradeVolumeCronJobs(stateDir);
+  seedUpgradeVolumeSharedState(stateDir);
 }
 
 function assertHealthySqlite(databasePath, assertContents) {
@@ -302,6 +311,7 @@ function assertHealthySqlite(databasePath, assertContents) {
 }
 
 export function assertUpgradeVolumeMigrated(stateDir, stage) {
+  assertUpgradeVolumeSharedState(stateDir, stage);
   const spec = getVolumeSpec();
   const fixtures = getVolumeSessionFixtures(spec);
   const legacyCronPath = path.join(stateDir, "cron", "jobs.json");
@@ -358,7 +368,7 @@ export function assertUpgradeVolumeMigrated(stateDir, stage) {
         .all();
       const eventRows = db
         .prepare(
-          "SELECT session_id, seq, event_json FROM transcript_events WHERE session_id LIKE 'volume-%'",
+          `SELECT session_id, seq, ${sqliteTranscriptPayloadColumns(db)} FROM transcript_events WHERE session_id LIKE 'volume-%'`,
         )
         .all();
       const sessionsByKey = new Map(sessionRows.map((row) => [row.session_key, row]));
@@ -410,7 +420,7 @@ export function assertUpgradeVolumeMigrated(stateDir, stage) {
           const event = eventsByIdAndSequence.get(`${fixture.sessionId}\0${sequence}`);
           const expected = getVolumeTranscriptEvent(fixture.index, fixture.sessionId, sequence);
           assertJsonEqual(
-            JSON.parse(event?.event_json ?? "null"),
+            event ? JSON.parse(readSqliteTranscriptPayload(event)) : null,
             expected,
             `volume transcript event changed: ${fixture.index}:${sequence}`,
           );
@@ -427,9 +437,8 @@ export function assertUpgradeVolumeMigrated(stateDir, stage) {
   assertHealthySqlite(stateDatabasePath, (db) => {
     const rows = db
       .prepare(
-        `SELECT job_id, job_json, state_json, enabled, schedule_kind, every_ms, anchor_ms,
-                payload_kind, payload_message, delivery_mode, next_run_at_ms, running_at_ms,
-                last_run_status, last_error, updated_at, runtime_updated_at_ms
+        `SELECT job_id, job_json, state_json, enabled, payload_kind, updated_at,
+                runtime_updated_at_ms
          FROM cron_jobs
          WHERE job_id LIKE 'volume-cron-%'`,
       )
@@ -468,26 +477,23 @@ export function assertUpgradeVolumeMigrated(stateDir, stage) {
         row?.enabled === (expected.enabled ? 1 : 0),
         `volume cron enabled column changed: ${index}`,
       );
-      assert(row?.schedule_kind === "every", `volume cron schedule column changed: ${index}`);
-      assert(row?.every_ms === expected.schedule.everyMs, `volume cron interval changed: ${index}`);
-      assert(row?.anchor_ms === expected.schedule.anchorMs, `volume cron anchor changed: ${index}`);
       assert(row?.payload_kind === "agentTurn", `volume cron payload kind changed: ${index}`);
       assert(
-        row?.payload_message === expected.payload.message,
-        `volume cron payload changed: ${index}`,
-      );
-      assert(row?.delivery_mode === "none", `volume cron delivery mode changed: ${index}`);
-      assert(
-        row?.next_run_at_ms === (expected.enabled ? expected.state.nextRunAtMs : null),
+        (actualState?.nextRunAtMs ?? null) ===
+          (expected.enabled ? expected.state.nextRunAtMs : null),
         `volume cron next-run state changed: ${index}`,
       );
-      assert(row?.running_at_ms === null, `volume cron running state changed: ${index}`);
       assert(
-        row?.last_run_status === (expected.state.lastStatus ?? null),
+        (actualState?.runningAtMs ?? null) === null,
+        `volume cron running state changed: ${index}`,
+      );
+      assert(
+        (actualState?.lastRunStatus ?? actualState?.lastStatus ?? null) ===
+          (expected.state.lastStatus ?? null),
         `volume cron status state changed: ${index}`,
       );
       assert(
-        row?.last_error === (expected.state.lastError ?? null),
+        (actualState?.lastError ?? null) === (expected.state.lastError ?? null),
         `volume cron error state changed: ${index}`,
       );
     }
@@ -549,8 +555,8 @@ export function assertUpgradeVolumeMigrated(stateDir, stage) {
       `unreferenced volume transcript was not archived: ${orphan}`,
     );
   }
-  for (const index of [0, 1, 2]) {
-    const fixture = getVolumeSessionFixture(index);
+  for (const fixture of fixtures.slice(0, 3)) {
+    const { index } = fixture;
     const archived = archivedTranscripts.get(fixture.agentId);
     const entry = archived?.transcriptsByName.get(`${fixture.sessionId}.jsonl`);
     assert(archived && entry, `archived volume transcript sample missing: ${index}`);

@@ -1,6 +1,7 @@
 // Discord tests cover gateway plugin plugin behavior.
 import { EventEmitter } from "node:events";
 import { beforeAll, describe, expect, it, vi } from "vitest";
+import { createRuntimeSpies } from "../../../test-support/runtime-spies.js";
 import { DISCORD_GATEWAY_TRANSPORT_ACTIVITY_EVENT } from "./gateway-handle.js";
 import {
   fetchDiscordGatewayInfoWithTimeout,
@@ -18,6 +19,7 @@ const { GatewayIntents, GatewayPlugin } = vi.hoisted(() => {
     GuildPresences: 1 << 6,
     GuildMembers: 1 << 7,
     GuildVoiceStates: 1 << 8,
+    GuildExpressions: 1 << 9,
   } as const;
 
   class TestEmitter {
@@ -93,11 +95,7 @@ describe("createDiscordGatewayPlugin", () => {
   function createPlugin(
     testing?: NonNullable<Parameters<typeof createDiscordGatewayPlugin>[0]["testing"]>,
     discordConfig: Parameters<typeof createDiscordGatewayPlugin>[0]["discordConfig"] = {},
-    runtime: Parameters<typeof createDiscordGatewayPlugin>[0]["runtime"] = {
-      log: vi.fn(),
-      error: vi.fn(),
-      exit: vi.fn(),
-    },
+    runtime: Parameters<typeof createDiscordGatewayPlugin>[0]["runtime"] = createRuntimeSpies(),
   ) {
     return createDiscordGatewayPlugin({
       discordConfig,
@@ -106,8 +104,11 @@ describe("createDiscordGatewayPlugin", () => {
     });
   }
 
-  it("omits GuildVoiceStates by default for text-only Discord configs", () => {
-    expect(resolveDiscordGatewayIntents() & GatewayIntents.GuildVoiceStates).toBe(0);
+  it("subscribes to guild emoji changes without enabling voice by default", () => {
+    const intents = resolveDiscordGatewayIntents();
+
+    expect(intents & GatewayIntents.GuildExpressions).toBe(GatewayIntents.GuildExpressions);
+    expect(intents & GatewayIntents.GuildVoiceStates).toBe(0);
   });
 
   it("includes GuildVoiceStates when voice is enabled", () => {
@@ -255,6 +256,7 @@ describe("createDiscordGatewayPlugin", () => {
       autoInteractions: false,
       intents:
         GatewayIntents.Guilds |
+        GatewayIntents.GuildExpressions |
         GatewayIntents.GuildMessages |
         GatewayIntents.MessageContent |
         GatewayIntents.DirectMessages |
@@ -325,11 +327,7 @@ describe("createDiscordGatewayPlugin", () => {
 
   it("logs Discord gateway websocket error and abnormal close details", () => {
     const socket = new EventEmitter() as EventEmitter & { binaryType?: string };
-    const runtime = {
-      log: vi.fn(),
-      error: vi.fn(),
-      exit: vi.fn(),
-    };
+    const runtime = createRuntimeSpies();
     const plugin = createPlugin(
       {
         webSocketCtor: function WebSocketCtor() {
@@ -363,11 +361,7 @@ describe("createDiscordGatewayPlugin", () => {
 
   it("keeps gateway close reason logs UTF-16 safe", () => {
     const socket = new EventEmitter() as EventEmitter & { binaryType?: string };
-    const runtime = {
-      log: vi.fn(),
-      error: vi.fn(),
-      exit: vi.fn(),
-    };
+    const runtime = createRuntimeSpies();
     const plugin = createPlugin(
       {
         webSocketCtor: function WebSocketCtor() {

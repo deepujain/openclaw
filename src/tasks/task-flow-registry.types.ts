@@ -64,3 +64,37 @@ export type TaskFlowRecord = {
   updatedAt: number;
   endedAt?: number;
 };
+
+// Managed `blocked` flows remain resumable until endedAt is set; mirrored
+// `blocked` flows carry endedAt because they project a terminal task outcome.
+export function isTerminalTaskFlow(flow: Pick<TaskFlowRecord, "status" | "endedAt">): boolean {
+  return (
+    flow.status === "succeeded" ||
+    (flow.status === "blocked" && flow.endedAt != null) ||
+    flow.status === "failed" ||
+    flow.status === "cancelled" ||
+    flow.status === "lost"
+  );
+}
+
+export type TaskFlowUpdateResult =
+  | {
+      applied: true;
+      flow: TaskFlowRecord;
+    }
+  | {
+      applied: false;
+      reason: "not_found" | "revision_conflict" | "persist_failed";
+      current?: TaskFlowRecord;
+    };
+
+export type TaskFlowSyncResult =
+  | {
+      ok: true;
+      flow: TaskFlowRecord | null;
+    }
+  | {
+      ok: false;
+      reason: "persist_failed";
+      current: TaskFlowRecord;
+    };

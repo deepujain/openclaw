@@ -18,7 +18,7 @@ import {
   INTERNAL_MESSAGE_CHANNEL,
   isDeliverableMessageChannel,
 } from "../../utils/message-channel.js";
-import type { AgentRunSessionTarget } from "../run-session-target.js";
+import type { AgentRunSessionTarget } from "../run-session-target.types.js";
 import type { AgentCommandOpts } from "./types.js";
 
 export function clearPendingFinalDelivery(entry: SessionEntry, updatedAt: number): SessionEntry {
@@ -113,30 +113,6 @@ export async function prepareCurrentRunDelivery(params: {
     threadId,
   });
   return context ? { context, targetMode } : undefined;
-}
-
-export function createAgentCommandSessionWorkingCopy(params: {
-  sessionKey?: string;
-  sessionEntry?: SessionEntry;
-  sessionStore?: Record<string, SessionEntry>;
-}): {
-  sessionEntry?: SessionEntry;
-  sessionStore?: Record<string, SessionEntry>;
-} {
-  const result: {
-    sessionEntry?: SessionEntry;
-    sessionStore?: Record<string, SessionEntry>;
-  } = {};
-  if (params.sessionEntry) {
-    result.sessionEntry = { ...params.sessionEntry };
-  }
-  if (params.sessionStore || params.sessionKey) {
-    result.sessionStore = {};
-  }
-  if (params.sessionKey && result.sessionEntry && result.sessionStore) {
-    result.sessionStore[params.sessionKey] = result.sessionEntry;
-  }
-  return result;
 }
 
 export function resolveInternalSessionEffectsSource(params: {

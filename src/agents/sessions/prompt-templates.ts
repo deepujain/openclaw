@@ -1,17 +1,19 @@
-import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
-import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
+import { existsSync, readFileSync, statSync } from "node:fs";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { truncateUtf16Safe } from "@openclaw/normalization-core/utf16-slice";
 import {
   parseCommandArgs,
   substituteArgs,
 } from "../../../packages/agent-core/src/harness/prompt-template-arguments.js";
+import { walkDirectorySync } from "../../infra/fs-safe.js";
 /**
  * Prompt template discovery and loading.
  *
  * Reads markdown prompt templates from user, project, and package sources with frontmatter metadata.
  */
+import { isPathInside } from "../../infra/path-guards.js";
 import { expandTildePath } from "../../shared/tilde-path.js";
-import { CONFIG_DIR_NAME } from "../config.js";
+import { CONFIG_DIR_NAME } from "../package-metadata.js";
 import { parsePromptFrontmatter } from "../utils/frontmatter.js";
 import { createSyntheticSourceInfo, type SourceInfo } from "./source-info.js";
 
@@ -69,33 +71,17 @@ function loadTemplatesFromDir(
 ): PromptTemplate[] {
   const templates: PromptTemplate[] = [];
 
-  if (!existsSync(dir)) {
-    return templates;
-  }
-
   try {
-    const entries = readdirSync(dir, { withFileTypes: true });
-
+    const { entries } = walkDirectorySync(dir, {
+      maxDepth: 1,
+      symlinks: "follow",
+      include: (entry) => entry.kind === "file" && entry.name.endsWith(".md"),
+    });
     for (const entry of entries) {
       const fullPath = join(dir, entry.name);
-
-      // For symlinks, check if they point to a file
-      let isFile = entry.isFile();
-      if (entry.isSymbolicLink()) {
-        try {
-          const stats = statSync(fullPath);
-          isFile = stats.isFile();
-        } catch {
-          // Broken symlink, skip it
-          continue;
-        }
-      }
-
-      if (isFile && entry.name.endsWith(".md")) {
-        const template = loadTemplateFromFile(fullPath, getSourceInfo(fullPath));
-        if (template) {
-          templates.push(template);
-        }
+      const template = loadTemplateFromFile(fullPath, getSourceInfo(fullPath));
+      if (template) {
+        templates.push(template);
       }
     }
   } catch {
@@ -138,24 +124,15 @@ export function loadPromptTemplates(options: LoadPromptTemplatesOptions): Prompt
   const globalPromptsDir = options.agentDir ? join(options.agentDir, "prompts") : resolvedAgentDir;
   const projectPromptsDir = resolve(resolvedCwd, CONFIG_DIR_NAME, "prompts");
 
-  const isUnderPath = (target: string, root: string): boolean => {
-    const normalizedRoot = resolve(root);
-    if (target === normalizedRoot) {
-      return true;
-    }
-    const prefix = normalizedRoot.endsWith(sep) ? normalizedRoot : `${normalizedRoot}${sep}`;
-    return target.startsWith(prefix);
-  };
-
   const getSourceInfo = (resolvedPath: string): SourceInfo => {
-    if (isUnderPath(resolvedPath, globalPromptsDir)) {
+    if (isPathInside(globalPromptsDir, resolvedPath)) {
       return createSyntheticSourceInfo(resolvedPath, {
         source: "local",
         scope: "user",
         baseDir: globalPromptsDir,
       });
     }
-    if (isUnderPath(resolvedPath, projectPromptsDir)) {
+    if (isPathInside(projectPromptsDir, resolvedPath)) {
       return createSyntheticSourceInfo(resolvedPath, {
         source: "local",
         scope: "project",

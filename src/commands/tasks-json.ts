@@ -1,5 +1,5 @@
-// JSON-only task command helpers.
-// These paths avoid maintenance reconciliation so short-lived JSON CLI processes stay read-only and exit cleanly.
+// JSON-only task commands use read-only registry snapshots without maintenance reconciliation.
+// This avoids broader task runtimes so short-lived CLI processes exit cleanly.
 
 import { parseCliEnumFilter } from "../cli/enum-filter.js";
 import type { RuntimeEnv } from "../runtime.js";
@@ -7,7 +7,11 @@ import { writeRuntimeJson } from "../runtime.js";
 import { listTaskRecords } from "../tasks/runtime-internal.js";
 import { listTaskFlowAuditFindings } from "../tasks/task-flow-registry.audit.js";
 import { listTaskAuditFindings } from "../tasks/task-registry.audit.js";
-import { TASK_RUNTIMES, TASK_STATUSES, type TaskRecord } from "../tasks/task-registry.types.js";
+import {
+  matchesTaskStatusFilter,
+  TASK_RUNTIMES,
+  TASK_STATUS_FILTERS,
+} from "../tasks/task-registry.types.js";
 import {
   TASK_SYSTEM_AUDIT_CODES,
   TASK_SYSTEM_AUDIT_SEVERITIES,
@@ -18,12 +22,6 @@ import {
   buildTaskSystemAuditJsonPayload,
   buildTaskSystemAuditFindings,
 } from "./tasks-audit-system.js";
-
-function listTaskJsonRecords(): TaskRecord[] {
-  // Keep the routed JSON path a read-only store snapshot; maintenance reconciliation imports
-  // broader task runtimes and can keep JSON-only CLI processes alive.
-  return listTaskRecords();
-}
 
 type TasksListJsonArgs = {
   json?: boolean;
@@ -42,7 +40,7 @@ function toSystemAuditFindings(params: {
   severityFilter?: TaskSystemAuditSeverity;
   codeFilter?: TaskSystemAuditCode;
 }) {
-  const tasks = listTaskJsonRecords();
+  const tasks = listTaskRecords();
   const taskFindings = listTaskAuditFindings({ tasks });
   const flowFindings = listTaskFlowAuditFindings();
   const result = buildTaskSystemAuditFindings({
@@ -56,12 +54,12 @@ function toSystemAuditFindings(params: {
 
 function buildTasksListJsonPayload(opts: TasksListJsonArgs) {
   const runtimeFilter = parseCliEnumFilter(opts.runtime, "--runtime", TASK_RUNTIMES);
-  const statusFilter = parseCliEnumFilter(opts.status, "--status", TASK_STATUSES);
-  const tasks = listTaskJsonRecords().filter((task) => {
+  const statusFilter = parseCliEnumFilter(opts.status, "--status", TASK_STATUS_FILTERS);
+  const tasks = listTaskRecords((task) => {
     if (runtimeFilter && task.runtime !== runtimeFilter) {
       return false;
     }
-    if (statusFilter && task.status !== statusFilter) {
+    if (statusFilter && !matchesTaskStatusFilter(task, statusFilter)) {
       return false;
     }
     return true;

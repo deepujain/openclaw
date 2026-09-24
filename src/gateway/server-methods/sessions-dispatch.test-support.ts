@@ -4,6 +4,7 @@ import {
   GATEWAY_CLIENT_IDS,
   GATEWAY_CLIENT_MODES,
 } from "../../../packages/gateway-protocol/src/client-info.js";
+import type { SessionsReclaimParams } from "../../../packages/gateway-protocol/src/schema/session-placement.js";
 import type { SessionEntry } from "../../config/sessions/types.js";
 import { NODE_WORKER_SUPERVISOR_PROTOCOL_FEATURE } from "../../infra/node-runner-inventory.js";
 import type { NodeWorkerSupervisorNodeProof } from "../node-registry-private.js";
@@ -127,6 +128,10 @@ export function makeDispatchTestContext(
   overrides: Partial<GatewayRequestContext> = {},
 ): GatewayRequestContext {
   const workerEnvironmentService = overrides.workerEnvironmentService ?? {
+    get: () => undefined,
+    readMachineShape: () => undefined,
+    machineShapeVersion: () => 0,
+    inventoryVersion: () => 0,
     supportsExecutionMode: () => true,
   };
   if (!overrides.workerEnvironmentService) {
@@ -140,13 +145,18 @@ export function makeDispatchTestContext(
         clientId: GATEWAY_CLIENT_IDS.NODE_HOST,
         clientMode: GATEWAY_CLIENT_MODES.NODE,
         protocolFeature: NODE_WORKER_SUPERVISOR_PROTOCOL_FEATURE,
-        workerHost: { enabled: true, capacity: { total: 2, available: 2 } },
+        workerHost: {
+          enabled: true,
+          capacity: { total: 2, available: 2 },
+          capturedExecPolicy: true,
+        },
         commands: observed?.commands ?? ["system.run", "codex.exec-server.stdio.v1"],
       };
       return { available: true, node };
     });
   }
   return {
+    getSessionEventSubscriberConnIds: () => new Set(),
     getRuntimeConfig: () => ({
       cloudWorkers: {
         profiles: {
@@ -154,6 +164,30 @@ export function makeDispatchTestContext(
         },
       },
     }),
+    // Dispatch replies project runner state through the canonical fenced
+    // reader; the default stub mirrors the placement's bound device as live.
+    workerPlacementRunnerAvailabilityReader: {
+      read: (placement: { state?: string; environmentId?: string | null }) => {
+        if (placement.state !== "active" && placement.state !== "draining") {
+          return undefined;
+        }
+        const environmentId =
+          typeof placement.environmentId === "string" ? placement.environmentId : "";
+        const service = workerEnvironmentService as {
+          get?: (environmentId: string) => { nodeDeviceId?: string } | undefined;
+        };
+        const deviceId =
+          service.get?.(environmentId)?.nodeDeviceId ??
+          (environmentId.startsWith("device-environment-")
+            ? environmentId.slice("device-environment-".length)
+            : undefined);
+        return {
+          kind: "device",
+          status: "available",
+          ...(deviceId ? { deviceId } : {}),
+        };
+      },
+    },
     ...overrides,
     workerEnvironmentService: workerEnvironmentService as never,
   } as unknown as GatewayRequestContext;
@@ -161,13 +195,21 @@ export function makeDispatchTestContext(
 
 export async function invokeSessionDispatch(
   context: GatewayRequestContext,
-  target: { profileId?: string; machineClass?: string; deviceId?: string } = {
+  target: {
+    profileId?: string;
+    machineClass?: string;
+    os?: string;
+    deviceId?: string;
+    autoDevice?: true;
+  } = {
     profileId: "test",
   },
   sessionMutationAuthorization?: SessionMutationAuthorization,
+  signal?: AbortSignal,
 ) {
   const respond = vi.fn() as unknown as RespondFn;
   await getSessionDispatchHandler()({
+    signal,
     req: { id: "dispatch-request" } as never,
     params: { key: dispatchTestSessionKey, ...target },
     respond,
@@ -186,7 +228,7 @@ export async function invokeSessionMove(
     abandonSource?: true;
     target:
       | { kind: "gateway" }
-      | { kind: "profile"; profileId: string; machineClass?: string }
+      | { kind: "profile"; profileId: string; machineClass?: string; os?: string }
       | { kind: "device"; deviceId: string };
   },
   sessionMutationAuthorization?: SessionMutationAuthorization,
@@ -210,6 +252,7 @@ export async function invokeSessionMove(
 export async function invokeSessionReclaim(
   context: GatewayRequestContext,
   sessionMutationAuthorization?: SessionMutationAuthorization,
+  params: Omit<SessionsReclaimParams, "key"> = {},
 ) {
   const respond = vi.fn() as unknown as RespondFn;
   await expectDefined(
@@ -217,7 +260,7 @@ export async function invokeSessionReclaim(
     'sessionDispatchHandlers["sessions.reclaim"] test invariant',
   )({
     req: { id: "reclaim-request" } as never,
-    params: { key: dispatchTestSessionKey },
+    params: { key: dispatchTestSessionKey, ...params },
     respond,
     context,
     client: null,

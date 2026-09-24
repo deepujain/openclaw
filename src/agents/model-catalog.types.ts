@@ -5,13 +5,22 @@
  */
 import type { ModelCatalogStatus } from "@openclaw/model-catalog-core/model-catalog-types";
 import type { ModelApi, ModelCompatConfig, ModelMediaInputConfig } from "../config/types.models.js";
+import type { ThinkingLevelMap } from "../llm/types.js";
 import type { ProviderCatalogOutcome } from "../plugins/provider-catalog-outcome.js";
 
 /** Input modalities a catalog entry can advertise. */
 export type ModelInputType = "text" | "image" | "audio" | "video" | "document";
 
+type ModelContextWindowOption = {
+  id: string;
+  label: string;
+  contextWindow: number;
+};
+
 /** Normalized model metadata exposed by the agent model catalog. */
 export type ModelCatalogEntry = {
+  /** Native catalog owner, not a physical provider route or transferable readiness fact. */
+  nativeRuntime?: string;
   id: string;
   name: string;
   provider: string;
@@ -22,12 +31,16 @@ export type ModelCatalogEntry = {
   /** Private transport provenance for route matching; never project directly to clients. */
   baseUrl?: string;
   contextWindow?: number;
+  contextWindows?: ModelContextWindowOption[];
+  contextWindowDefault?: string;
   contextTokens?: number;
   reasoning?: boolean;
   /** Config-authored reasoning override; internal provenance, never project to clients. */
   configuredReasoning?: boolean;
   /** Concrete runtime owner of thinking policy; internal and never project to clients. */
   thinkingPolicyProvider?: string;
+  /** Provider-owned effort support for this exact physical model route. */
+  thinkingLevelMap?: ThinkingLevelMap;
   input?: ModelInputType[];
   params?: Record<string, unknown>;
   compat?: ModelCompatConfig;
@@ -44,6 +57,14 @@ export type ModelCatalogSnapshot = {
   routeVariants: ModelCatalogEntry[];
   /** Provider-owned outcome of each live catalog request in this generation. */
   providerOutcomes?: readonly ProviderCatalogOutcome[];
+  /** Native discovery facts belong to their harness, independently of API-provider auth. */
+  nativeProviderOutcomes?: Readonly<Record<string, readonly ProviderCatalogOutcome[]>>;
+  /** Untagged harness observations, before API donor enrichment; each runtime owns its scope. */
+  nativeHostRows?: Readonly<Record<string, readonly ModelCatalogEntry[]>>;
+  /** The current acquisition failed while this published inventory remained available. */
+  refreshFailed?: boolean;
+  /** Provider discovery is in progress; existing rows remain usable. */
+  pendingProviders?: readonly string[];
   /** Static provider-hook rows captured alongside the full lifecycle generation. */
   staticEntries?: ModelCatalogEntry[];
   /**

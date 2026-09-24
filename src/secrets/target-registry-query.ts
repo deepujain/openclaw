@@ -1,6 +1,7 @@
 /** Query helpers for discovering secret target registry entries. */
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import type { PluginManifestRegistry } from "../plugins/manifest-registry.js";
+import { formatConcreteConfigPath, type ConcreteConfigPathSegment } from "../shared/dot-path.js";
 import { loadChannelSecretContractApi } from "./channel-contract-api.js";
 import { getPath } from "./path-utils.js";
 import {
@@ -22,27 +23,10 @@ import type {
   SecretTargetRegistryEntry,
 } from "./target-registry-types.js";
 
-let compiledSecretTargetRegistryState: {
-  authProfilesCompiledSecretTargets: CompiledTargetRegistryEntry[];
-  authProfilesTargetsById: Map<string, CompiledTargetRegistryEntry[]>;
-  compiledSecretTargetRegistry: CompiledTargetRegistryEntry[];
-  knownTargetIds: Set<string>;
-  openClawCompiledSecretTargets: CompiledTargetRegistryEntry[];
-  openClawTargetsById: Map<string, CompiledTargetRegistryEntry[]>;
-  targetsByType: Map<string, CompiledTargetRegistryEntry[]>;
-} | null = null;
+type CompiledSecretTargetRegistryState = ReturnType<typeof compileSecretTargetRegistryState>;
 
-let compiledCoreOpenClawTargetState: {
-  knownTargetIds: Set<string>;
-  openClawCompiledSecretTargets: CompiledTargetRegistryEntry[];
-  openClawTargetsById: Map<string, CompiledTargetRegistryEntry[]>;
-  planTargetsByType: Map<string, CompiledTargetRegistryEntry[]>;
-} | null = null;
-
-let compiledCoreAuthProfileTargetState: {
-  entries: CompiledTargetRegistryEntry[];
-  entriesById: Map<string, CompiledTargetRegistryEntry[]>;
-} | null = null;
+let compiledSecretTargetRegistryState: CompiledSecretTargetRegistryState | null = null;
+let compiledCoreSecretTargetRegistryState: CompiledSecretTargetRegistryState | null = null;
 
 // Channel contract entries are process-stable; plugin install/reload is the owner of freshness.
 const compiledChannelOpenClawTargets = new Map<string, CompiledTargetRegistryEntry[] | null>();
@@ -122,35 +106,11 @@ function getConfiguredSecretTargetRegistryState(
   );
 }
 
-function getCompiledCoreOpenClawTargetState() {
-  if (compiledCoreOpenClawTargetState) {
-    return compiledCoreOpenClawTargetState;
-  }
-  const compiledCoreSecretTargets = getCoreSecretTargetRegistry().map(compileTargetRegistryEntry);
-  const openClawCompiledSecretTargets = compiledCoreSecretTargets.filter(
-    (entry) => entry.configFile === "openclaw.json",
+function getCompiledCoreSecretTargetRegistryState() {
+  compiledCoreSecretTargetRegistryState ??= compileSecretTargetRegistryState(
+    getCoreSecretTargetRegistry(),
   );
-  compiledCoreOpenClawTargetState = {
-    knownTargetIds: new Set(compiledCoreSecretTargets.map((entry) => entry.id)),
-    openClawCompiledSecretTargets,
-    openClawTargetsById: buildConfigTargetIdIndex(openClawCompiledSecretTargets),
-    planTargetsByType: buildTargetTypeIndex(compiledCoreSecretTargets),
-  };
-  return compiledCoreOpenClawTargetState;
-}
-
-function getCompiledCoreAuthProfileTargetState() {
-  if (compiledCoreAuthProfileTargetState) {
-    return compiledCoreAuthProfileTargetState;
-  }
-  const entries = getCoreSecretTargetRegistry()
-    .filter((entry) => entry.configFile === "auth-profile-store")
-    .map(compileTargetRegistryEntry);
-  compiledCoreAuthProfileTargetState = {
-    entries,
-    entriesById: buildConfigTargetIdIndex(entries),
-  };
-  return compiledCoreAuthProfileTargetState;
+  return compiledCoreSecretTargetRegistryState;
 }
 
 function getCompiledChannelOpenClawTargets(
@@ -241,17 +201,19 @@ function discoverSecretTargetsFromEntries(
   source: unknown,
   discoveryEntries: CompiledTargetRegistryEntry[],
 ): DiscoveredConfigSecretTarget[] {
+  const formatDiscoveredPath = (segments: readonly ConcreteConfigPathSegment[]) =>
+    formatConcreteConfigPath(segments, source);
   const out: DiscoveredConfigSecretTarget[] = [];
   const seen = new Set<string>();
 
   for (const entry of discoveryEntries) {
     const expanded = expandPathTokens(source, entry.pathTokens);
     for (const match of expanded) {
-      const resolved = toResolvedPlanTarget(entry, match.segments, match.captures);
+      const resolved = toResolvedPlanTarget(entry, match.captures);
       if (!resolved) {
         continue;
       }
-      const key = `${entry.id}:${resolved.pathSegments.join(".")}`;
+      const key = JSON.stringify([entry.id, ...resolved.pathTokens]);
       if (seen.has(key)) {
         continue;
       }
@@ -261,12 +223,12 @@ function discoverSecretTargetsFromEntries(
         : undefined;
       out.push({
         entry,
-        path: resolved.pathSegments.join("."),
+        path: formatDiscoveredPath(match.segments),
         pathSegments: resolved.pathSegments,
         ...(resolved.refPathSegments
           ? {
               refPathSegments: resolved.refPathSegments,
-              refPath: resolved.refPathSegments.join("."),
+              refPath: formatDiscoveredPath(resolved.refPathTokens ?? resolved.refPathSegments),
             }
           : {}),
         value: match.value,
@@ -282,9 +244,13 @@ function discoverSecretTargetsFromEntries(
 
 function toResolvedPlanTarget(
   entry: CompiledTargetRegistryEntry,
-  pathSegments: string[],
-  captures: string[],
+  captures: ConcreteConfigPathSegment[],
 ): ResolvedPlanTarget | null {
+  const pathTokens = materializePathTokens(entry.pathTokens, captures);
+  if (!pathTokens) {
+    return null;
+  }
+  const pathSegments = pathTokens.map(String);
   const providerId =
     entry.providerIdPathSegmentIndex !== undefined
       ? pathSegments[entry.providerIdPathSegmentIndex]
@@ -293,16 +259,17 @@ function toResolvedPlanTarget(
     entry.accountIdPathSegmentIndex !== undefined
       ? pathSegments[entry.accountIdPathSegmentIndex]
       : undefined;
-  const refPathSegments = entry.refPathTokens
+  const refPathTokens = entry.refPathTokens
     ? materializePathTokens(entry.refPathTokens, captures)
     : undefined;
-  if (entry.refPathTokens && !refPathSegments) {
+  if (entry.refPathTokens && !refPathTokens) {
     return null;
   }
   return {
     entry,
     pathSegments,
-    ...(refPathSegments ? { refPathSegments } : {}),
+    pathTokens,
+    ...(refPathTokens ? { refPathTokens, refPathSegments: refPathTokens.map(String) } : {}),
     ...(providerId ? { providerId } : {}),
     ...(accountId ? { accountId } : {}),
   };
@@ -318,6 +285,7 @@ export function listSecretTargetRegistryEntries(): SecretTargetRegistryEntry[] {
       { id: entry.id, targetType: entry.targetType },
       entry.targetTypeAliases ? { targetTypeAliases: [...entry.targetTypeAliases] } : {},
       { configFile: entry.configFile, pathPattern: entry.pathPattern },
+      entry.pathPatternSegments ? { pathPatternSegments: [...entry.pathPatternSegments] } : {},
       entry.refPathPattern ? { refPathPattern: entry.refPathPattern } : {},
       {
         secretShape: entry.secretShape,
@@ -350,7 +318,8 @@ export function isKnownSecretTargetId(value: unknown): value is string {
 /** Checks the static core registry without materializing plugin/channel contracts. */
 export function isKnownCoreSecretTargetId(value: unknown): value is string {
   return (
-    typeof value === "string" && getCompiledCoreOpenClawTargetState().knownTargetIds.has(value)
+    typeof value === "string" &&
+    getCompiledCoreSecretTargetRegistryState().knownTargetIds.has(value)
   );
 }
 
@@ -360,10 +329,12 @@ export function isKnownCoreSecretTargetId(value: unknown): value is string {
 export function resolvePlanTargetAgainstRegistry(candidate: {
   type: string;
   pathSegments: string[];
+  pathTokens?: readonly ConcreteConfigPathSegment[];
+  allowLegacyArrayString?: boolean;
   providerId?: string;
   accountId?: string;
 }): ResolvedPlanTarget | null {
-  const coreEntries = getCompiledCoreOpenClawTargetState().planTargetsByType.get(candidate.type);
+  const coreEntries = getCompiledCoreSecretTargetRegistryState().targetsByType.get(candidate.type);
   if (coreEntries) {
     return resolvePlanTargetAgainstEntries(candidate, coreEntries);
   }
@@ -385,8 +356,9 @@ export function resolvePlanTargetAgainstRegistry(candidate: {
 
 function resolvePlanTargetAgainstEntries(
   candidate: {
-    type: string;
     pathSegments: string[];
+    pathTokens?: readonly ConcreteConfigPathSegment[];
+    allowLegacyArrayString?: boolean;
     providerId?: string;
     accountId?: string;
   },
@@ -396,15 +368,18 @@ function resolvePlanTargetAgainstEntries(
     return null;
   }
 
+  const pathTokens = candidate.pathTokens ?? candidate.pathSegments;
   for (const entry of entries) {
     if (!entry.includeInPlan) {
       continue;
     }
-    const matched = matchPathTokens(candidate.pathSegments, entry.pathTokens);
+    const matched = matchPathTokens(pathTokens, entry.pathTokens, {
+      allowLegacyArrayString: candidate.allowLegacyArrayString,
+    });
     if (!matched) {
       continue;
     }
-    const resolved = toResolvedPlanTarget(entry, candidate.pathSegments, matched.captures);
+    const resolved = toResolvedPlanTarget(entry, matched.captures);
     if (!resolved) {
       continue;
     }
@@ -429,43 +404,31 @@ function resolvePlanTargetAgainstEntries(
 export function resolveSecretPlanTargetByPathCore(params: {
   configFile: SecretTargetConfigFile;
   pathSegments: string[];
+  pathTokens?: readonly ConcreteConfigPathSegment[];
 }): ResolvedPlanTarget | null {
   if (params.configFile === "openclaw.json") {
-    return resolveConfigSecretTargetByPath(params.pathSegments);
+    return resolveConfigSecretTargetByPath(params.pathSegments, params.pathTokens);
   }
-  for (const entry of getCompiledSecretTargetRegistryState().authProfilesCompiledSecretTargets) {
-    if (!entry.includeInPlan) {
-      continue;
-    }
-    const matched = matchPathTokens(params.pathSegments, entry.pathTokens);
-    if (!matched) {
-      continue;
-    }
-    const resolved = toResolvedPlanTarget(entry, params.pathSegments, matched.captures);
-    if (resolved) {
-      return resolved;
-    }
-  }
-  return null;
+  return resolvePlanTargetAgainstEntries(
+    { pathSegments: params.pathSegments, pathTokens: params.pathTokens },
+    getCompiledSecretTargetRegistryState().authProfilesCompiledSecretTargets,
+  );
 }
 
 /**
  * Resolves an openclaw.json config path to the matching plan-capable secrets target.
  */
-export function resolveConfigSecretTargetByPath(pathSegments: string[]): ResolvedPlanTarget | null {
-  for (const entry of getCompiledCoreOpenClawTargetState().openClawCompiledSecretTargets) {
-    if (!entry.includeInPlan) {
-      continue;
-    }
-    const matched = matchPathTokens(pathSegments, entry.pathTokens);
-    if (!matched) {
-      continue;
-    }
-    const resolved = toResolvedPlanTarget(entry, pathSegments, matched.captures);
-    if (!resolved) {
-      continue;
-    }
-    return resolved;
+export function resolveConfigSecretTargetByPath(
+  pathSegments: string[],
+  pathTokens: readonly ConcreteConfigPathSegment[] = pathSegments,
+): ResolvedPlanTarget | null {
+  const candidate = { pathSegments, pathTokens };
+  const coreTarget = resolvePlanTargetAgainstEntries(
+    candidate,
+    getCompiledCoreSecretTargetRegistryState().openClawCompiledSecretTargets,
+  );
+  if (coreTarget) {
+    return coreTarget;
   }
 
   const explicitChannelId = pathSegments[0] === "channels" ? (pathSegments[1]?.trim() ?? "") : "";
@@ -473,36 +436,13 @@ export function resolveConfigSecretTargetByPath(pathSegments: string[]): Resolve
     ? getCompiledChannelOpenClawTargets(explicitChannelId)
     : null;
   // Channel-owned contracts get first chance for explicit channel paths before bundled defaults.
-  for (const entry of explicitChannelEntries ?? []) {
-    if (!entry.includeInPlan) {
-      continue;
-    }
-    const matched = matchPathTokens(pathSegments, entry.pathTokens);
-    if (!matched) {
-      continue;
-    }
-    const resolved = toResolvedPlanTarget(entry, pathSegments, matched.captures);
-    if (!resolved) {
-      continue;
-    }
-    return resolved;
-  }
-
-  for (const entry of getCompiledSecretTargetRegistryState().openClawCompiledSecretTargets) {
-    if (!entry.includeInPlan) {
-      continue;
-    }
-    const matched = matchPathTokens(pathSegments, entry.pathTokens);
-    if (!matched) {
-      continue;
-    }
-    const resolved = toResolvedPlanTarget(entry, pathSegments, matched.captures);
-    if (!resolved) {
-      continue;
-    }
-    return resolved;
-  }
-  return null;
+  return (
+    resolvePlanTargetAgainstEntries(candidate, explicitChannelEntries ?? []) ??
+    resolvePlanTargetAgainstEntries(
+      candidate,
+      getCompiledSecretTargetRegistryState().openClawCompiledSecretTargets,
+    )
+  );
 }
 
 /** Discovers configured secret-bearing values in openclaw.json. */
@@ -529,7 +469,7 @@ export function discoverConfigSecretTargetsByIds(
 ): DiscoveredConfigSecretTarget[] {
   const env = options.env ?? process.env;
   const allowedTargetIds = normalizeAllowedTargetIds(targetIds);
-  const coreState = getCompiledCoreOpenClawTargetState();
+  const coreState = getCompiledCoreSecretTargetRegistryState();
   const hasOnlyCoreTargetIds =
     allowedTargetIds !== null &&
     Array.from(allowedTargetIds).every((targetId) => coreState.knownTargetIds.has(targetId));
@@ -568,11 +508,11 @@ export function discoverAuthProfileSecretTargets(
   targetIds?: Iterable<string>,
 ): DiscoveredConfigSecretTarget[] {
   const allowedTargetIds = normalizeAllowedTargetIds(targetIds);
-  const registryState = getCompiledCoreAuthProfileTargetState();
+  const registryState = getCompiledCoreSecretTargetRegistryState();
   const discoveryEntries = resolveDiscoveryEntries({
     allowedTargetIds,
-    defaultEntries: registryState.entries,
-    entriesById: registryState.entriesById,
+    defaultEntries: registryState.authProfilesCompiledSecretTargets,
+    entriesById: registryState.authProfilesTargetsById,
   });
   return discoverSecretTargetsFromEntries(store, discoveryEntries);
 }

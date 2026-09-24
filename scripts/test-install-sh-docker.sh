@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# Bash 5.3+ can deadlock writing heredoc pipes on macOS before the reader starts.
+if [[ ${OSTYPE:-} == darwin* && $BASH != /bin/bash ]] && ((BASH_VERSINFO[0] > 5 || (BASH_VERSINFO[0] == 5 && BASH_VERSINFO[1] >= 3))); then
+  exec /bin/bash "$0" "$@"
+fi
 set -euo pipefail
 
 HARNESS_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -110,55 +114,40 @@ console.log(
 assert_pack_unpacked_size_budget() {
   local label="$1"
   local pack_json_file="$2"
-  node --input-type=module - "$label" "$pack_json_file" <<'NODE'
+  node --input-type=module - "$label" "$pack_json_file" "$HARNESS_ROOT" <<'NODE'
 import { readFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+const harnessRoot = process.argv[4];
+const { collectPackUnpackedSizeFindings } = await import(
+  pathToFileURL(`${harnessRoot}/scripts/lib/npm-pack-budget.mts`).href
+);
+const { reportLimitViolations } = await import(
+  pathToFileURL(`${harnessRoot}/scripts/lib/check-limits.mts`).href
+);
 
 const label = process.argv[2];
 const packJsonFile = process.argv[3];
 const raw = readFileSync(packJsonFile, "utf8") || "[]";
 const parsed = JSON.parse(raw);
 const budgetOverride = process.env.OPENCLAW_INSTALL_SMOKE_PACK_UNPACKED_BUDGET_BYTES;
-const budgetBytes = budgetOverride ? Number(budgetOverride) : 204 * 1024 * 1024;
-if (!Number.isFinite(budgetBytes)) {
+const budgetBytes = budgetOverride ? Number(budgetOverride) : undefined;
+if (budgetBytes !== undefined && !Number.isFinite(budgetBytes)) {
   throw new Error(
     `OPENCLAW_INSTALL_SMOKE_PACK_UNPACKED_BUDGET_BYTES must be numeric, got ${JSON.stringify(
       budgetOverride,
     )}`,
   );
 }
-const entries = Array.isArray(parsed) ? parsed : [parsed];
-const errors = [];
-let checkedCount = 0;
-for (const [index, entry] of entries.entries()) {
-  if (
-    !entry ||
-    typeof entry !== "object" ||
-    Array.isArray(entry) ||
-    typeof entry.unpackedSize !== "number" ||
-    !Number.isFinite(entry.unpackedSize)
-  ) {
-    continue;
-  }
-  checkedCount += 1;
-  if (entry.unpackedSize > budgetBytes) {
-    const resultLabel =
-      typeof entry.filename === "string" && entry.filename.trim()
-        ? entry.filename.trim()
-        : `pack result #${index + 1}`;
-    errors.push(
-      `${resultLabel} unpackedSize ${entry.unpackedSize} bytes exceeds budget ${budgetBytes} bytes. Investigate duplicate channel shims, copied extension trees, or other accidental pack bloat before release.`,
-    );
-  }
-}
-if (entries.length > 0 && checkedCount === 0) {
-  errors.push(
-    `${label} npm pack output did not include unpackedSize; install smoke cannot verify pack budget.`,
-  );
-}
+const { errors, violations } = collectPackUnpackedSizeFindings(parsed, {
+  budgetBytes,
+  missingDataMessage: `${label} npm pack output did not include unpackedSize; install smoke cannot verify pack budget.`,
+});
 for (const error of errors) {
   console.error(`ERROR: ${error}`);
 }
-if (errors.length > 0) {
+const sizeFailed = reportLimitViolations(violations);
+if (errors.length > 0 || sizeFailed) {
   process.exit(1);
 }
 NODE
@@ -268,7 +257,7 @@ SKIP_FRESHNESS="${OPENCLAW_INSTALL_SMOKE_SKIP_FRESHNESS:-0}"
 FRESHNESS_INSTALL_URL="${OPENCLAW_INSTALL_SMOKE_FRESHNESS_INSTALL_URL:-file:///tmp/openclaw-install.sh}"
 # npm min-release-age is days; 10000 keeps the control failure independent of normal release cadence.
 FRESHNESS_MIN_RELEASE_AGE="${OPENCLAW_INSTALL_FRESHNESS_MIN_RELEASE_AGE:-10000}"
-FRESHNESS_NPM_VERSION="${OPENCLAW_INSTALL_FRESHNESS_NPM_VERSION:-11.14.1}"
+FRESHNESS_NPM_VERSION="${OPENCLAW_INSTALL_FRESHNESS_NPM_VERSION:-11.19.0}"
 UPDATE_BASELINE_VERSION="${OPENCLAW_INSTALL_SMOKE_UPDATE_BASELINE:-latest}"
 UPDATE_PACKAGE_SPEC="${OPENCLAW_INSTALL_SMOKE_UPDATE_PACKAGE_SPEC:-}"
 UPDATE_DIST_IMAGE="${OPENCLAW_INSTALL_SMOKE_UPDATE_DIST_IMAGE:-}"
@@ -277,6 +266,7 @@ UPDATE_HOST_ALIAS="${OPENCLAW_INSTALL_SMOKE_UPDATE_HOST:-host.docker.internal}"
 UPDATE_PORT="${OPENCLAW_INSTALL_SMOKE_UPDATE_PORT:-}"
 UPDATE_EXPECT_VERSION="${OPENCLAW_INSTALL_SMOKE_UPDATE_EXPECT_VERSION:-}"
 FROZEN_PAYLOAD_DIR="${OPENCLAW_INSTALL_SMOKE_FROZEN_PAYLOAD_DIR:-}"
+FROZEN_NODE_VERSION="${OPENCLAW_INSTALL_SMOKE_NODE_VERSION:-}"
 LATEST_DIR="$(mktemp -d)"
 LATEST_FILE="${LATEST_DIR}/latest"
 UPDATE_DIR="$(mktemp -d)"
@@ -319,6 +309,10 @@ if [[ -n "$FROZEN_PAYLOAD_DIR" ]]; then
     echo "ERROR: frozen install-smoke payload requires OPENCLAW_INSTALL_SMOKE_UPDATE_EXPECT_VERSION" >&2
     exit 1
   fi
+  if [[ ! "$FROZEN_NODE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    echo "ERROR: frozen install-smoke payload requires a trusted OPENCLAW_INSTALL_SMOKE_NODE_VERSION" >&2
+    exit 1
+  fi
   INSTALL_SCRIPT_PATH="$FROZEN_PAYLOAD_DIR/install.sh"
   CLI_INSTALL_SCRIPT_PATH="$FROZEN_PAYLOAD_DIR/install-cli.sh"
 fi
@@ -327,10 +321,14 @@ INSTALL_SCRIPT_DOCKER_ARGS=(
   -v "$INSTALL_SCRIPT_PATH:/tmp/openclaw-install.sh:ro"
   -v "$CLI_INSTALL_SCRIPT_PATH:/tmp/openclaw-install-cli.sh:ro"
 )
+if [[ -n "$FROZEN_PAYLOAD_DIR" ]]; then
+  INSTALL_SCRIPT_DOCKER_ARGS+=(
+    -e "OPENCLAW_NODE_VERSION=$FROZEN_NODE_VERSION"
+  )
+fi
 
 for env_name in \
-  OPENCLAW_INSTALL_ALLOW_LEGACY_UPDATE_WARNING \
-  OPENCLAW_INSTALL_SELF_UPDATE_WARNING_FIXED_VERSION \
+  OPENCLAW_INSTALL_ALLOW_LEGACY_SAME_VERSION_APPLY \
   OPENCLAW_INSTALL_SMOKE_COMMAND_TIMEOUT \
   OPENCLAW_INSTALL_SMOKE_HEARTBEAT_INTERVAL \
   OPENCLAW_INSTALL_SMOKE_PREVIOUS \

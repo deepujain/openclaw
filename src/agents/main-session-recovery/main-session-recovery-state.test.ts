@@ -176,6 +176,7 @@ describe("main session recovery state", () => {
   it("marks without charging and replaces an older lifecycle owner for the same run", () => {
     const entry = interruptedEntry({
       lifecycleRunId: "dead-run",
+      lastRunId: "settled-run",
       restartRecoveryRuns: [
         { runId: "older-run", lifecycleGeneration: "generation-old" },
         { runId: "shared-run", lifecycleGeneration: "generation-1" },
@@ -208,6 +209,7 @@ describe("main session recovery state", () => {
       { runId: "shared-run", lifecycleGeneration: "generation-2" },
     ]);
     expect(entry.lifecycleRunId).toBeUndefined();
+    expect(entry.lastRunId).toBeUndefined();
   });
 
   it("rejects foreground work after the automatic recovery budget is exhausted", () => {
@@ -346,6 +348,7 @@ describe("main session recovery state", () => {
 
   it("moves a reservation into the lifecycle fence during Gateway admission", () => {
     const entry = interruptedEntry({
+      lastRunId: "settled-run",
       pendingFinalDelivery: { kind: "replayable", text: " captured reply ", createdAt: 1 },
       restartRecoveryDeliveryRunId: "recovery-1",
       restartRecoveryDeliverySourceRunId: "source-1",
@@ -379,7 +382,7 @@ describe("main session recovery state", () => {
         runId: "recovery-1",
         sessionId: "session-1",
       }),
-    ).toEqual({ kind: "admitted_recovery" });
+    ).toMatchObject({ kind: "admitted_recovery" });
     expect(entry).toMatchObject({
       abortedLastRun: false,
       pendingFinalDelivery: { kind: "replayable", text: "captured reply", createdAt: 1 },
@@ -391,10 +394,13 @@ describe("main session recovery state", () => {
     });
     expect(entry.mainRestartRecovery?.reservation).toBeUndefined();
     expect(entry.lifecycleRunId).toBe("recovery-1");
+    expect(entry.lastRunId).toBeUndefined();
 
     expect(
       transitionMainSessionRecovery(entry, {
         kind: "mark_admitted_recovery_interrupted",
+        cycleId: "cycle-1",
+        attempt: 1,
         lifecycleGeneration: "generation-1",
         now: 400,
         runId: "recovery-1",
@@ -407,6 +413,7 @@ describe("main session recovery state", () => {
     expect(entry.restartRecoveryDeliveryRunId).toBeUndefined();
     expect(entry.restartRecoveryDeliverySourceRunId).toBe("source-1");
     expect(entry.lifecycleRunId).toBeUndefined();
+    expect(entry.lastRunId).toBeUndefined();
   });
 
   it("rejects a reservation created by an older lifecycle generation", () => {
@@ -604,7 +611,7 @@ describe("main session recovery state", () => {
         runId: "recovery-new",
         sessionId: "session-1",
       }),
-    ).toEqual({ kind: "admitted_recovery" });
+    ).toMatchObject({ kind: "admitted_recovery" });
     expect(
       transitionMainSessionRecovery(entry, {
         kind: "bind_admitted_execution_identity",

@@ -1,4 +1,3 @@
-// Memory Core plugin module implements manager targeted sync behavior.
 import { formatErrorMessage } from "openclaw/plugin-sdk/error-runtime";
 import type { MemorySyncProgressUpdate } from "openclaw/plugin-sdk/memory-core-host-engine-storage";
 
@@ -50,7 +49,11 @@ export async function runMemoryTargetedSessionSync(params: {
   }) => Promise<void>;
   shouldFallbackOnError: (err: unknown) => boolean;
   activateFallbackProvider: (reason: string) => Promise<boolean>;
-}): Promise<{ handled: boolean; sessionsDirty: boolean }> {
+}): Promise<
+  | { handled: false; sessionsDirty: boolean }
+  | { handled: true; sessionsDirty: boolean; failure?: never }
+  | { handled: true; sessionsDirty: boolean; failure: { error: unknown } }
+> {
   const hasPendingSessionWork = (hasDirtyFiles = params.sessionsDirtyFiles.size > 0) =>
     params.sessionsFullRetryDirty || params.sessionsReconcileDirty || hasDirtyFiles;
   if (!params.hasSessionSource || !params.targetArchiveFiles) {
@@ -88,6 +91,7 @@ export async function runMemoryTargetedSessionSync(params: {
     return {
       handled: true,
       sessionsDirty: hasPendingSessionWork(remainingSessionsDirty),
+      failure: { error: err },
     };
   }
 }

@@ -30,6 +30,8 @@ import {
   projectAgentRunAttemptTerminal,
 } from "../agent-run-terminal-outcome.js";
 import type { EmbeddedRunAttemptResult } from "../embedded-agent-runner/run/types.js";
+import { copyCoreTtsAttemptResultProvenance } from "../tools/tts-tool-result-provenance.js";
+import { subscribeAgentCommentaryDiagnostics } from "./commentary-diagnostics.js";
 import { recordAgentHarnessPreflightOwner } from "./errors.js";
 import { applyAgentHarnessResultClassification } from "./result-classification.js";
 import { EmptySettledTurnFinalizationError } from "./settled-turn-finalization-outcome.js";
@@ -91,6 +93,7 @@ function agentHarnessDiagnosticBase(
   return {
     runId: params.runId,
     sessionId: params.sessionId,
+    ...(params.agentId ? { agentId: params.agentId } : {}),
     provider: params.provider,
     model: params.modelId,
     harnessId: harness.id,
@@ -175,6 +178,7 @@ function agentRunDiagnosticBase(params: AgentHarnessAttemptParams, trace: Diagno
     runId: params.runId,
     ...(params.sessionKey ? { sessionKey: params.sessionKey } : {}),
     ...(params.sessionId ? { sessionId: params.sessionId } : {}),
+    ...(params.agentId ? { agentId: params.agentId } : {}),
     provider: params.provider,
     model: params.modelId,
     ...(params.trigger ? { trigger: params.trigger } : {}),
@@ -204,10 +208,10 @@ function withFallbackDiagnosticTrace(
   if (result.diagnosticTrace || !trace) {
     return result;
   }
-  return {
+  return copyCoreTtsAttemptResultProvenance(result, {
     ...result,
     diagnosticTrace: freezeDiagnosticTraceContext(trace),
-  };
+  });
 }
 
 function withFallbackFinalizationDiagnosticTrace(
@@ -322,6 +326,10 @@ export async function runAgentHarnessLifecycleAttempt(
   };
 
   emitAgentHarnessRunStarted(harness, params, activeHarnessTrace);
+  const unsubscribeCommentary = subscribeAgentCommentaryDiagnostics(
+    params.config,
+    agentHarnessDiagnosticBase(harness, params, activeHarnessTrace),
+  );
   try {
     phase = "prepare";
     assertAgentHarnessContextEngineSupport(harness, params);
@@ -343,8 +351,11 @@ export async function runAgentHarnessLifecycleAttempt(
       phase = "resolve";
       // Classification happens inside the diagnostic phase so failures identify
       // whether they came from send or result resolution.
-      return normalizeAgentHarnessAttemptResult(
-        applyAgentHarnessResultClassification(harness, rawResult, params),
+      return copyCoreTtsAttemptResultProvenance(
+        rawResult,
+        normalizeAgentHarnessAttemptResult(
+          applyAgentHarnessResultClassification(harness, rawResult, params),
+        ),
       );
     };
     result = agentRunTrace
@@ -363,6 +374,8 @@ export async function runAgentHarnessLifecycleAttempt(
     });
     emitAgentRunCompleted({ outcome: "error", error });
     throw error;
+  } finally {
+    unsubscribeCommentary();
   }
 
   emitAgentRunCompleted(agentRunCompletion(result));
@@ -391,6 +404,10 @@ export async function runAgentHarnessLifecycleFinalization(
       : undefined;
 
   emitAgentHarnessRunStarted(harness, params, activeHarnessTrace);
+  const unsubscribeCommentary = subscribeAgentCommentaryDiagnostics(
+    params.config,
+    agentHarnessDiagnosticBase(harness, params, activeHarnessTrace),
+  );
   if (agentRunTrace) {
     emitTrustedDiagnosticEvent({
       type: "run.started",
@@ -400,9 +417,9 @@ export async function runAgentHarnessLifecycleFinalization(
   try {
     const runAndValidate = async () => {
       phase = "send";
-      const rawResult = await execute();
-      phase = "resolve";
       try {
+        const rawResult = await execute();
+        phase = "resolve";
         return {
           outcome: "answered" as const,
           result: assertSettledTurnFinalizationResult(rawResult),
@@ -464,5 +481,7 @@ export async function runAgentHarnessLifecycleFinalization(
       );
     }
     throw error;
+  } finally {
+    unsubscribeCommentary();
   }
 }

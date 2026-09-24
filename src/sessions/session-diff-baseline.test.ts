@@ -1,10 +1,7 @@
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
-import {
-  isSessionWorkStartInvalidatedError,
-  SessionWorkStartInvalidatedError,
-} from "../config/sessions/lifecycle.js";
+import { SessionWorkStartInvalidatedError } from "../config/sessions/lifecycle.js";
 import {
   deleteSessionEntryLifecycle,
   loadSessionEntry,
@@ -63,22 +60,33 @@ function baseline(sessionId: string): SessionDiffBaseline {
 async function seedEntry(params: {
   entry: InternalSessionEntry;
   sessionKey?: string;
-}): Promise<{ entry: InternalSessionEntry; sessionKey: string; storePath: string }> {
+  agentId?: string;
+}): Promise<{
+  agentId: string;
+  entry: InternalSessionEntry;
+  sessionKey: string;
+  storePath: string;
+}> {
   const dir = tempDirs.make("openclaw-session-diff-owner-");
   const storePath = path.join(dir, "sessions.json");
+  const agentId = params.agentId ?? "main";
   const sessionKey = params.sessionKey ?? "agent:main:diff-owner";
-  await replaceSessionEntry({ sessionKey, storePath }, params.entry);
-  return { entry: params.entry, sessionKey, storePath };
+  await replaceSessionEntry({ agentId, sessionKey, storePath }, params.entry);
+  return { agentId, entry: params.entry, sessionKey, storePath };
 }
 
 function loadInternal(sessionKey: string, storePath: string): InternalSessionEntry | undefined {
   return loadSessionEntry({ sessionKey, storePath }) as InternalSessionEntry | undefined;
 }
 
-function expectInvalidated(result: PromiseSettledResult<unknown>, message: RegExp): void {
+function expectWorkStartError(
+  result: PromiseSettledResult<unknown>,
+  message: RegExp,
+  code: "SESSION_WORK_START_CHANGED" | "SESSION_WORK_START_INVALIDATED",
+): void {
   expect(result.status).toBe("rejected");
   if (result.status === "rejected") {
-    expect(isSessionWorkStartInvalidatedError(result.reason)).toBe(true);
+    expect(result.reason).toMatchObject({ code });
     expect(String(result.reason)).toMatch(message);
   }
 }
@@ -125,6 +133,40 @@ describe("ensureSessionDiffBaseline", () => {
       sessionDiffBaseline: baseline(sessionId),
     });
   });
+
+  it.each([false, true])(
+    "keeps a global session baseline in its selected agent's custom store (new=%s)",
+    async (isNewSession) => {
+      const entry: InternalSessionEntry = {
+        createdVia: "operator",
+        sessionId: "work-global-session",
+        sessionDiffBaselineCapture: isNewSession
+          ? undefined
+          : createSessionDiffBaselineCaptureClaim(),
+        updatedAt: 2,
+      };
+      const target = await seedEntry({ agentId: "work", sessionKey: "global", entry });
+      const mainScope = { agentId: "main", sessionKey: "global", storePath: target.storePath };
+      await replaceSessionEntry(mainScope, { sessionId: "main-global-session", updatedAt: 1 });
+      const mainBefore = loadSessionEntry(mainScope);
+      captureMocks.capture.mockResolvedValue(baseline(entry.sessionId));
+
+      const settled = await ensureSessionDiffBaseline({
+        ...target,
+        cwd: "/workspace",
+        isNewSession,
+      });
+
+      expect(settled.sessionDiffBaseline).toEqual(baseline(entry.sessionId));
+      const persisted = loadSessionEntry(target);
+      expect(persisted).toMatchObject({
+        sessionId: entry.sessionId,
+        sessionDiffBaseline: baseline(entry.sessionId),
+      });
+      expect(persisted?.sessionDiffBaselineCapture).toBeUndefined();
+      expect(loadSessionEntry(mainScope)).toEqual(mainBefore);
+    },
+  );
 
   it("shares one capture across concurrent first-turn ensures", async () => {
     const sessionId = "concurrent-session";
@@ -188,7 +230,7 @@ describe("ensureSessionDiffBaseline", () => {
           entry: cachedEntry,
           isNewSession: false,
         }),
-      ).rejects.toSatisfy(isSessionWorkStartInvalidatedError);
+      ).rejects.toMatchObject({ code: "SESSION_WORK_START_CHANGED" });
       expect(captureMocks.capture).not.toHaveBeenCalled();
       expect(loadInternal(target.sessionKey, target.storePath)).toMatchObject({
         lifecycleRevision: "fresh-generation",
@@ -254,7 +296,7 @@ describe("ensureSessionDiffBaseline", () => {
         cwd: "/workspace",
         isNewSession: false,
       }),
-    ).rejects.toSatisfy(isSessionWorkStartInvalidatedError);
+    ).rejects.toMatchObject({ code: "SESSION_WORK_START_INVALIDATED" });
     expect(captureMocks.capture).not.toHaveBeenCalled();
   });
 
@@ -324,7 +366,11 @@ describe("ensureSessionDiffBaseline", () => {
     if (!settled) {
       throw new Error("expected capture settlement");
     }
-    expectInvalidated(settled, /could not persist its diff baseline/i);
+    expectWorkStartError(
+      settled,
+      /could not persist its diff baseline/i,
+      "SESSION_WORK_START_INVALIDATED",
+    );
     expect(loadInternal(target.sessionKey, target.storePath)).toMatchObject({
       sessionDiffBaselineCapture: claim,
     });
@@ -426,7 +472,7 @@ describe("ensureSessionDiffBaseline", () => {
         cwd: "/workspace",
         isNewSession: true,
       }),
-    ).rejects.toSatisfy(isSessionWorkStartInvalidatedError);
+    ).rejects.toMatchObject({ code: "SESSION_WORK_START_CHANGED" });
     expect(loadInternal(target.sessionKey, target.storePath)).toMatchObject({
       lifecycleRevision: "replacement-generation",
       sessionId,
@@ -447,6 +493,7 @@ describe("ensureSessionDiffBaseline", () => {
 
     const result = await Promise.allSettled([
       ensureSessionDiffBaseline({
+        agentId: "main",
         cwd: "/workspace",
         entry,
         isNewSession: true,
@@ -459,7 +506,7 @@ describe("ensureSessionDiffBaseline", () => {
     if (!settled) {
       throw new Error("expected claim-arm settlement");
     }
-    expectInvalidated(settled, /was deleted while starting work/i);
+    expectWorkStartError(settled, /was deleted while starting work/i, "SESSION_WORK_START_CHANGED");
     expect(captureMocks.capture).not.toHaveBeenCalled();
   });
 
@@ -492,7 +539,7 @@ describe("ensureSessionDiffBaseline", () => {
     if (!settled) {
       throw new Error("expected capture settlement");
     }
-    expectInvalidated(settled, /was deleted while starting work/i);
+    expectWorkStartError(settled, /was deleted while starting work/i, "SESSION_WORK_START_CHANGED");
     expect(loadInternal(target.sessionKey, target.storePath)).toBeUndefined();
   });
 
@@ -530,7 +577,7 @@ describe("ensureSessionDiffBaseline", () => {
     );
     capture.resolve(baseline(sessionId));
     for (const result of await outcomes) {
-      expectInvalidated(result, /changed while starting work/i);
+      expectWorkStartError(result, /changed while starting work/i, "SESSION_WORK_START_CHANGED");
     }
 
     expect(loadInternal(target.sessionKey, target.storePath)).toMatchObject({
@@ -571,7 +618,7 @@ describe("ensureSessionDiffBaseline", () => {
     if (!settled) {
       throw new Error("expected capture settlement");
     }
-    expectInvalidated(settled, /changed while starting work/i);
+    expectWorkStartError(settled, /changed while starting work/i, "SESSION_WORK_START_CHANGED");
     expect(loadInternal(target.sessionKey, target.storePath)).toMatchObject({
       lifecycleRevision: "replacement-generation",
       sessionDiffBaselineCapture: claim,

@@ -3,6 +3,7 @@ import {
   createNativeBootstrapController,
   discardRetiredCopilotState,
   prepareRetiredCopilotState,
+  requestRelayEnsure,
 } from "./native-bootstrap.js";
 
 const COPILOT_LOCAL_KEYS = [
@@ -311,76 +312,152 @@ describe("native bootstrap timeout", () => {
     vi.unstubAllGlobals();
   });
 
-  it("bounds a stuck native call and leaves status retryable", async () => {
-    vi.useFakeTimers();
-    vi.stubGlobal("crypto", {
-      getRandomValues: vi.fn((bytes: Uint8Array) => {
-        bytes.set(Uint8Array.from({ length: 16 }, (_, index) => index * 17));
-        return bytes;
-      }),
-    });
-    const stored: Record<string, unknown> = {};
-    let onDisconnect = () => {};
-    const disconnect = vi.fn(() => onDisconnect());
-    const chromeApi = {
-      runtime: {
-        connectNative: vi.fn(() => ({
-          disconnect,
-          onDisconnect: {
-            addListener: (listener: () => void) => {
-              onDisconnect = listener;
+  it.each(["current", "disabled", "re-enabled"])(
+    "settles a stuck native call after %s ownership",
+    async (ownership) => {
+      vi.useFakeTimers();
+      vi.stubGlobal("crypto", {
+        getRandomValues: vi.fn((bytes: Uint8Array) => {
+          bytes.set(Uint8Array.from({ length: 16 }, (_, index) => index * 17));
+          return bytes;
+        }),
+      });
+      const stored: Record<string, unknown> = {};
+      let onDisconnect = () => {};
+      const disconnect = vi.fn(() => onDisconnect());
+      const chromeApi = {
+        runtime: {
+          connectNative: vi.fn(() => ({
+            disconnect,
+            onDisconnect: {
+              addListener: (listener: () => void) => {
+                onDisconnect = listener;
+              },
             },
-          },
-          onMessage: { addListener: vi.fn() },
-          postMessage: vi.fn(),
-        })),
-      },
-      storage: {
-        local: {
-          get: vi.fn(async (keys: string[]) =>
-            Object.fromEntries(
-              keys.filter((key) => Object.hasOwn(stored, key)).map((key) => [key, stored[key]]),
-            ),
-          ),
-          set: vi.fn(async (values: Record<string, unknown>) => {
-            Object.assign(stored, values);
-          }),
-          remove: vi.fn(async (keys: string[]) => {
-            for (const key of keys) {
-              delete stored[key];
-            }
-          }),
+            onMessage: { addListener: vi.fn() },
+            postMessage: vi.fn(),
+          })),
         },
-      },
-    };
-    const controller = createNativeBootstrapController({
-      chromeApi,
-      getPairing: async () => null,
-      applyPairing: vi.fn(),
-    });
+        storage: {
+          local: {
+            get: vi.fn(async (keys: string[]) =>
+              Object.fromEntries(
+                keys.filter((key) => Object.hasOwn(stored, key)).map((key) => [key, stored[key]]),
+              ),
+            ),
+            set: vi.fn(async (values: Record<string, unknown>) => {
+              Object.assign(stored, values);
+            }),
+            remove: vi.fn(async (keys: string[]) => {
+              for (const key of keys) {
+                delete stored[key];
+              }
+            }),
+          },
+        },
+      };
+      const controller = createNativeBootstrapController({
+        chromeApi,
+        getPairing: async () => null,
+        applyPairing: vi.fn(),
+      });
 
-    const attempt = controller.attempt();
-    await vi.advanceTimersByTimeAsync(0);
-    expect(chromeApi.runtime.connectNative.mock.results[0]?.value.postMessage).toHaveBeenCalledWith(
-      {
+      const attempt = controller.attempt();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(
+        chromeApi.runtime.connectNative.mock.results[0]?.value.postMessage,
+      ).toHaveBeenCalledWith({
         v: 1,
         op: "bootstrap",
         nonce: "ABEiM0RVZneImaq7zN3u_w",
-      },
-    );
-    await vi.advanceTimersByTimeAsync(29_999);
-    expect(stored).toEqual({});
-    await vi.advanceTimersByTimeAsync(1);
+      });
+      await vi.advanceTimersByTimeAsync(29_999);
+      expect(stored).toEqual({});
+      if (ownership !== "current") {
+        await controller.disableSynchronously();
+        if (ownership === "re-enabled") {
+          await controller.enable({ attemptNow: false });
+        }
+      }
+      await vi.advanceTimersByTimeAsync(1);
 
-    await expect(attempt).resolves.toEqual({
-      status: "retrying",
-      code: "native_host_timeout",
+      await expect(attempt).resolves.toEqual(
+        ownership === "current"
+          ? { status: "retrying", code: "native_host_timeout" }
+          : { status: "superseded" },
+      );
+      await expect(controller.status()).resolves.toEqual(
+        ownership === "current"
+          ? { disabled: false, state: "retrying", failureCode: "native_host_timeout" }
+          : {
+              disabled: ownership === "disabled",
+              state: ownership === "disabled" ? "disabled" : "waiting",
+            },
+      );
+      expect(disconnect).toHaveBeenCalledOnce();
+    },
+  );
+});
+
+type EnsurePortScript = (request: { nonce: string }) => unknown;
+
+function ensureChromeApi(script: EnsurePortScript | "disconnect") {
+  const connectNative = vi.fn(() => {
+    let messageListener: ((response: unknown) => void) | undefined;
+    let disconnectListener: (() => void) | undefined;
+    return {
+      disconnect: vi.fn(),
+      onMessage: {
+        addListener: (listener: (response: unknown) => void) => {
+          messageListener = listener;
+        },
+      },
+      onDisconnect: {
+        addListener: (listener: () => void) => {
+          disconnectListener = listener;
+        },
+      },
+      postMessage: (request: { nonce: string }) => {
+        queueMicrotask(() => {
+          if (script === "disconnect") {
+            disconnectListener?.();
+            return;
+          }
+          messageListener?.(script(request));
+        });
+      },
+    };
+  });
+  return { runtime: { connectNative, lastError: undefined } };
+}
+
+describe("requestRelayEnsure", () => {
+  it("returns the relay status when the native host answers with the echoed nonce", async () => {
+    const chromeApi = ensureChromeApi((request) => {
+      expect(request).toEqual({
+        v: 1,
+        op: "ensure_relay",
+        nonce: expect.any(String),
+        relayPort: 20123,
+      });
+      return { v: 1, ok: true, nonce: request.nonce, relay: "spawned" };
     });
-    await expect(controller.status()).resolves.toEqual({
-      disabled: false,
-      state: "retrying",
-      failureCode: "native_host_timeout",
+    await expect(requestRelayEnsure(20123, chromeApi)).resolves.toEqual({ status: "spawned" });
+  });
+
+  it("treats a nonce mismatch as unavailable", async () => {
+    const chromeApi = ensureChromeApi(() => ({
+      v: 1,
+      ok: true,
+      nonce: "AAAAAAAAAAAAAAAAAAAAAA",
+      relay: "spawned",
+    }));
+    await expect(requestRelayEnsure(20123, chromeApi)).resolves.toEqual({ status: "unavailable" });
+  });
+
+  it("treats a missing native host as unavailable", async () => {
+    await expect(requestRelayEnsure(20123, ensureChromeApi("disconnect"))).resolves.toEqual({
+      status: "unavailable",
     });
-    expect(disconnect).toHaveBeenCalledOnce();
   });
 });

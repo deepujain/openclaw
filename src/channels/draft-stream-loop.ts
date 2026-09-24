@@ -24,6 +24,8 @@ type CreatedDraftStreamLoop<T> = DraftStreamLoop<T> & {
 /** Creates a single-flight draft stream loop that preserves the newest pending value. */
 export function createDraftStreamLoop<T = string>(params: {
   throttleMs: number;
+  /** Keep background updates arriving during a send in the next throttle window. */
+  coalesceInFlight?: boolean;
   isStopped: () => boolean;
   sendOrEditStreamMessage: (value: T) => Promise<void | boolean>;
   /** Empty sentinel and predicate for non-string payloads. */
@@ -44,14 +46,30 @@ export function createDraftStreamLoop<T = string>(params: {
   let inFlightPromise: Promise<void | boolean> | undefined;
   let timer: ReturnType<typeof setTimeout> | undefined;
 
-  const flush = async () => {
+  const clearTimer = () => {
     if (timer) {
       clearTimeout(timer);
       timer = undefined;
     }
+  };
+
+  const retainUnsentValue = (value: T, background: boolean) => {
+    if (!hasPendingValue(pendingValue)) {
+      pendingValue = value;
+    } else if (background && params.coalesceInFlight) {
+      // Only newer work owns another attempt; never retry the failed/rejected value.
+      schedule();
+    }
+  };
+
+  const flush = async (background = false) => {
+    clearTimer();
     while (!params.isStopped()) {
       if (inFlightPromise) {
         await inFlightPromise;
+        if (background && params.coalesceInFlight) {
+          return;
+        }
         continue;
       }
       const value = pendingValue;
@@ -61,43 +79,36 @@ export function createDraftStreamLoop<T = string>(params: {
       }
       pendingValue = emptyValue;
       let current: Promise<void | boolean> | undefined;
+      let sent: void | boolean;
       try {
         current = Promise.resolve(params.sendOrEditStreamMessage(value)).finally(() => {
           if (inFlightPromise === current) {
             inFlightPromise = undefined;
           }
         });
-      } catch (err) {
-        if (!hasPendingValue(pendingValue)) {
-          pendingValue = value;
-        }
-        throw err;
-      }
-      inFlightPromise = current;
-      let sent: void | boolean;
-      try {
+        inFlightPromise = current;
         sent = await current;
       } catch (err) {
-        if (!hasPendingValue(pendingValue)) {
-          pendingValue = value;
-        }
+        retainUnsentValue(value, background);
         throw err;
       }
       if (sent === false) {
-        if (!hasPendingValue(pendingValue)) {
-          pendingValue = value;
-        }
+        retainUnsentValue(value, background);
         return;
       }
       lastSentAt = Date.now();
       if (!hasPendingValue(pendingValue)) {
         return;
       }
+      if (background && params.coalesceInFlight) {
+        schedule();
+        return;
+      }
     }
   };
 
   const startBackgroundFlush = () => {
-    void flush().catch((err: unknown) => {
+    void flush(true).catch((err: unknown) => {
       try {
         params.onBackgroundFlushError?.(err);
       } catch {
@@ -123,7 +134,9 @@ export function createDraftStreamLoop<T = string>(params: {
       }
       pendingValue = value;
       if (inFlightPromise) {
-        schedule();
+        if (!params.coalesceInFlight) {
+          schedule();
+        }
         return;
       }
       if (!timer && Date.now() - lastSentAt >= throttleMs) {
@@ -132,23 +145,17 @@ export function createDraftStreamLoop<T = string>(params: {
       }
       schedule();
     },
-    flush,
+    flush: () => flush(),
     stop: () => {
       pendingValue = emptyValue;
-      if (timer) {
-        clearTimeout(timer);
-        timer = undefined;
-      }
+      clearTimer();
     },
     resetPending: () => {
       pendingValue = emptyValue;
     },
     resetThrottleWindow: () => {
       lastSentAt = 0;
-      if (timer) {
-        clearTimeout(timer);
-        timer = undefined;
-      }
+      clearTimer();
     },
     waitForInFlight: async () => {
       if (inFlightPromise) {
@@ -158,10 +165,7 @@ export function createDraftStreamLoop<T = string>(params: {
     takePending: () => {
       const value = pendingValue;
       pendingValue = emptyValue;
-      if (timer) {
-        clearTimeout(timer);
-        timer = undefined;
-      }
+      clearTimer();
       return value;
     },
   };

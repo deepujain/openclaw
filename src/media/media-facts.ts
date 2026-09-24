@@ -20,6 +20,8 @@ export type MediaFact = {
   contentType?: string;
   kind?: MediaKind;
   fileName?: string;
+  /** Composer attachment provenance for display; never part of model input. */
+  origin?: "paste" | "file";
   sizeBytes?: number;
   durationMs?: number;
   width?: number;
@@ -233,6 +235,7 @@ export function canonicalizePersistedUserMessageMedia<T extends object>(
       ...(fact.contentType && !bareLegacyKind ? { contentType: fact.contentType } : {}),
       ...(explicitKind ? { kind: explicitKind } : {}),
       ...(fact.fileName ? { fileName: fact.fileName } : {}),
+      ...(fact.origin ? { origin: fact.origin } : {}),
       ...(fact.sizeBytes !== undefined ? { sizeBytes: fact.sizeBytes } : {}),
       ...(fact.durationMs ? { durationMs: fact.durationMs } : {}),
       ...(fact.width ? { width: fact.width } : {}),
@@ -282,7 +285,7 @@ export function readRuntimePromptImageOrder(message: object): PromptImageOrderEn
 }
 
 /** Returns whether a declared MIME only describes otherwise unclassified binary bytes. */
-export function isGenericBinaryMediaContentType(contentType?: string | null): boolean {
+function isGenericBinaryMediaContentType(contentType?: string | null): boolean {
   const normalizedContentType = normalizeMimeType(contentType);
   return (
     normalizedContentType === "application/octet-stream" ||
@@ -290,7 +293,8 @@ export function isGenericBinaryMediaContentType(contentType?: string | null): bo
   );
 }
 
-function classifyMediaFact(fact: MediaFactInput): MediaKind | undefined {
+/** Resolves attachment kind from authoritative facts before source or filename hints. */
+export function resolveMediaFactKind(fact: MediaFactInput): MediaKind | undefined {
   if (fact.kind && fact.kind !== "unknown") {
     return fact.kind;
   }
@@ -305,28 +309,33 @@ function classifyMediaFact(fact: MediaFactInput): MediaKind | undefined {
       ? (normalizedContentType as MediaKind)
       : undefined;
   }
-  const pathValue = normalizeOptionalString(fact.path) ?? normalizeOptionalString(fact.url);
-  const inferredMime = mimeTypeFromFilePath(pathValue);
-  if (inferredMime === "image/svg+xml") {
+  const source = normalizeOptionalString(fact.path) ?? normalizeOptionalString(fact.url);
+  if (!source) {
     return undefined;
   }
-  const inferredKind = kindFromMime(inferredMime);
-  if (inferredKind) {
-    return inferredKind;
+  for (const candidate of [fact.path, fact.url, fact.fileName, source]) {
+    const inferredMime = mimeTypeFromFilePath(candidate);
+    if (inferredMime !== undefined) {
+      // A recognized source, including SVG, takes precedence over later filename hints.
+      return inferredMime === "image/svg+xml" ? undefined : kindFromMime(inferredMime);
+    }
+    const extension = getFileExtension(candidate);
+    if (extension === ".tif" || extension === ".tiff") {
+      return "image";
+    }
   }
-  const extension = getFileExtension(pathValue);
-  return extension === ".tif" || extension === ".tiff" ? "image" : undefined;
+  return undefined;
 }
 
 /** Returns whether a fact can produce native image input. */
 export function isImageMediaFact(fact: MediaFactInput): boolean {
-  const kind = classifyMediaFact(fact);
+  const kind = resolveMediaFactKind(fact);
   return kind === "image" || kind === "sticker";
 }
 
 /** Returns whether a fact can produce native video input. */
 export function isVideoMediaFact(fact: MediaFactInput): boolean {
-  return classifyMediaFact(fact) === "video";
+  return resolveMediaFactKind(fact) === "video";
 }
 
 type MediaFactDefaults<TInput extends MediaFactInput = MediaFactInput> = {
@@ -381,6 +390,7 @@ function normalizeMediaFact<TInput extends MediaFactInput>(
       defaults.kind ??
       (isGenericBinaryMediaContentType(contentType) ? undefined : kindFromMime(contentType)),
     fileName: normalizeOptionalString(input.fileName),
+    ...(input.origin === "paste" || input.origin === "file" ? { origin: input.origin } : {}),
     sizeBytes: normalizeNonNegativeNumber(input.sizeBytes),
     ...(durationMs ? { durationMs } : {}),
     ...(width ? { width } : {}),
@@ -466,6 +476,7 @@ function resolveMediaFactsWithPrecedence(
           : (fact?.contentType ?? legacyContentType),
         kind: fact?.kind,
         fileName: fact?.fileName,
+        origin: fact?.origin,
         sizeBytes: fact?.sizeBytes,
         durationMs: fact?.durationMs,
         width: fact?.width,

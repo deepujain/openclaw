@@ -27,7 +27,7 @@ import type {
   SessionMessagePayload,
   WaitFilter,
 } from "./channel-shared.js";
-import { matchEventFilter, normalizeApprovalId, toConversation, toText } from "./channel-shared.js";
+import { matchEventFilter, toConversation, toText } from "./channel-shared.js";
 
 /**
  * Runtime bridge between MCP tools and the OpenClaw Gateway channel APIs.
@@ -122,7 +122,7 @@ export class OpenClawChannelBridge {
     ] = await Promise.all([
       import("../gateway/client-bootstrap.js"),
       import("../gateway/client.js"),
-      import("../gateway/client-start-readiness.js"),
+      import("../../packages/gateway-client/src/readiness.js"),
       import("../gateway/method-scopes.js"),
       import("../../packages/gateway-protocol/src/client-info.js"),
     ]);
@@ -267,6 +267,15 @@ export class OpenClawChannelBridge {
       limit: requestLimit,
     });
     return response.messages ?? [];
+  }
+
+  async readMessage(sessionKey: string, messageId: string) {
+    await this.waitUntilReady();
+    const result = await this.requestGateway("chat.message.get", {
+      sessionKey,
+      messageId,
+    });
+    return result.ok === true ? (result.message ?? null) : null;
   }
 
   /** Send a reply using the same channel route stored on the conversation. */
@@ -492,7 +501,7 @@ export class OpenClawChannelBridge {
     if (this.closed) {
       return;
     }
-    const id = normalizeApprovalId(payload.id);
+    const id = toText(payload.id);
     if (!id) {
       return;
     }
@@ -548,7 +557,7 @@ export class OpenClawChannelBridge {
   }
 
   private resolveTrackedApproval(payload: Record<string, unknown>): void {
-    const id = normalizeApprovalId(payload.id);
+    const id = toText(payload.id);
     if (id) {
       this.pendingApprovals.delete(id);
     }

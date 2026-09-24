@@ -4,8 +4,10 @@
  * This module builds runtime plugin tools from config/options, delivery context,
  * auth profiles, and the current runtime config snapshot.
  */
+import { getRuntimeConfigSnapshot } from "../config/config.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import {
+  resolveMessageActionTurnAuthorization,
   resolveMessageActionTurnCapability,
   selectMessageActionRequesterIdentity,
 } from "../gateway/message-action-turn-capability.js";
@@ -15,12 +17,14 @@ import {
   getPluginRuntimeGatewayRequestScope,
   withPluginRuntimeRegistryScope,
 } from "../plugins/runtime/gateway-request-scope.js";
+import { getPluginRuntimeLoadContext } from "../plugins/runtime/load-context.js";
 import type { OpenClawPluginToolDelivery } from "../plugins/tool-types.js";
 import { resolvePluginTools } from "../plugins/tools.js";
 import type { OpenClawPluginToolContext } from "../plugins/types.js";
 import { createLazyRuntimeModule } from "../shared/lazy-runtime.js";
 import { resolveApiKeyForProfile, resolveAuthProfileOrder } from "./auth-profiles.js";
 import type { AuthProfileStore } from "./auth-profiles/types.js";
+import { bindRequesterOwnerIdentity } from "./cron-creator-authority-context.js";
 import {
   createRuntimeProviderAuthLookup,
   hasRuntimeAvailableProviderAuth,
@@ -31,11 +35,10 @@ import {
   resolveOpenClawPluginToolInputs,
   type OpenClawPluginToolOptions,
 } from "./openclaw-tools.plugin-context.js";
-import { applyPluginToolDeliveryDefaults } from "./plugin-tool-delivery-defaults.js";
-import { getPreparedPluginRuntimeLoadContext } from "./prepared-model-runtime.plugin-context.js";
 import type { PreparedModelRuntimeSnapshot } from "./prepared-model-runtime.types.js";
 import { resolveAgentRuntimeToolConfig } from "./tool-runtime-config.js";
 import type { AnyAgentTool } from "./tools/common.js";
+import { captureGatewayToolCallerAssertion } from "./tools/gateway-caller-context.js";
 import { hasProviderAuthForTool } from "./tools/model-config.helpers.js";
 
 type ResolveOpenClawPluginToolsOptions = OpenClawPluginToolOptions & {
@@ -88,6 +91,22 @@ function createPluginToolDelivery(params: {
   ) {
     return undefined;
   }
+  // Capabilities bind the source policy session, even when plugins execute in
+  // a shared or durable session. Keep validation separate from execution identity.
+  const policySessionKey = params.options?.agentSessionKey ?? sessionKey;
+  if (
+    resolveMessageActionTurnAuthorization({
+      token,
+      agentId,
+      runId,
+      sessionKey: policySessionKey,
+      sessionId,
+    })?.scheduled
+  ) {
+    // Scheduled grants are consumed by individual message actions. They do not
+    // delegate the source conversation's plugin delivery capability.
+    return undefined;
+  }
   const channelPlugin = activeRegistry.channels.find(
     (entry) => entry.plugin.id === deliveryContext.channel,
   )?.plugin;
@@ -114,7 +133,7 @@ function createPluginToolDelivery(params: {
       token,
       agentId,
       runId,
-      sessionKey,
+      sessionKey: policySessionKey,
       sessionId,
     });
     if (!authorization) {
@@ -188,7 +207,7 @@ function createPluginToolDelivery(params: {
   };
 }
 
-/** Resolves plugin tools for an agent run and applies delivery-context defaults. */
+/** Resolves plugin tools and their delivery context for an agent run. */
 export function resolveOpenClawPluginToolsForOptions(params: {
   options?: ResolveOpenClawPluginToolsOptions;
   resolvedConfig?: OpenClawConfig;
@@ -198,19 +217,30 @@ export function resolveOpenClawPluginToolsForOptions(params: {
     return [];
   }
 
-  const resolveCurrentRuntimeConfig = () => {
-    // Re-resolve on demand so auth/profile lookups see the active runtime config
-    // while tests can still inject a fixed resolvedConfig.
-    return resolveAgentRuntimeToolConfig(params.resolvedConfig ?? params.options?.config);
-  };
+  const inputConfig = params.resolvedConfig ?? params.options?.config;
+  const availabilityConfig = resolveAgentRuntimeToolConfig(inputConfig);
+  // Bind ownership before reload replaces the source snapshot. Explicit run
+  // overrides stay isolated; runtime-owned contexts follow later publications.
+  const followsRuntimeConfig =
+    inputConfig === undefined || availabilityConfig === getRuntimeConfigSnapshot();
+  const resolveCurrentRuntimeConfig = () =>
+    followsRuntimeConfig ? resolveAgentRuntimeToolConfig() : availabilityConfig;
   const pluginToolInputs = resolveOpenClawPluginToolInputs({
     options: params.options,
     resolvedConfig: params.resolvedConfig,
-    runtimeConfig: resolveCurrentRuntimeConfig(),
+    runtimeConfig: availabilityConfig,
     getRuntimeConfig: resolveCurrentRuntimeConfig,
   });
   const authProfileStore = params.options?.authProfileStore;
-  const availabilityConfig = resolveCurrentRuntimeConfig();
+  const requesterOwner =
+    pluginToolInputs.context.senderIsOwner === true
+      ? undefined
+      : bindRequesterOwnerIdentity({
+          runId: params.options?.runId,
+          sessionKey: pluginToolInputs.context.sessionKey,
+          sessionId: pluginToolInputs.context.sessionId,
+          agentId: pluginToolInputs.context.agentId,
+        });
   const delivery = createPluginToolDelivery({
     options: params.options,
     context: pluginToolInputs.context,
@@ -242,6 +272,7 @@ export function resolveOpenClawPluginToolsForOptions(params: {
           cfg,
           store: authProfileStore,
           provider: providerId,
+          includePendingOAuthRefresh: true,
         })) {
           const resolved = await resolveApiKeyForProfile({
             cfg,
@@ -288,8 +319,17 @@ export function resolveOpenClawPluginToolsForOptions(params: {
     : undefined;
   const existingToolNames = new Set(params.existingToolNames ?? []);
   const preparedModelRuntime = params.options?.preparedModelRuntime;
-  const runtimeRegistry =
-    getPluginRuntimeGatewayRequestScope()?.pluginRegistry ?? getActivePluginRegistry() ?? undefined;
+  const requestRegistry = getPluginRuntimeGatewayRequestScope()?.pluginRegistry;
+  const runtimeRegistry = requestRegistry ?? getActivePluginRegistry() ?? undefined;
+  // A scoped registry can own prepared plugin facts without a model runtime (headless cron).
+  // Never borrow process-global load facts for an unrelated direct caller.
+  const preparedRegistry = preparedModelRuntime
+    ? preparedModelRuntime.pluginRegistry
+    : requestRegistry;
+  const loadContext = getPluginRuntimeLoadContext(preparedRegistry);
+  const metadataSnapshot = preparedModelRuntime?.metadataSnapshot ?? loadContext?.metadataSnapshot;
+  const assertCallerCurrent = captureGatewayToolCallerAssertion();
+  const assertRequestCurrent = params.options?.assertInvocationCurrent;
   const pluginTools = resolvePluginTools({
     ...pluginToolInputs,
     context: {
@@ -299,18 +339,25 @@ export function resolveOpenClawPluginToolsForOptions(params: {
       ...(resolveApiKeyForProvider ? { resolveApiKeyForProvider } : {}),
     },
     existingToolNames,
+    assertInvocationCurrent: assertRequestCurrent
+      ? () => {
+          assertCallerCurrent?.();
+          assertRequestCurrent();
+        }
+      : assertCallerCurrent,
+    ownerContinuation: requesterOwner,
     clientCaps: params.options?.clientCaps,
     toolAllowlist: params.options?.pluginToolAllowlist,
     toolDenylist: params.options?.pluginToolDenylist,
     allowGatewaySubagentBinding: params.options?.allowGatewaySubagentBinding,
     ...(hasAuthForProvider ? { hasAuthForProvider } : {}),
     ...(runtimeRegistry ? { runtimeRegistry } : {}),
-    ...(preparedModelRuntime
+    ...(metadataSnapshot
       ? {
           preparedRuntime: {
-            loadContext: getPreparedPluginRuntimeLoadContext(preparedModelRuntime.pluginRegistry),
-            metadataSnapshot: preparedModelRuntime.metadataSnapshot,
-            registry: preparedModelRuntime.pluginRegistry,
+            loadContext,
+            metadataSnapshot,
+            registry: preparedRegistry,
           },
         }
       : {}),
@@ -323,12 +370,9 @@ export function resolveOpenClawPluginToolsForOptions(params: {
       existingToolNames,
       toolAllowlist: params.options?.pluginToolAllowlist,
       toolDenylist: params.options?.pluginToolDenylist,
-      agentSessionKey: params.options?.agentSessionKey,
+      agentSessionKey: pluginToolInputs.context.sessionKey,
     }),
   );
 
-  return applyPluginToolDeliveryDefaults({
-    tools: pluginTools,
-    deliveryContext: pluginToolInputs.context.deliveryContext,
-  });
+  return pluginTools;
 }

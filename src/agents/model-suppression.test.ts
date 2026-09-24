@@ -14,17 +14,16 @@ vi.mock("../plugins/manifest-model-suppression.js", () => ({
   buildManifestBuiltInModelSuppressionResolver: mocks.buildManifestBuiltInModelSuppressionResolver,
 }));
 
-import {
-  getCurrentPluginMetadataSnapshot,
-  setCurrentPluginMetadataSnapshot,
-} from "../plugins/current-plugin-metadata-snapshot.js";
+import { getCurrentPluginMetadataSnapshot } from "../plugins/current-plugin-metadata-snapshot.js";
+import { setCurrentPluginMetadataSnapshot } from "../plugins/current-plugin-metadata.test-support.js";
+import { createPluginCache, getPluginCache, withPluginCache } from "../plugins/plugin-cache.js";
 import * as pluginControlPlaneContext from "../plugins/plugin-control-plane-context.js";
 import { clearPluginMetadataLifecycleCaches } from "../plugins/plugin-metadata-lifecycle.js";
 import * as pluginMetadataSnapshot from "../plugins/plugin-metadata-snapshot.js";
 import { withPluginRuntimeGenerationScope } from "../plugins/runtime/generation-scope.js";
 import {
   buildShouldSuppressBuiltInModelCore,
-  shouldSuppressBuiltInModelCore,
+  resolveBuiltInModelSuppressionFromManifest,
 } from "./model-suppression.js";
 
 const originalBundledPluginsDir = process.env.OPENCLAW_BUNDLED_PLUGINS_DIR;
@@ -45,6 +44,24 @@ describe("model suppression", () => {
     }
   });
 
+  it("does not reuse standalone suppression rules across fresh operation owners", () => {
+    const config = {};
+    const firstOwner = createPluginCache();
+    const secondOwner = createPluginCache();
+    mocks.buildManifestBuiltInModelSuppressionResolver.mockImplementation(() => {
+      const suppressed = getPluginCache() === firstOwner;
+      return () =>
+        suppressed ? { suppress: true, errorMessage: "first operation policy" } : undefined;
+    });
+    const check = () =>
+      resolveBuiltInModelSuppressionFromManifest({ provider: "fixture", id: "model", config })
+        ?.suppress;
+
+    expect(withPluginCache(firstOwner, check)).toBe(true);
+    expect(withPluginCache(secondOwner, check)).toBeUndefined();
+    expect(withPluginCache(firstOwner, check)).toBe(true);
+  });
+
   it("uses manifest suppression", () => {
     const resolver = vi.fn().mockReturnValueOnce({
       suppress: true,
@@ -54,11 +71,11 @@ describe("model suppression", () => {
     mocks.buildManifestBuiltInModelSuppressionResolver.mockReturnValueOnce(resolver);
 
     expect(
-      shouldSuppressBuiltInModelCore({
+      resolveBuiltInModelSuppressionFromManifest({
         provider: "openai",
         id: "gpt-5.3-codex-spark",
         config,
-      }),
+      })?.suppress,
     ).toBe(true);
 
     expect(mocks.buildManifestBuiltInModelSuppressionResolver).toHaveBeenCalledOnce();
@@ -66,40 +83,38 @@ describe("model suppression", () => {
       config,
       env: process.env,
     });
-    expect(resolver).toHaveBeenCalledWith({
-      provider: "openai",
-      id: "gpt-5.3-codex-spark",
-    });
   });
 
-  it("does not run deprecated runtime suppression hooks", () => {
+  it("returns no decision when no manifest suppression applies", () => {
     const resolver = vi.fn().mockReturnValueOnce(undefined);
     mocks.buildManifestBuiltInModelSuppressionResolver.mockReturnValueOnce(resolver);
 
     expect(
-      shouldSuppressBuiltInModelCore({
+      resolveBuiltInModelSuppressionFromManifest({
         provider: "openai",
         id: "gpt-5.3-codex-spark",
         config: {},
-      }),
-    ).toBe(false);
+      })?.suppress,
+    ).toBeUndefined();
 
     expect(mocks.buildManifestBuiltInModelSuppressionResolver).toHaveBeenCalledOnce();
   });
 
-  it("reuses manifest suppression resolver for repeated checks with the same scope", () => {
+  it("delegates repeated checks to the manifest-owned resolver", () => {
     const resolver = vi.fn().mockReturnValue(undefined);
     const config = {};
-    mocks.buildManifestBuiltInModelSuppressionResolver.mockReturnValueOnce(resolver);
+    mocks.buildManifestBuiltInModelSuppressionResolver.mockReturnValue(resolver);
 
-    expect(shouldSuppressBuiltInModelCore({ provider: "openai", id: "gpt-5.3", config })).toBe(
-      false,
-    );
-    expect(shouldSuppressBuiltInModelCore({ provider: "anthropic", id: "claude-4", config })).toBe(
-      false,
-    );
+    expect(
+      resolveBuiltInModelSuppressionFromManifest({ provider: "openai", id: "gpt-5.3", config })
+        ?.suppress,
+    ).toBeUndefined();
+    expect(
+      resolveBuiltInModelSuppressionFromManifest({ provider: "anthropic", id: "claude-4", config })
+        ?.suppress,
+    ).toBeUndefined();
 
-    expect(mocks.buildManifestBuiltInModelSuppressionResolver).toHaveBeenCalledOnce();
+    expect(mocks.buildManifestBuiltInModelSuppressionResolver).toHaveBeenCalledTimes(2);
     expect(resolver).toHaveBeenCalledTimes(2);
   });
 
@@ -120,21 +135,23 @@ describe("model suppression", () => {
       manifestRegistry: { plugins: [], diagnostics: [] },
     });
     setCurrentPluginMetadataSnapshot(firstSnapshot, { config });
-    expect(shouldSuppressBuiltInModelCore({ provider: "openai", id: "gpt-5.3", config })).toBe(
-      false,
-    );
+    expect(
+      resolveBuiltInModelSuppressionFromManifest({ provider: "openai", id: "gpt-5.3", config })
+        ?.suppress,
+    ).toBeUndefined();
 
     setCurrentPluginMetadataSnapshot(secondSnapshot, { config });
-    expect(shouldSuppressBuiltInModelCore({ provider: "openai", id: "gpt-5.3", config })).toBe(
-      false,
-    );
+    expect(
+      resolveBuiltInModelSuppressionFromManifest({ provider: "openai", id: "gpt-5.3", config })
+        ?.suppress,
+    ).toBeUndefined();
 
     expect(mocks.buildManifestBuiltInModelSuppressionResolver).toHaveBeenCalledTimes(2);
     expect(firstResolver).toHaveBeenCalledOnce();
     expect(secondResolver).toHaveBeenCalledOnce();
   });
 
-  it("reuses each concurrent generation's suppression resolver across A/B/A interleaving", async () => {
+  it("reads each concurrent generation's suppression rules across A/B/A interleaving", async () => {
     const config = {} satisfies OpenClawConfig;
     const snapshotA = createPluginMetadataSnapshot({
       config,
@@ -158,45 +175,42 @@ describe("model suppression", () => {
     const aReady = new Promise<void>((resolve) => {
       markAReady = resolve;
     });
-    const resultA = withPluginRuntimeGenerationScope(
-      { config, metadataSnapshot: snapshotA },
-      async () => {
-        const result = shouldSuppressBuiltInModelCore({
+    const resultA = withPluginRuntimeGenerationScope({ metadataSnapshot: snapshotA }, async () => {
+      const result = resolveBuiltInModelSuppressionFromManifest({
+        provider: "openai",
+        id: "generation-model",
+        config,
+      })?.suppress;
+      markAReady();
+      await holdA;
+      return [
+        result,
+        resolveBuiltInModelSuppressionFromManifest({
           provider: "openai",
           id: "generation-model",
           config,
-        });
-        markAReady();
-        await holdA;
-        return [
-          result,
-          shouldSuppressBuiltInModelCore({
-            provider: "openai",
-            id: "generation-model",
-            config,
-          }),
-        ];
-      },
-    );
+        })?.suppress,
+      ];
+    });
     await aReady;
 
     const resultB = await withPluginRuntimeGenerationScope(
-      { config, metadataSnapshot: snapshotB },
+      { metadataSnapshot: snapshotB },
       async () =>
-        shouldSuppressBuiltInModelCore({
+        resolveBuiltInModelSuppressionFromManifest({
           provider: "openai",
           id: "generation-model",
           config,
-        }),
+        })?.suppress,
     );
     releaseA();
 
     await expect(resultA).resolves.toEqual([true, true]);
-    expect(resultB).toBe(false);
-    expect(mocks.buildManifestBuiltInModelSuppressionResolver).toHaveBeenCalledTimes(2);
+    expect(resultB).toBeUndefined();
+    expect(mocks.buildManifestBuiltInModelSuppressionResolver).toHaveBeenCalledTimes(3);
   });
 
-  it("keys generation resolvers by config identity and workspace", () => {
+  it("passes config identity and workspace to the manifest owner", () => {
     const configA = {} satisfies OpenClawConfig;
     const configB = {} satisfies OpenClawConfig;
     const snapshot = createPluginMetadataSnapshot({
@@ -206,23 +220,25 @@ describe("model suppression", () => {
     mocks.buildManifestBuiltInModelSuppressionResolver.mockReturnValue(() => undefined);
 
     const check = (config: OpenClawConfig, workspaceDir: string) =>
-      withPluginRuntimeGenerationScope({ config, metadataSnapshot: snapshot }, () =>
-        shouldSuppressBuiltInModelCore({
-          provider: "openai",
-          id: "generation-model",
-          config,
-          workspaceDir,
-        }),
+      withPluginRuntimeGenerationScope(
+        { metadataSnapshot: snapshot },
+        () =>
+          resolveBuiltInModelSuppressionFromManifest({
+            provider: "openai",
+            id: "generation-model",
+            config,
+            workspaceDir,
+          })?.suppress,
       );
 
-    expect(check(configA, "/workspace/a")).toBe(false);
-    expect(check(configB, "/workspace/a")).toBe(false);
-    expect(check(configA, "/workspace/b")).toBe(false);
-    expect(check(configA, "/workspace/a")).toBe(false);
-    expect(mocks.buildManifestBuiltInModelSuppressionResolver).toHaveBeenCalledTimes(3);
+    expect(check(configA, "/workspace/a")).toBeUndefined();
+    expect(check(configB, "/workspace/a")).toBeUndefined();
+    expect(check(configA, "/workspace/b")).toBeUndefined();
+    expect(check(configA, "/workspace/a")).toBeUndefined();
+    expect(mocks.buildManifestBuiltInModelSuppressionResolver).toHaveBeenCalledTimes(4);
   });
 
-  it("does not recompute content fingerprints on a stable generation cache hit", () => {
+  it("does not fingerprint metadata while delegating prepared generation reads", () => {
     const config = {} satisfies OpenClawConfig;
     const snapshot = createPluginMetadataSnapshot({
       config,
@@ -235,33 +251,16 @@ describe("model suppression", () => {
     );
     const envFingerprint = vi.spyOn(pluginMetadataSnapshot, "resolvePluginMetadataEnvFingerprint");
 
-    withPluginRuntimeGenerationScope({ config, metadataSnapshot: snapshot }, () => {
-      shouldSuppressBuiltInModelCore({ provider: "openai", id: "gpt-5.3", config });
+    withPluginRuntimeGenerationScope({ metadataSnapshot: snapshot }, () => {
+      resolveBuiltInModelSuppressionFromManifest({ provider: "openai", id: "gpt-5.3", config });
       controlPlaneFingerprint.mockClear();
       envFingerprint.mockClear();
 
-      shouldSuppressBuiltInModelCore({ provider: "anthropic", id: "claude-4", config });
+      resolveBuiltInModelSuppressionFromManifest({ provider: "anthropic", id: "claude-4", config });
 
       expect(controlPlaneFingerprint).not.toHaveBeenCalled();
       expect(envFingerprint).not.toHaveBeenCalled();
     });
-  });
-
-  it("rebuilds a generation resolver after plugin metadata lifecycle caches clear", () => {
-    const config = {} satisfies OpenClawConfig;
-    const snapshot = createPluginMetadataSnapshot({
-      config,
-      manifestRegistry: { plugins: [], diagnostics: [] },
-    });
-    mocks.buildManifestBuiltInModelSuppressionResolver.mockReturnValue(() => undefined);
-
-    withPluginRuntimeGenerationScope({ config, metadataSnapshot: snapshot }, () => {
-      shouldSuppressBuiltInModelCore({ provider: "openai", id: "gpt-5.3", config });
-      clearPluginMetadataLifecycleCaches();
-      shouldSuppressBuiltInModelCore({ provider: "anthropic", id: "claude-4", config });
-    });
-
-    expect(mocks.buildManifestBuiltInModelSuppressionResolver).toHaveBeenCalledTimes(2);
   });
 
   it("refreshes manifest suppression resolver when process env plugin metadata inputs change", () => {
@@ -273,14 +272,16 @@ describe("model suppression", () => {
       .mockReturnValueOnce(secondResolver);
 
     process.env.OPENCLAW_BUNDLED_PLUGINS_DIR = "/tmp/openclaw-bundled-a";
-    expect(shouldSuppressBuiltInModelCore({ provider: "openai", id: "gpt-5.3", config })).toBe(
-      false,
-    );
+    expect(
+      resolveBuiltInModelSuppressionFromManifest({ provider: "openai", id: "gpt-5.3", config })
+        ?.suppress,
+    ).toBeUndefined();
 
     process.env.OPENCLAW_BUNDLED_PLUGINS_DIR = "/tmp/openclaw-bundled-b";
-    expect(shouldSuppressBuiltInModelCore({ provider: "openai", id: "gpt-5.3", config })).toBe(
-      false,
-    );
+    expect(
+      resolveBuiltInModelSuppressionFromManifest({ provider: "openai", id: "gpt-5.3", config })
+        ?.suppress,
+    ).toBeUndefined();
 
     expect(mocks.buildManifestBuiltInModelSuppressionResolver).toHaveBeenCalledTimes(2);
     expect(firstResolver).toHaveBeenCalledOnce();
@@ -295,14 +296,16 @@ describe("model suppression", () => {
       .mockReturnValueOnce(firstResolver)
       .mockReturnValueOnce(secondResolver);
 
-    expect(shouldSuppressBuiltInModelCore({ provider: "openai", id: "gpt-5.3", config })).toBe(
-      false,
-    );
+    expect(
+      resolveBuiltInModelSuppressionFromManifest({ provider: "openai", id: "gpt-5.3", config })
+        ?.suppress,
+    ).toBeUndefined();
 
     config.plugins.load.paths = ["/tmp/openclaw-plugin-b"];
-    expect(shouldSuppressBuiltInModelCore({ provider: "openai", id: "gpt-5.3", config })).toBe(
-      false,
-    );
+    expect(
+      resolveBuiltInModelSuppressionFromManifest({ provider: "openai", id: "gpt-5.3", config })
+        ?.suppress,
+    ).toBeUndefined();
 
     expect(mocks.buildManifestBuiltInModelSuppressionResolver).toHaveBeenCalledTimes(2);
     expect(firstResolver).toHaveBeenCalledOnce();
@@ -314,7 +317,7 @@ describe("model suppression", () => {
       mocks.buildManifestBuiltInModelSuppressionResolver.mockReset();
     });
 
-    it("creates a reusable manifest resolver with lowercase provider and model ids", () => {
+    it("reuses the manifest owner for repeated model decisions", () => {
       const resolver = vi
         .fn()
         .mockReturnValueOnce({ suppress: true, errorMessage: "manifest suppression" })
@@ -331,25 +334,6 @@ describe("model suppression", () => {
         config,
         env: process.env,
       });
-      expect(resolver).toHaveBeenNthCalledWith(1, {
-        provider: "bedrock",
-        id: "claude-3",
-      });
-      expect(resolver).toHaveBeenNthCalledWith(2, {
-        provider: "aws-bedrock",
-        id: "claude-4",
-      });
-    });
-
-    it("does not call the manifest resolver for empty provider or model ids", () => {
-      const resolver = vi.fn();
-      mocks.buildManifestBuiltInModelSuppressionResolver.mockReturnValueOnce(resolver);
-
-      const shouldSuppress = buildShouldSuppressBuiltInModelCore({});
-
-      expect(shouldSuppress({ provider: "openai", id: "" })).toBe(false);
-      expect(shouldSuppress({ provider: "", id: "gpt-5.5" })).toBe(false);
-      expect(resolver).not.toHaveBeenCalled();
     });
   });
 });

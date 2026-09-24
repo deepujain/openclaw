@@ -2,13 +2,19 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import * as tar from "tar";
-import { resolveStateDir } from "../config/config.js";
+import { readConfigFileSnapshot, resolveStateDir } from "../config/config.js";
 import { formatErrorMessage } from "../infra/errors.js";
 import { type RuntimeEnv, writeRuntimeJson } from "../runtime.js";
-import { resolveUserPath, shortenHomePath } from "../utils.js";
-import { BACKUP_MAX_DECOMPRESSION_RATIO, canonicalizePathForContainment } from "./backup-shared.js";
-import { verifyBackupArchive } from "./backup-verify.js";
+import { shortenHomePath } from "../utils.js";
+import {
+  BACKUP_MAX_DECOMPRESSION_RATIO,
+  canonicalizePathForContainment,
+  resolveBackupAgentRoots,
+  resolveRequiredBackupPath,
+} from "./backup-shared.js";
+import { prepareBackupArchive } from "./backup-verify.js";
 import { isPathWithin } from "./cleanup-utils.js";
+import { resolveStartupConfigSnapshot } from "./doctor/shared/automatic-startup-config-repair.js";
 
 const BACKUP_RESTORE_WARNINGS = [
   "Restoring an archive is time travel: every restored state surface rolls back to the archive timestamp.",
@@ -24,26 +30,10 @@ type BackupRestoreOptions = {
   json?: boolean;
 };
 
-type BackupRestoreResult = {
-  ok: true;
-  archivePath: string;
+type BackupRestoreResult = Awaited<ReturnType<typeof prepareBackupArchive>>["result"] & {
   targetPath: string;
-  archiveRoot: string;
-  createdAt: string;
-  runtimeVersion: string;
-  assetCount: number;
-  entryCount: number;
-  symlinkCount: number;
   warnings: string[];
 };
-
-function resolveRequiredTarget(value: string | undefined): string {
-  const trimmed = value?.trim();
-  if (!trimmed) {
-    throw new Error("Missing required --target value.");
-  }
-  return path.resolve(resolveUserPath(trimmed));
-}
 
 async function assertTargetOutsideLiveState(targetPath: string): Promise<void> {
   const [canonicalTarget, canonicalStateDir] = await Promise.all([
@@ -54,6 +44,19 @@ async function assertTargetOutsideLiveState(targetPath: string): Promise<void> {
     throw new Error(
       `Backup restore target must be outside the live OpenClaw state directory: ${targetPath}`,
     );
+  }
+  const configSnapshot = await readConfigFileSnapshot({ observe: false });
+  const discoverySnapshot = resolveStartupConfigSnapshot(configSnapshot);
+  if (!discoverySnapshot) {
+    return;
+  }
+  const agentRoots = await resolveBackupAgentRoots(discoverySnapshot.config);
+  for (const { sourcePath } of agentRoots) {
+    if (isPathWithin(canonicalTarget, sourcePath)) {
+      throw new Error(
+        `Backup restore target must be outside the live OpenClaw agent directory: ${targetPath}`,
+      );
+    }
   }
 }
 
@@ -87,7 +90,12 @@ async function cleanupFailedRestore(targetPath: string, created: boolean): Promi
   }
 }
 
-async function extractBackupArchive(archivePath: string, targetPath: string): Promise<void> {
+async function extractBackupArchive(
+  archivePath: string,
+  targetPath: string,
+  hardlinkTargets: ReadonlyMap<string, string>,
+  symbolicLinkPaths: ReadonlySet<string>,
+): Promise<void> {
   let extractionError: Error | undefined;
   await tar.x({
     file: archivePath,
@@ -98,6 +106,15 @@ async function extractBackupArchive(archivePath: string, targetPath: string): Pr
     // Verification catches fatal archive errors; rethrow recoverable warnings after close.
     strict: false,
     preserveOwner: false,
+    // Create links only after file writes finish; never extract through a link.
+    filter: (entryPath) => !symbolicLinkPaths.has(entryPath),
+    // node-tar calls this before its path checks and filesystem reservations.
+    onReadEntry: (entry) => {
+      const target = hardlinkTargets.get(entry.path);
+      if (target !== undefined) {
+        entry.linkpath = target;
+      }
+    },
     onwarn: (code, message, data) => {
       extractionError ??=
         data instanceof Error ? data : Object.assign(new Error(`${code}: ${message}`), data);
@@ -127,30 +144,36 @@ export async function backupRestoreCommand(
   runtime: RuntimeEnv,
   options: BackupRestoreOptions,
 ): Promise<BackupRestoreResult> {
-  const targetPath = resolveRequiredTarget(options.target);
+  const targetPath = resolveRequiredBackupPath(options.target, "--target");
   await assertTargetOutsideLiveState(targetPath);
-  const verified = await verifyBackupArchive(options.archive);
+  const {
+    result: verified,
+    hardlinkTargets,
+    symbolicLinks,
+  } = await prepareBackupArchive(options.archive);
   const target = await prepareRestoreTarget(targetPath);
 
-  let extractionError: unknown;
-  let extractionFailed = false;
   try {
-    await extractBackupArchive(verified.archivePath, targetPath);
-  } catch (caughtExtractionError) {
-    extractionError = caughtExtractionError;
-    extractionFailed = true;
-  }
-  if (extractionFailed) {
-    let cleanupError: unknown;
-    let cleanupFailed = false;
+    await extractBackupArchive(
+      verified.archivePath,
+      targetPath,
+      hardlinkTargets,
+      new Set(symbolicLinks.map(({ entryPath }) => entryPath)),
+    );
+    // Materialize all parents before links: filesystem aliases then collide with
+    // directories instead of letting an earlier link redirect a later write.
+    for (const { entryPath } of symbolicLinks) {
+      await fs.mkdir(path.dirname(path.join(targetPath, entryPath)), { recursive: true });
+    }
+    for (const { entryPath, linkpath } of symbolicLinks) {
+      await fs.symlink(linkpath, path.join(targetPath, entryPath));
+    }
+  } catch (extractionError) {
     try {
       await cleanupFailedRestore(targetPath, target.created);
-    } catch (caughtCleanupError) {
-      cleanupError = caughtCleanupError;
-      cleanupFailed = true;
-    }
-    if (cleanupFailed) {
-      // Extraction stays the primary cause; cleanup rides along as the second AggregateError entry.
+    } catch (cleanupError) {
+      // Both errors are retained; extraction remains the primary cause, not cleanup.
+      // oxlint-disable-next-line preserve-caught-error -- AggregateError.errors preserves the cleanup error.
       throw new AggregateError(
         [extractionError, cleanupError],
         `Backup restore failed and the incomplete target could not be cleaned: ${targetPath}. Cleanup error: ${formatErrorMessage(cleanupError)}`,
@@ -165,7 +188,13 @@ export async function backupRestoreCommand(
   const result: BackupRestoreResult = {
     ...verified,
     targetPath,
-    warnings: [...BACKUP_RESTORE_WARNINGS],
+    warnings: [
+      ...BACKUP_RESTORE_WARNINGS,
+      ...(verified.externalSymbolicLinks ?? []).map(
+        ({ entryPath, linkpath }) =>
+          `External link restored (target not copied through link): ${JSON.stringify(entryPath)} -> ${JSON.stringify(linkpath)}`,
+      ),
+    ],
   };
   if (options.json) {
     writeRuntimeJson(runtime, result);

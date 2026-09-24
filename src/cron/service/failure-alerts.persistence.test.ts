@@ -1,84 +1,206 @@
 // Failure alerts must describe only cron outcomes that survived durable persistence.
 import { describe, expect, it, vi } from "vitest";
-import {
-  createDueIsolatedJob,
-  noopLogger,
-  setupCronRegressionFixtures,
-} from "../../../test/helpers/cron/service-regression-fixtures.js";
+import { setupCronRegressionFixtures } from "../../../test/helpers/cron/service-regression-fixtures.js";
 import { openOpenClawStateDatabase } from "../../state/openclaw-state-db.js";
-import { markCronJobActive } from "../active-jobs.js";
+import { cronScriptFailureMetadata } from "../script-failure.js";
 import { loadCronStore, saveCronStore } from "../store.js";
 import { cronStoreKey } from "../store/key.js";
-import type { CronJob, CronRunStatus } from "../types.js";
-import { createCronServiceState } from "./state.js";
-import { finalizeCompletedCronRunOutcomes } from "./timer-outcome-finalization.js";
-import { applyJobResult, authorCronRunCompletion } from "./timer.js";
+import type { CronJob } from "../types.js";
+import {
+  createAlertJob,
+  createAlertState,
+  finalizeAlertOutcome,
+  type SendCronFailureAlert,
+} from "./failure-alerts.test-support.js";
+import {
+  applyJobResultAndDrainNotifications,
+  applyTriggerNoFireResultAndDrainNotifications,
+} from "./notification.test-helpers.js";
+import { restoreFinalizedStartupRun } from "./startup-run-repair.js";
+import type { DeferredCronNotifications } from "./state.js";
+import { applyJobResult } from "./timer.js";
 
 const fixtures = setupCronRegressionFixtures({
   prefix: "cron-failure-alert-persistence-",
 });
 
-type SendCronFailureAlert = NonNullable<
-  Parameters<typeof createCronServiceState>[0]["sendCronFailureAlert"]
->;
-
-function createAlertJob(params: { id: string; dueAt: number; includeSkipped?: boolean }): CronJob {
-  const job = createDueIsolatedJob({
-    id: params.id,
-    nowMs: params.dueAt,
-    nextRunAtMs: params.dueAt,
-  });
-  job.schedule = { kind: "every", everyMs: 60_000, anchorMs: params.dueAt - 60_000 };
-  job.failureAlert = {
-    after: 1,
-    cooldownMs: 60_000,
-    ...(params.includeSkipped ? { includeSkipped: true } : {}),
-  };
-  job.state.runningAtMs = params.dueAt;
-  return job;
-}
-
-function createAlertState(params: {
-  storePath: string;
-  nowMs: () => number;
-  sendCronFailureAlert: SendCronFailureAlert;
-}) {
-  return createCronServiceState({
-    cronEnabled: true,
-    storePath: params.storePath,
-    log: noopLogger,
-    nowMs: params.nowMs,
-    enqueueSystemEvent: vi.fn(),
-    requestHeartbeat: vi.fn(),
-    sendCronFailureAlert: params.sendCronFailureAlert,
-    runIsolatedAgentJob: vi.fn(),
-  });
-}
-
-async function finalizeAlertOutcome(params: {
-  state: ReturnType<typeof createCronServiceState>;
-  job: CronJob;
-  status: Extract<CronRunStatus, "error" | "skipped">;
-  error: string;
-  startedAt: number;
-  endedAt: number;
-}) {
-  await finalizeCompletedCronRunOutcomes(params.state, [
-    {
-      jobId: params.job.id,
-      job: structuredClone(params.job),
-      activeJobMarker: markCronJobActive(params.job.id),
-      ...authorCronRunCompletion(params.state, params.job, {
-        status: params.status,
-        error: params.error,
-      }),
-      startedAt: params.startedAt,
-      endedAt: params.endedAt,
-    },
-  ]);
-}
-
 describe("cron failure alert persistence", () => {
+  it.each(["error", "ok"] as const)(
+    "shares cooldown across alternating failures starting %s",
+    (firstStatus) => {
+      const store = fixtures.makeStorePath();
+      let now = Date.parse("2026-08-01T14:49:00Z");
+      const job = createAlertJob({ id: "shared-alert-cooldown", dueAt: now });
+      job.delivery = {
+        mode: "announce",
+        failureDestination: { mode: "webhook", to: "https://alerts.example.test/cron" },
+      };
+      const sendCronFailureAlert = vi.fn<SendCronFailureAlert>(async () => undefined);
+      const state = createAlertState({
+        storePath: store.storePath,
+        nowMs: () => now,
+        sendCronFailureAlert,
+      });
+      for (const status of [firstStatus, firstStatus === "error" ? "ok" : "error"] as const) {
+        applyJobResultAndDrainNotifications(state, job, {
+          status,
+          delivered: false,
+          error: status === "error" ? "execution failed" : undefined,
+          deliveryError: "primary rejected",
+          startedAt: now,
+          endedAt: now,
+        });
+        now += 1_000;
+      }
+      expect(sendCronFailureAlert).toHaveBeenCalledOnce();
+      applyJobResultAndDrainNotifications(state, job, {
+        status: "ok",
+        delivered: true,
+        startedAt: now,
+        endedAt: now,
+      });
+      expect(job.state.lastFailureAlertAtMs).toBeUndefined();
+      expect(sendCronFailureAlert).toHaveBeenCalledTimes(2);
+      expect(sendCronFailureAlert.mock.calls[1]?.[0].payload.text).toContain("recovered");
+      applyJobResultAndDrainNotifications(state, job, {
+        status: "ok",
+        delivered: false,
+        deliveryError: "primary rejected",
+        startedAt: now,
+        endedAt: now,
+      });
+      expect(sendCronFailureAlert).toHaveBeenCalledTimes(3);
+    },
+  );
+
+  it.each(["skipped run", "quiet trigger"])(
+    "keeps delivery cooldown across a %s",
+    (intervening) => {
+      const store = fixtures.makeStorePath();
+      const firstAt = Date.parse("2026-08-01T14:49:00Z");
+      let now = firstAt;
+      const job = createAlertJob({ id: "delivery-alert-order", dueAt: now });
+      job.delivery = {
+        mode: "announce",
+        failureDestination: { mode: "webhook", to: "https://alerts.example.test/cron" },
+      };
+      const sendCronFailureAlert = vi.fn(async () => undefined);
+      const state = createAlertState({
+        storePath: store.storePath,
+        nowMs: () => now,
+        sendCronFailureAlert,
+      });
+      const failDelivery = () =>
+        applyJobResultAndDrainNotifications(state, job, {
+          status: "ok",
+          delivered: false,
+          deliveryError: "primary rejected",
+          startedAt: now,
+          endedAt: now,
+        });
+      failDelivery();
+      expect(sendCronFailureAlert).toHaveBeenCalledOnce();
+      now += 1_000;
+      if (intervening === "skipped run") {
+        applyJobResultAndDrainNotifications(state, job, {
+          status: "skipped",
+          startedAt: now,
+          endedAt: now,
+        });
+      } else {
+        applyTriggerNoFireResultAndDrainNotifications(state, job, {
+          startedAt: now,
+          endedAt: now,
+          triggerEval: { fired: false, stateChanged: false },
+        });
+      }
+      now += 1_000;
+      failDelivery();
+      expect(sendCronFailureAlert).toHaveBeenCalledOnce();
+      expect(job.state.lastFailureAlertAtMs).toBe(firstAt);
+    },
+  );
+
+  it.each(
+    [
+      {
+        name: "recorded attempt",
+        notification: { status: "unknown" as const },
+        priorOffset: -20_000,
+        expectedOffset: 0,
+      },
+      {
+        name: "newer alert",
+        notification: { status: "delivered" as const, delivered: true },
+        priorOffset: 10_000,
+        expectedOffset: 10_000,
+      },
+      {
+        name: "future timestamp",
+        notification: { status: "unknown" as const },
+        priorOffset: 120_000,
+        expectedOffset: 0,
+      },
+      {
+        name: "suppressed alert",
+        notification: { status: "not-requested" as const },
+        priorOffset: -120_000,
+        expectedOffset: -120_000,
+      },
+      {
+        name: "absent fact",
+        notification: undefined,
+        priorOffset: -120_000,
+        expectedOffset: -120_000,
+      },
+    ].flatMap((testCase) =>
+      (["ok", "error", "skipped"] as const).flatMap((status) =>
+        [false, true].map((enabled) => ({ testCase, name: testCase.name, status, enabled })),
+      ),
+    ),
+  )(
+    "restores $status cooldown from $name (alerts enabled=$enabled) without transport",
+    ({ testCase, status, enabled }) => {
+      const endedAt = Date.parse("2026-08-01T14:50:00Z");
+      const store = fixtures.makeStorePath();
+      const job = createAlertJob({ id: "delivery-replay", dueAt: endedAt - 10 });
+      job.delivery = { mode: "none" };
+      job.failureAlert = enabled ? { after: 1, cooldownMs: 60_000, includeSkipped: true } : false;
+      job.state.lastFailureAlertAtMs = endedAt + testCase.priorOffset;
+      const sendCronFailureAlert = vi.fn(async () => undefined);
+      const state = createAlertState({
+        storePath: store.storePath,
+        nowMs: () => endedAt + 30_000,
+        sendCronFailureAlert,
+      });
+      const deferredNotifications: DeferredCronNotifications = [];
+      restoreFinalizedStartupRun({
+        state,
+        job,
+        runningAtMs: endedAt - 10,
+        deferredNotifications,
+        entry: {
+          ts: endedAt,
+          jobId: job.id,
+          action: "finished",
+          status,
+          completionStatus: "failed",
+          deliveryStatus: "not-delivered",
+          deliveryError: "primary rejected",
+          failureNotificationDelivery: testCase.notification,
+          runAtMs: endedAt - 10,
+        },
+      });
+      expect(job.state.lastFailureAlertAtMs).toBe(endedAt + testCase.expectedOffset);
+      expect(job.state.lastFailureNotificationDeliveryStatus).toBe(
+        testCase.notification?.status ?? "not-requested",
+      );
+      expect(deferredNotifications).toEqual([]);
+      expect(sendCronFailureAlert).not.toHaveBeenCalled();
+      expect(state.deps.enqueueSystemEvent).not.toHaveBeenCalled();
+    },
+  );
+
   it.each([
     { status: "error", includeSkipped: false },
     { status: "skipped", includeSkipped: true },
@@ -199,7 +321,7 @@ describe("cron failure alert persistence", () => {
       nowMs: () => now,
       sendCronFailureAlert,
     });
-    const deferredNotifications: Array<() => void> = [];
+    const deferredNotifications: DeferredCronNotifications = [];
 
     applyJobResult(
       state,
@@ -210,7 +332,7 @@ describe("cron failure alert persistence", () => {
         startedAt: replayedAt - 10,
         endedAt: replayedAt,
       },
-      { replayFailureAlertAtMs: replayedAt, deferredNotifications },
+      { replay: true, deferredNotifications },
     );
 
     expect(job.state.lastFailureAlertAtMs).toBe(previousAlertAt);
@@ -262,7 +384,7 @@ describe("cron failure alert persistence", () => {
     }
   });
 
-  it("persists the cooldown atomically and suppresses a second alert", async () => {
+  it("persists an incident and suppresses repeats after a service reload past cooldown", async () => {
     const store = fixtures.makeStorePath();
     const dueAt = Date.parse("2026-08-01T14:58:00.000Z");
     const firstAlertAt = dueAt + 10;
@@ -300,7 +422,7 @@ describe("cron failure alert persistence", () => {
       state,
       job: currentJob,
       status: "error",
-      error: "second failure",
+      error: "first failure",
       startedAt: now,
       endedAt: now + 10,
     });
@@ -313,5 +435,168 @@ describe("cron failure alert persistence", () => {
         lastFailureNotificationDeliveryStatus: "not-requested",
       },
     });
+
+    now += 60_000;
+    const reloadedState = createAlertState({
+      storePath: store.storePath,
+      nowMs: () => now,
+      sendCronFailureAlert,
+    });
+    await finalizeAlertOutcome({
+      state: reloadedState,
+      job: currentJob,
+      status: "error",
+      error: "first failure",
+      startedAt: now,
+      endedAt: now + 10,
+    });
+    expect(sendCronFailureAlert).toHaveBeenCalledOnce();
+
+    sendCronFailureAlert.mockImplementationOnce(async () => {
+      expect(
+        (await loadCronStore(store.storePath)).jobs[0]?.state.failureAlertIncident,
+      ).toBeUndefined();
+    });
+    const recoveredJob = reloadedState.store?.jobs[0];
+    if (!recoveredJob) {
+      throw new Error("expected reloaded cron job");
+    }
+    now += 1_000;
+    await finalizeAlertOutcome({
+      state: reloadedState,
+      job: recoveredJob,
+      status: "ok",
+      startedAt: now,
+      endedAt: now + 10,
+    });
+    expect(sendCronFailureAlert).toHaveBeenCalledTimes(2);
+    await sendCronFailureAlert.mock.results[1]?.value;
   });
+
+  it.each([
+    { source: "trigger", busy: false, recovered: true },
+    { source: "trigger", busy: true, recovered: false },
+    { source: "payload", busy: false, recovered: false },
+  ] as const)(
+    "only recovers a $source incident when the quiet trigger succeeds (busy=$busy)",
+    ({ source, busy, recovered }) => {
+      const store = fixtures.makeStorePath();
+      const now = Date.parse("2026-08-01T15:00:00Z");
+      const job = createAlertJob({ id: "trigger-recovery-scope", dueAt: now });
+      const sendCronFailureAlert = vi.fn<SendCronFailureAlert>(async () => undefined);
+      const state = createAlertState({
+        storePath: store.storePath,
+        nowMs: () => now,
+        sendCronFailureAlert,
+      });
+      applyJobResultAndDrainNotifications(state, job, {
+        status: "error",
+        error: "plugin reload failed",
+        failureNotificationDetail: { kind: "script-failure", source, code: "plugin_reload_failed" },
+        startedAt: now,
+        endedAt: now,
+      });
+      applyTriggerNoFireResultAndDrainNotifications(state, job, {
+        startedAt: now + 1_000,
+        endedAt: now + 1_001,
+        triggerEval: { fired: false, stateChanged: false, ...(busy ? { busy: true } : {}) },
+      });
+      expect(sendCronFailureAlert).toHaveBeenCalledTimes(recovered ? 2 : 1);
+      if (recovered) {
+        expect(sendCronFailureAlert.mock.calls[1]?.[0]).toMatchObject({
+          payload: {
+            text: 'Automation "trigger-recovery-scope" recovered\nThe trigger check completed successfully; no run was needed.',
+          },
+        });
+        expect(sendCronFailureAlert.mock.calls[1]?.[0].runAtMs).toBeUndefined();
+        expect(job.state.failureAlertIncident).toBeUndefined();
+      } else {
+        expect(job.state.failureAlertIncident).toBeDefined();
+      }
+    },
+  );
+
+  it.each([
+    { after: 1, triggerFirst: true },
+    { after: 3, triggerFirst: true },
+    { after: 2, triggerFirst: false },
+  ])(
+    "keeps a payload failure open across trigger checks (threshold=$after, triggerFirst=$triggerFirst)",
+    ({ after, triggerFirst }) => {
+      const store = fixtures.makeStorePath();
+      let now = Date.parse("2026-08-01T15:00:00Z");
+      const job = createAlertJob({ id: "mixed-trigger-payload-incident", dueAt: now });
+      const sendCronFailureAlert = vi.fn<SendCronFailureAlert>(async () => undefined);
+      const state = createAlertState({
+        storePath: store.storePath,
+        nowMs: () => now,
+        sendCronFailureAlert,
+      });
+      const fail = (source: "trigger" | "payload", code: "timeout" | "plugin_reload_failed") =>
+        applyJobResultAndDrainNotifications(state, job, {
+          status: "error",
+          error: "script failure",
+          ...cronScriptFailureMetadata(source, code),
+          startedAt: now,
+          endedAt: now,
+        });
+      if (triggerFirst) {
+        fail("trigger", "timeout");
+      }
+      job.failureAlert = { after, cooldownMs: 60_000 };
+      now += 1_000;
+      fail("payload", "timeout");
+      expect(sendCronFailureAlert).toHaveBeenCalledTimes(triggerFirst ? 1 : 0);
+      now += 60_000;
+      fail("trigger", "plugin_reload_failed");
+      const incidentAlerts = triggerFirst ? 2 : 1;
+      expect(sendCronFailureAlert).toHaveBeenCalledTimes(incidentAlerts);
+      applyTriggerNoFireResultAndDrainNotifications(state, job, {
+        startedAt: now + 1_000,
+        endedAt: now + 1_001,
+        triggerEval: { fired: false, stateChanged: false },
+      });
+      expect(sendCronFailureAlert).toHaveBeenCalledTimes(incidentAlerts);
+      expect(job.state.failureAlertIncident?.scope).toBe("run");
+      applyJobResultAndDrainNotifications(state, job, {
+        status: "ok",
+        startedAt: now + 2_000,
+        endedAt: now + 2_001,
+      });
+      expect(sendCronFailureAlert).toHaveBeenCalledTimes(incidentAlerts + 1);
+      expect(sendCronFailureAlert.mock.calls[incidentAlerts]?.[0].payload.text).toContain(
+        "recovered",
+      );
+    },
+  );
+
+  it.each(["trigger", "payload"] as const)(
+    "clears an unreported %s failure after success without notifying",
+    (source) => {
+      const store = fixtures.makeStorePath();
+      const now = Date.parse("2026-08-01T15:00:00Z");
+      const job = createAlertJob({ id: "unreported-incident-recovery", dueAt: now });
+      job.failureAlert = { after: 2 };
+      const sendCronFailureAlert = vi.fn<SendCronFailureAlert>(async () => undefined);
+      const state = createAlertState({
+        storePath: store.storePath,
+        nowMs: () => now,
+        sendCronFailureAlert,
+      });
+      applyJobResultAndDrainNotifications(state, job, {
+        status: "error",
+        error: "script failure",
+        ...cronScriptFailureMetadata(source, "plugin_reload_failed"),
+        startedAt: now,
+        endedAt: now,
+      });
+      applyJobResultAndDrainNotifications(state, job, {
+        status: "ok",
+        startedAt: now + 1_000,
+        endedAt: now + 1_001,
+      });
+      expect(sendCronFailureAlert).not.toHaveBeenCalled();
+      expect(job.state.failureAlertIncident).toBeUndefined();
+    },
+  );
 });

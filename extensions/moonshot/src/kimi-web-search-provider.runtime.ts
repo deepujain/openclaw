@@ -24,11 +24,7 @@ import {
   wrapWebContent,
   writeCachedSearchPayload,
 } from "openclaw/plugin-sdk/provider-web-search";
-import {
-  isRecord,
-  normalizeOptionalString,
-  uniqueStrings,
-} from "openclaw/plugin-sdk/string-coerce-runtime";
+import { isRecord, normalizeOptionalString } from "openclaw/plugin-sdk/string-coerce-runtime";
 import {
   isNativeMoonshotBaseUrl,
   MOONSHOT_BASE_URL,
@@ -136,14 +132,17 @@ function extractKimiMessageText(message: KimiMessage | undefined): string | unde
   return reasoning || undefined;
 }
 
-function extractKimiCitations(data: KimiSearchResponse): string[] {
+function collectKimiCitations(data: KimiSearchResponse, citations: Set<string>): void {
   const searchResults = data.search_results ?? [];
   if (!Array.isArray(searchResults)) {
     throwMalformedKimiResponse();
   }
-  const citations = searchResults
-    .map((entry) => (isRecord(entry) && typeof entry.url === "string" ? entry.url.trim() : ""))
-    .filter((url): url is string => Boolean(url));
+  for (const entry of searchResults) {
+    const url = isRecord(entry) && typeof entry.url === "string" ? entry.url.trim() : "";
+    if (url) {
+      citations.add(url);
+    }
+  }
 
   const choices = data.choices ?? [];
   if (!Array.isArray(choices)) {
@@ -170,20 +169,18 @@ function extractKimiCitations(data: KimiSearchResponse): string[] {
       };
       const parsedUrl = normalizeOptionalString(parsed.url);
       if (parsedUrl) {
-        citations.push(parsedUrl);
+        citations.add(parsedUrl);
       }
       for (const result of parsed.search_results ?? []) {
         const resultUrl = normalizeOptionalString(result.url);
         if (resultUrl) {
-          citations.push(resultUrl);
+          citations.add(resultUrl);
         }
       }
     } catch {
       // ignore malformed tool arguments
     }
   }
-
-  return uniqueStrings(citations);
 }
 
 function hasKimiSearchResults(data: KimiSearchResponse): boolean {
@@ -258,9 +255,7 @@ async function runKimiSearch(params: {
         if (hasKimiSearchResults(data)) {
           hasGroundingEvidence = true;
         }
-        for (const citation of extractKimiCitations(data)) {
-          collectedCitations.add(citation);
-        }
+        collectKimiCitations(data, collectedCitations);
         if (collectedCitations.size > 0) {
           hasGroundingEvidence = true;
         }
@@ -371,7 +366,8 @@ export async function executeKimiWebSearchProviderTool(
   const model = resolveKimiModel(kimiConfig);
   const baseUrl = resolveKimiBaseUrl(kimiConfig, ctx.config);
   const cacheKey = buildSearchCacheKey(["kimi", query, baseUrl, model]);
-  const cached = readCachedSearchPayload(cacheKey);
+  const cacheTtlMs = resolveSearchCacheTtlMs(searchConfig);
+  const cached = readCachedSearchPayload(cacheKey, cacheTtlMs);
   if (cached) {
     return cached;
   }
@@ -412,7 +408,7 @@ export async function executeKimiWebSearchProviderTool(
     content: wrapWebContent(result.content),
     citations: result.citations,
   };
-  writeCachedSearchPayload(cacheKey, payload, resolveSearchCacheTtlMs(searchConfig));
+  writeCachedSearchPayload(cacheKey, payload, cacheTtlMs);
   return payload;
 }
 
@@ -498,11 +494,3 @@ export async function runKimiSearchProviderSetup(
   setProviderWebSearchPluginConfigValue(next, "moonshot", "model", model);
   return next;
 }
-
-export const testing = {
-  resolveKimiApiKey,
-  resolveKimiModel,
-  resolveKimiBaseUrl,
-  extractKimiCitations,
-  extractKimiToolResultContent,
-} as const;

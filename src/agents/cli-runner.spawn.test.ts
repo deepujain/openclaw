@@ -15,7 +15,6 @@ import {
 import { invokeNodeClaudeCliRun } from "../gateway/node-agent-cli-runtime.js";
 import { onAgentEvent, resetAgentEventsForTest } from "../infra/agent-events.js";
 import {
-  onTrustedToolExecutionEvent,
   setDiagnosticsEnabledForProcess,
   waitForDiagnosticEventsDrained,
 } from "../infra/diagnostic-events.js";
@@ -24,37 +23,37 @@ import {
   startDiagnosticRunActivityTracking,
 } from "../logging/diagnostic-run-activity.js";
 import type { getProcessSupervisor } from "../process/supervisor/index.js";
-import { createTestAdmittedRunContext } from "./admitted-run-context.test-support.js";
+import { prepareSystemAgentRunAdmission } from "./admitted-run-context.js";
 import {
-  buildClaudeLiveRunContext,
   buildPreparedCliRunContext,
   captureModelCallDiagnostics,
-  createClaudeInputStartedEvent,
   expectPathMissing,
   expectRejectsWithFields,
   expectModelCallTypes,
   mockCallArg,
-  mockClaudeLiveRun,
   requireArgAfter,
   requireRecord,
   requireRegexMatch,
 } from "./cli-runner.test-helpers.js";
-import { resetClaudeLiveSessionsForTest } from "./cli-runner/claude-live-session.test-support.js";
 import {
   attachCliMessagingDeliveryEvidence,
   getCliMessagingDeliveryEvidence,
 } from "./cli-runner/delivery-evidence.js";
 import { logCliInvocation } from "./cli-runner/execute-logging.js";
-import { executePreparedCliRun } from "./cli-runner/execute.js";
+import { executePreparedCliRun as executePreparedCliRunImpl } from "./cli-runner/execute.js";
 import {
   buildCliExecLogLine,
   createManagedRun,
+  createSuccessfulProcessExit,
   setCliRunnerExecuteTestDeps,
   supervisorSpawnMock,
+  wrapPreparedCliRunWithTestAdmission,
 } from "./cli-runner/execute.test-support.js";
-import { buildCliAgentSystemPrompt, writeCliSystemPromptFile } from "./cli-runner/helpers.js";
+import { writeCliSystemPromptFile } from "./cli-runner/helpers.js";
 import { cliBackendLog, formatCliBackendOutputDigest } from "./cli-runner/log.js";
 import type { PreparedCliRunContext } from "./cli-runner/types.js";
+
+const executePreparedCliRun = wrapPreparedCliRunWithTestAdmission(executePreparedCliRunImpl);
 
 // Approval behavior is injected below; loading its gateway/tool graph here is incidental.
 vi.mock("./bash-tools.exec-approval-request.js", () => ({
@@ -79,19 +78,11 @@ vi.mock("../gateway/mcp-http.loopback-runtime.js", async (importOriginal) => {
   };
 });
 
-function emitClaudeInputStarted(stdout: ((chunk: string) => void) | undefined, data: string): void {
-  const event = createClaudeInputStartedEvent(data);
-  if (event) {
-    stdout?.(`${JSON.stringify(event)}\n`);
-  }
-}
-
 beforeEach(() => {
   setDiagnosticsEnabledForProcess(true);
   resetAgentEventsForTest();
   resetDiagnosticRunActivityForTest();
   startDiagnosticRunActivityTracking();
-  resetClaudeLiveSessionsForTest();
   setCliRunnerExecuteTestDeps({
     writeCliSystemPromptFile,
     invokeNodeClaudeCliRun,
@@ -109,7 +100,6 @@ afterEach(() => {
   vi.restoreAllMocks();
   vi.useRealTimers();
   resetDiagnosticRunActivityForTest();
-  resetClaudeLiveSessionsForTest();
 });
 
 const CLAUDE_OK_JSONL = `${JSON.stringify({ type: "result", result: "ok" })}\n`;
@@ -122,14 +112,8 @@ const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 function mockSuccessfulCliRun(stdout = "ok") {
   supervisorSpawnMock.mockResolvedValueOnce(
     createManagedRun({
-      reason: "exit",
-      exitCode: 0,
-      exitSignal: null,
-      durationMs: 50,
+      ...createSuccessfulProcessExit(),
       stdout,
-      stderr: "",
-      timedOut: false,
-      noOutputTimedOut: false,
     }),
   );
 }
@@ -224,7 +208,9 @@ describe("runCliAgent spawn path", () => {
     expect(logLine).not.toContain("claude-session-secret");
   });
 
-  it("streams a node-placed Claude resume through the normal JSONL parser", async () => {
+  it("streams a node-placed Claude resume through the normal JSONL parser", async ({
+    onTestFinished,
+  }) => {
     const writeSystemPrompt = vi.fn(writeCliSystemPromptFile);
     let toolAvailability: unknown = "unset";
     const invokeNode = vi.fn(async (params: Parameters<typeof invokeNodeClaudeCliRun>[0]) => {
@@ -248,7 +234,7 @@ describe("runCliAgent spawn path", () => {
       writeCliSystemPromptFile: writeSystemPrompt,
       invokeNodeClaudeCliRun: invokeNode,
     });
-    const context = buildClaudeLiveRunContext({
+    const context = buildPreparedCliRunContext({
       model: "claude-opus-4-8",
       runId: "run-node-claude",
       prompt: "current turn",
@@ -311,12 +297,20 @@ describe("runCliAgent spawn path", () => {
     context.params.claimCliSessionFork = vi.fn(async () => true);
     context.params.persistCliSessionForkSuccessor = vi.fn(async () => {});
 
+    const admission = prepareSystemAgentRunAdmission(
+      {},
+      context.params.runId,
+      "main",
+      "cli-node-resume-test",
+    );
+    onTestFinished(admission.close);
+    context.params.admittedRunContext = await admission.admit("embedded");
     const output = await executePreparedCliRun(context, "source-node-session");
 
     expect(output).toMatchObject({ text: "node answer", sessionId: "forked-node-session" });
     // Node runs keep the gateway's native tool policy; loopback MCP tools do
     // not exist on the node so the OpenClaw list is projected empty.
-    expect(toolAvailability).toEqual({ native: [], openClaw: [], mcp: [] });
+    expect(toolAvailability).toEqual({ native: [], openClaw: [] });
     expect(writeSystemPrompt).not.toHaveBeenCalled();
     expect(supervisorSpawnMock).not.toHaveBeenCalled();
     expect(invokeNode).toHaveBeenCalledWith(
@@ -350,6 +344,52 @@ describe("runCliAgent spawn path", () => {
     );
   });
 
+  it.each([
+    {
+      selection: "200k",
+      preparedEnv: { CLAUDE_CODE_DISABLE_1M_CONTEXT: "1" },
+      expectedEnv: { CLAUDE_CODE_DISABLE_1M_CONTEXT: "1" },
+    },
+    { selection: "1m", preparedEnv: undefined, expectedEnv: undefined },
+  ])(
+    "forwards the $selection Claude context-window env policy to a paired node",
+    async (testCase) => {
+      const invokeNode = vi.fn(async (params: Parameters<typeof invokeNodeClaudeCliRun>[0]) => {
+        params.onProgress(
+          `${JSON.stringify({
+            type: "result",
+            session_id: `node-context-${testCase.selection}`,
+            result: "ok",
+          })}\n`,
+        );
+        return {
+          ok: true,
+          payloadJSON: JSON.stringify({ exitCode: 0, stderrTail: "", truncated: false }),
+        };
+      });
+      setCliRunnerExecuteTestDeps({ invokeNodeClaudeCliRun: invokeNode });
+      const context = buildPreparedCliRunContext({
+        model: "claude-fable-5",
+        runId: `run-node-context-${testCase.selection}`,
+        sessionEntry: {
+          sessionId: `openclaw-context-${testCase.selection}`,
+          updatedAt: 1,
+          execHost: "node",
+          execNode: "node-a",
+        },
+        backend: { clearEnv: ["CLAUDE_CODE_DISABLE_1M_CONTEXT"] },
+        preparedEnv: testCase.preparedEnv,
+      });
+
+      await expect(executePreparedCliRun(context)).resolves.toMatchObject({ text: "ok" });
+      expect(invokeNode).toHaveBeenCalledOnce();
+      expect(invokeNode.mock.calls[0]?.[0]).toMatchObject({
+        clearEnv: ["CLAUDE_CODE_DISABLE_1M_CONTEXT"],
+      });
+      expect(invokeNode.mock.calls[0]?.[0].env).toEqual(testCase.expectedEnv);
+    },
+  );
+
   it("surfaces a node-placed Claude synthetic empty terminal through the shared parser", async () => {
     const invokeNode = vi.fn(async (params: Parameters<typeof invokeNodeClaudeCliRun>[0]) => {
       params.onProgress(
@@ -377,7 +417,7 @@ describe("runCliAgent spawn path", () => {
       };
     });
     setCliRunnerExecuteTestDeps({ invokeNodeClaudeCliRun: invokeNode });
-    const context = buildClaudeLiveRunContext({
+    const context = buildPreparedCliRunContext({
       model: "claude-opus-4-8",
       runId: "run-node-synthetic-empty",
       prompt: "current turn",
@@ -410,7 +450,7 @@ describe("runCliAgent spawn path", () => {
       };
     });
     setCliRunnerExecuteTestDeps({ invokeNodeClaudeCliRun: invokeNode });
-    const context = buildClaudeLiveRunContext({
+    const context = buildPreparedCliRunContext({
       model: "claude-opus-4-8",
       prompt: "current turn",
       sessionEntry: {
@@ -716,63 +756,20 @@ describe("runCliAgent spawn path", () => {
   it("does not inject hardcoded 'Tools are disabled' text into CLI arguments", async () => {
     supervisorSpawnMock.mockResolvedValueOnce(
       createManagedRun({
-        reason: "exit",
-        exitCode: 0,
-        exitSignal: null,
-        durationMs: 50,
+        ...createSuccessfulProcessExit(),
         stdout: CLAUDE_OK_JSONL,
-        stderr: "",
-        timedOut: false,
-        noOutputTimedOut: false,
       }),
     );
 
-    const backendConfig = {
-      command: "claude",
-      args: ["-p", "--output-format", "stream-json"],
-      output: "jsonl" as const,
-      input: "stdin" as const,
-      modelArg: "--model",
-      sessionArgs: ["--session-id", "{sessionId}"],
-      systemPromptArg: "--append-system-prompt",
-      systemPromptWhen: "first" as const,
-      serialize: true,
-    };
-    const context: PreparedCliRunContext = {
-      params: {
-        admittedRunContext: createTestAdmittedRunContext("run-no-tools-disabled"),
-        sessionId: "s1",
-        sessionFile: "/tmp/session.jsonl",
-        workspaceDir: "/tmp",
-        prompt: "Run: node script.mjs",
-        provider: "claude-cli",
-        model: "sonnet",
-        timeoutMs: 1_000,
-        runId: "run-no-tools-disabled",
-        extraSystemPrompt: "You are a helpful assistant.",
+    const context = buildPreparedCliRunContext({
+      runId: "run-no-tools-disabled",
+      prompt: "Run: node script.mjs",
+      backend: {
+        systemPromptArg: "--append-system-prompt",
+        systemPromptFileArg: undefined,
       },
-      started: Date.now(),
-      workspaceDir: "/tmp",
-      backendResolved: {
-        id: "claude-cli",
-        config: backendConfig,
-        bundleMcp: true,
-        pluginId: "anthropic",
-      },
-      preparedBackend: {
-        backend: backendConfig,
-        env: {},
-      },
-      reusableCliSession: { mode: "none" },
-      hadSessionFile: false,
-      contextEngineConfig: {},
-      modelId: "sonnet",
-      normalizedModel: "sonnet",
-      systemPrompt: "You are a helpful assistant.",
-      systemPromptReport: {} as PreparedCliRunContext["systemPromptReport"],
-      bootstrapPromptWarningLines: [],
-      authEpochVersion: 2,
-    };
+    });
+    context.params.extraSystemPrompt = "You are a helpful assistant.";
     await executePreparedCliRun(context);
 
     const input = mockCallArg(supervisorSpawnMock) as { argv?: string[] };
@@ -781,38 +778,11 @@ describe("runCliAgent spawn path", () => {
     expect(allArgs).toContain("You are a helpful assistant.");
   });
 
-  it("includes the OpenClaw skills prompt in CLI system prompts", () => {
-    const systemPrompt = buildCliAgentSystemPrompt({
-      workspaceDir: "/tmp",
-      modelDisplay: "claude-cli/sonnet",
-      tools: [],
-      skillsPrompt: [
-        "<available_skills>",
-        "  <skill>",
-        "    <name>weather</name>",
-        "    <description>Use weather tools.</description>",
-        "    <location>/tmp/skills/weather/SKILL.md</location>",
-        "  </skill>",
-        "</available_skills>",
-      ].join("\n"),
-    });
-
-    expect(systemPrompt).toContain("## Skills");
-    expect(systemPrompt).toContain("<name>weather</name>");
-    expect(systemPrompt).toContain("/tmp/skills/weather/SKILL.md");
-  });
-
   it("pipes Claude prompts over stdin instead of argv", async () => {
     supervisorSpawnMock.mockResolvedValueOnce(
       createManagedRun({
-        reason: "exit",
-        exitCode: 0,
-        exitSignal: null,
-        durationMs: 50,
+        ...createSuccessfulProcessExit(),
         stdout: CLAUDE_OK_JSONL,
-        stderr: "",
-        timedOut: false,
-        noOutputTimedOut: false,
       }),
     );
 
@@ -864,14 +834,8 @@ describe("runCliAgent spawn path", () => {
       ].join("\n") + "\n";
     supervisorSpawnMock.mockResolvedValueOnce(
       createManagedRun({
-        reason: "exit",
-        exitCode: 0,
-        exitSignal: null,
-        durationMs: 50,
+        ...createSuccessfulProcessExit(),
         stdout,
-        stderr: "",
-        timedOut: false,
-        noOutputTimedOut: false,
       }),
     );
     const diagnostics = captureModelCallDiagnostics("run-claude-model-call-metadata");
@@ -966,14 +930,8 @@ describe("runCliAgent spawn path", () => {
       ].join("\n") + "\n";
     supervisorSpawnMock.mockResolvedValueOnce(
       createManagedRun({
-        reason: "exit",
-        exitCode: 0,
-        exitSignal: null,
-        durationMs: 50,
+        ...createSuccessfulProcessExit(),
         stdout,
-        stderr: "",
-        timedOut: false,
-        noOutputTimedOut: false,
       }),
     );
     const diagnostics = captureModelCallDiagnostics("run-claude-model-call-content");
@@ -1071,14 +1029,9 @@ describe("runCliAgent spawn path", () => {
       label: "parse failure",
       runId: "run-claude-model-call-parse-error",
       exit: {
+        ...createSuccessfulProcessExit(),
         reason: "exit" as const,
-        exitCode: 0,
-        exitSignal: null,
-        durationMs: 50,
         stdout: `${JSON.stringify({ type: "system", subtype: "unexpected" })}\n`,
-        stderr: "",
-        timedOut: false,
-        noOutputTimedOut: false,
       },
       errorCategory: "unknown",
       failureKind: undefined,
@@ -1125,14 +1078,8 @@ describe("runCliAgent spawn path", () => {
       );
       expect(input.argv).not.toContain("You are a helpful assistant.");
       return createManagedRun({
-        reason: "exit",
-        exitCode: 0,
-        exitSignal: null,
-        durationMs: 50,
+        ...createSuccessfulProcessExit(),
         stdout: CLAUDE_OK_JSONL,
-        stderr: "",
-        timedOut: false,
-        noOutputTimedOut: false,
       });
     });
 
@@ -1155,14 +1102,8 @@ describe("runCliAgent spawn path", () => {
       expect(input.argv).toContain("soft-cli-session");
       expect(input.argv?.join(" ")).toContain("/tmp/openclaw-soft-resume-system-prompt.md");
       return createManagedRun({
-        reason: "exit",
-        exitCode: 0,
-        exitSignal: null,
-        durationMs: 50,
+        ...createSuccessfulProcessExit(),
         stdout: "ok",
-        stderr: "",
-        timedOut: false,
-        noOutputTimedOut: false,
       });
     });
     const context = buildPreparedCliRunContext({
@@ -1261,10 +1202,7 @@ describe("runCliAgent spawn path", () => {
 
     expect(resolveExecutionArgs).toHaveBeenCalledWith(
       expect.objectContaining({
-        toolAvailability: {
-          ...toolAvailability,
-          mcp: ["mcp__openclaw__openclaw"],
-        },
+        toolAvailability,
       }),
     );
   });
@@ -1513,19 +1451,17 @@ describe("runCliAgent spawn path", () => {
     }
   });
 
-  it("maps Ultra to the strongest generic CLI backend level", async () => {
+  it("passes the prepared native effort for Ultra to the CLI backend", async () => {
     mockSuccessfulCliRun(CLAUDE_OK_JSONL);
     const resolveExecutionArgs = vi.fn(({ baseArgs }) => baseArgs);
 
-    await executePreparedCliRun(
-      buildPreparedCliRunContext({
-        thinkLevel: "ultra",
-        resolveExecutionArgs,
-      }),
-    );
+    await executePreparedCliRun({
+      ...buildPreparedCliRunContext({ thinkLevel: "ultra", resolveExecutionArgs }),
+      providerThinkingLevel: "high",
+    });
 
     const resolveArgsInput = requireRecord(mockCallArg(resolveExecutionArgs), "resolved args");
-    expect(resolveArgsInput.thinkingLevel).toBe("max");
+    expect(resolveArgsInput.thinkingLevel).toBe("high");
   });
 
   it("passes prepared backend env to the spawned CLI process", async () => {
@@ -1556,12 +1492,14 @@ describe("runCliAgent spawn path", () => {
     );
   });
 
-  it("captures a runtime artifact for a strict CLI credential", async () => {
+  it("captures a runtime artifact while preserving a strict CLI shim invocation", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-cli-strict-artifact-"));
+    const implementation = path.join(dir, "2.1.205");
     const executable = path.join(dir, "claude-fixture");
     try {
-      await fs.copyFile(process.execPath, executable);
-      await fs.chmod(executable, 0o755);
+      await fs.copyFile(process.execPath, implementation);
+      await fs.chmod(implementation, 0o755);
+      await fs.symlink(implementation, executable);
       mockSuccessfulCliRun(CLAUDE_OK_JSONL);
       const context = buildPreparedCliRunContext({
         backend: { command: executable },
@@ -1579,90 +1517,11 @@ describe("runCliAgent spawn path", () => {
 
       expect(context.runtimeArtifactFingerprint).toMatch(/^[a-f0-9]{64}$/u);
       expect(context.runtimeOwnerFingerprint).toBeUndefined();
-      const input = mockCallArg(supervisorSpawnMock) as { argv?: string[] };
-      expect(input.argv?.[0]).toBe(await fs.realpath(executable));
+      const input = mockCallArg(supervisorSpawnMock) as { argv?: string[]; argv0?: string };
+      expect(input.argv?.[0]).toBe(await fs.realpath(implementation));
+      expect(input.argv0).toBe(executable);
     } finally {
       await fs.rm(dir, { recursive: true, force: true });
-    }
-  });
-
-  it("passes OpenClaw skills to Claude as a session plugin", async () => {
-    const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-cli-skills-"));
-    const skillDir = path.join(workspaceDir, "skills", "weather");
-    await fs.mkdir(skillDir, { recursive: true });
-    await fs.writeFile(
-      path.join(skillDir, "SKILL.md"),
-      [
-        "---",
-        "name: weather",
-        "description: Use weather tools for forecasts.",
-        "---",
-        "",
-        "Read forecast data before replying.",
-      ].join("\n"),
-      "utf-8",
-    );
-
-    let pluginDir = "";
-    supervisorSpawnMock.mockImplementationOnce(async (...args: unknown[]) => {
-      const input = (args[0] ?? {}) as { argv?: string[] };
-      pluginDir = requireArgAfter(input.argv, "--plugin-dir");
-      const manifest = JSON.parse(
-        await fs.readFile(path.join(pluginDir, ".claude-plugin", "plugin.json"), "utf-8"),
-      ) as { name?: string; skills?: string };
-      expect(manifest.name).toBe("openclaw-skills");
-      expect(manifest.skills).toBe("./skills");
-      await expect(
-        fs.readFile(path.join(pluginDir, "skills", "weather", "SKILL.md"), "utf-8"),
-      ).resolves.toContain("Read forecast data before replying.");
-      return createManagedRun({
-        reason: "exit",
-        exitCode: 0,
-        exitSignal: null,
-        durationMs: 50,
-        stdout: CLAUDE_OK_JSONL,
-        stderr: "",
-        timedOut: false,
-        noOutputTimedOut: false,
-      });
-    });
-
-    try {
-      await executePreparedCliRun(
-        buildPreparedCliRunContext({
-          workspaceDir,
-          skillsSnapshot: {
-            prompt: "",
-            skills: [{ name: "weather" }],
-            resolvedSkills: [
-              {
-                name: "weather",
-                description: "Use weather tools for forecasts.",
-                filePath: path.join(skillDir, "SKILL.md"),
-                baseDir: skillDir,
-                source: "test",
-                sourceInfo: {
-                  path: skillDir,
-                  source: "test",
-                  scope: "project",
-                  origin: "top-level",
-                  baseDir: skillDir,
-                },
-                disableModelInvocation: false,
-              },
-            ],
-          },
-        }),
-      );
-      let accessError: unknown;
-      try {
-        await fs.access(pluginDir);
-      } catch (error) {
-        accessError = error;
-      }
-      expect((accessError as NodeJS.ErrnoException | undefined)?.code).toBe("ENOENT");
-    } finally {
-      await fs.rm(workspaceDir, { recursive: true, force: true });
     }
   });
 
@@ -1673,14 +1532,8 @@ describe("runCliAgent spawn path", () => {
       const input = (args[0] ?? {}) as { env?: Record<string, string> };
       expect(input.env?.CLI_SKILL_API_KEY).toBe("skill-secret");
       return createManagedRun({
-        reason: "exit",
-        exitCode: 0,
-        exitSignal: null,
-        durationMs: 50,
+        ...createSuccessfulProcessExit(),
         stdout: CLAUDE_OK_JSONL,
-        stderr: "",
-        timedOut: false,
-        noOutputTimedOut: false,
       });
     });
 
@@ -1717,14 +1570,8 @@ describe("runCliAgent spawn path", () => {
       const input = (args[0] ?? {}) as { env?: Record<string, string> };
       expect(input.env?.CLI_SKILL_API_KEY).toBeUndefined();
       return createManagedRun({
-        reason: "exit",
-        exitCode: 0,
-        exitSignal: null,
-        durationMs: 50,
+        ...createSuccessfulProcessExit(),
         stdout: CLAUDE_OK_JSONL,
-        stderr: "",
-        timedOut: false,
-        noOutputTimedOut: false,
       });
     });
 
@@ -1763,14 +1610,8 @@ describe("runCliAgent spawn path", () => {
     const logInfoSpy = vi.spyOn(cliBackendLog, "info").mockImplementation(() => undefined);
     supervisorSpawnMock.mockResolvedValueOnce(
       createManagedRun({
-        reason: "exit",
-        exitCode: 0,
-        exitSignal: null,
-        durationMs: 50,
+        ...createSuccessfulProcessExit(),
         stdout: "ok",
-        stderr: "",
-        timedOut: false,
-        noOutputTimedOut: false,
       }),
     );
 
@@ -1823,14 +1664,10 @@ describe("runCliAgent spawn path", () => {
   it("returns process diagnostics with byte counts and bounded output hashes", async () => {
     supervisorSpawnMock.mockResolvedValueOnce(
       createManagedRun({
-        reason: "exit",
-        exitCode: 0,
-        exitSignal: null,
+        ...createSuccessfulProcessExit(),
         durationMs: 75,
         stdout: "ok",
         stderr: "warn\n",
-        timedOut: false,
-        noOutputTimedOut: false,
       }),
     );
 
@@ -1858,10 +1695,7 @@ describe("runCliAgent spawn path", () => {
   it("rejects Gemini stream-json error results emitted with a zero exit code", async () => {
     supervisorSpawnMock.mockResolvedValueOnce(
       createManagedRun({
-        reason: "exit",
-        exitCode: 0,
-        exitSignal: null,
-        durationMs: 50,
+        ...createSuccessfulProcessExit(),
         stdout:
           [
             JSON.stringify({
@@ -1878,9 +1712,6 @@ describe("runCliAgent spawn path", () => {
               },
             }),
           ].join("\n") + "\n",
-        stderr: "",
-        timedOut: false,
-        noOutputTimedOut: false,
       }),
     );
 
@@ -1910,14 +1741,8 @@ describe("runCliAgent spawn path", () => {
         "utf-8",
       );
       return createManagedRun({
-        reason: "exit",
-        exitCode: 0,
-        exitSignal: null,
-        durationMs: 50,
+        ...createSuccessfulProcessExit(),
         stdout: "ok",
-        stderr: "",
-        timedOut: false,
-        noOutputTimedOut: false,
       });
     });
 
@@ -2029,16 +1854,7 @@ describe("runCliAgent spawn path", () => {
           result: "Hello world",
         }) + "\n",
       );
-      return createManagedRun({
-        reason: "exit",
-        exitCode: 0,
-        exitSignal: null,
-        durationMs: 50,
-        stdout: "",
-        stderr: "",
-        timedOut: false,
-        noOutputTimedOut: false,
-      });
+      return createManagedRun(createSuccessfulProcessExit());
     });
 
     try {
@@ -2079,16 +1895,7 @@ describe("runCliAgent spawn path", () => {
           }),
         ].join("\n") + "\n",
       );
-      return createManagedRun({
-        reason: "exit",
-        exitCode: 0,
-        exitSignal: null,
-        durationMs: 50,
-        stdout: "",
-        stderr: "",
-        timedOut: false,
-        noOutputTimedOut: false,
-      });
+      return createManagedRun(createSuccessfulProcessExit());
     });
 
     try {
@@ -2103,361 +1910,6 @@ describe("runCliAgent spawn path", () => {
       expect(agentEvents).toEqual([]);
     } finally {
       stop();
-    }
-  });
-
-  it("keeps one managed Claude model call open until background task results drain", async () => {
-    let stdoutListener: ((chunk: string) => void) | undefined;
-    const writes: string[] = [];
-    const cancel = vi.fn();
-    const interimChunk =
-      [
-        JSON.stringify({ type: "system", subtype: "init", session_id: "live-trace" }),
-        JSON.stringify({
-          type: "assistant",
-          session_id: "live-trace",
-          message: {
-            role: "assistant",
-            content: [{ type: "text", text: "working" }],
-            usage: { input_tokens: 4, output_tokens: 1, cache_read_input_tokens: 20 },
-          },
-        }),
-        JSON.stringify({
-          type: "system",
-          subtype: "background_tasks_changed",
-          tasks: [{ task_id: "task-1", task_type: "local_agent", description: "research" }],
-        }),
-        JSON.stringify({
-          type: "result",
-          subtype: "success",
-          session_id: "live-trace",
-          result: "working",
-          usage: { input_tokens: 5, output_tokens: 1, cache_read_input_tokens: 25 },
-        }),
-      ].join("\n") + "\n";
-    const finalChunk =
-      [
-        JSON.stringify({ type: "system", subtype: "background_tasks_changed", tasks: [] }),
-        JSON.stringify({
-          type: "assistant",
-          session_id: "live-trace",
-          message: {
-            role: "assistant",
-            content: [{ type: "text", text: "finished" }],
-            usage: { input_tokens: 6, output_tokens: 2, cache_read_input_tokens: 30 },
-          },
-        }),
-        JSON.stringify({
-          type: "result",
-          subtype: "success",
-          session_id: "live-trace",
-          result: "finished",
-          usage: {
-            input_tokens: 10,
-            output_tokens: 3,
-            cache_read_input_tokens: 50,
-            cache_creation_input_tokens: 2,
-          },
-        }),
-      ].join("\n") + "\n";
-    const stdin = {
-      write: vi.fn((data: string, cb?: (err?: Error | null) => void) => {
-        writes.push(data);
-        emitClaudeInputStarted(stdoutListener, data);
-        stdoutListener?.(interimChunk);
-        cb?.();
-      }),
-      end: vi.fn(),
-    };
-    supervisorSpawnMock.mockImplementationOnce(async (...args: unknown[]) => {
-      const input = (args[0] ?? {}) as { onStdout?: (chunk: string) => void };
-      stdoutListener = input.onStdout;
-      return {
-        runId: "live-model-call",
-        pid: 2345,
-        startedAtMs: Date.now(),
-        stdin,
-        wait: vi.fn(() => new Promise(() => {})),
-        cancel,
-      };
-    });
-    const diagnostics = captureModelCallDiagnostics("run-live-model-call-background");
-
-    try {
-      const run = executePreparedCliRun(
-        buildClaudeLiveRunContext({
-          model: "claude-sonnet-4-6",
-          runId: "run-live-model-call-background",
-          prompt: "research this",
-          config: {
-            diagnostics: {
-              enabled: true,
-              otel: {
-                enabled: true,
-                traces: true,
-                captureContent: true,
-              },
-            },
-          },
-        }),
-      );
-      await vi.waitFor(() => expect(writes).toHaveLength(1));
-      await waitForDiagnosticEventsDrained();
-      expect(diagnostics.events.map(({ event }) => event.type)).toEqual(["model.call.started"]);
-
-      stdoutListener?.(finalChunk);
-      const output = await run;
-      await waitForDiagnosticEventsDrained();
-
-      expect(output.text).toContain("working");
-      expect(output.text).toContain("finished");
-      expect(output.usage).toEqual({
-        input: 6,
-        output: 2,
-        cacheRead: 30,
-        cacheWrite: undefined,
-        total: undefined,
-      });
-      expectModelCallTypes(diagnostics, ["model.call.started", "model.call.completed"]);
-      const completed = diagnostics.events[1];
-      const inputUuid = (JSON.parse(writes[0] ?? "{}") as { uuid?: string }).uuid;
-      const lifecycleChunk = `${JSON.stringify({
-        type: "command_lifecycle",
-        command_uuid: inputUuid,
-        state: "started",
-      })}\n`;
-      expect(completed?.event).toMatchObject({
-        api: "claude-code",
-        transport: "stdio-live",
-        observationUnit: "turn",
-        requestPayloadBytes: Buffer.byteLength(writes[0] ?? ""),
-        responseStreamBytes:
-          Buffer.byteLength(lifecycleChunk) +
-          Buffer.byteLength(interimChunk) +
-          Buffer.byteLength(finalChunk),
-        usage: {
-          input: 10,
-          output: 3,
-          cacheRead: 50,
-          cacheWrite: 2,
-        },
-      });
-      expect(completed?.privateData.modelContent?.outputMessages).toEqual([
-        { role: "assistant", content: [{ type: "text", text: "working" }] },
-        { role: "assistant", content: [{ type: "text", text: "finished" }] },
-      ]);
-      expect(cancel).not.toHaveBeenCalled();
-    } finally {
-      diagnostics.stop();
-    }
-  });
-
-  it("emits one terminal model-call error for a managed Claude result failure", async () => {
-    mockClaudeLiveRun(supervisorSpawnMock, {
-      runId: "live-model-call-error",
-      pid: 2346,
-      events: [
-        {
-          type: "result",
-          subtype: "error_during_execution",
-          is_error: true,
-          session_id: "live-error",
-          result: "managed turn failed",
-          usage: { input_tokens: 8, output_tokens: 2, cache_read_input_tokens: 40 },
-        },
-      ],
-    });
-    const diagnostics = captureModelCallDiagnostics("run-live-model-call-error");
-
-    try {
-      await expect(
-        executePreparedCliRun(
-          buildClaudeLiveRunContext({
-            model: "claude-sonnet-4-6",
-            runId: "run-live-model-call-error",
-          }),
-        ),
-      ).rejects.toThrow(/managed turn failed/i);
-      await waitForDiagnosticEventsDrained();
-
-      expectModelCallTypes(diagnostics, ["model.call.started", "model.call.error"]);
-      expect(diagnostics.events[1]?.event).toMatchObject({
-        transport: "stdio-live",
-        usage: { input: 8, output: 2, cacheRead: 40 },
-      });
-    } finally {
-      diagnostics.stop();
-    }
-  });
-
-  it("extends the live no-output watchdog to the blocked-tool floor while a tool is outstanding", async () => {
-    const toolErrorEvents: Array<Record<string, unknown>> = [];
-    const stopDiagnostics = onTrustedToolExecutionEvent((event) => {
-      if (event.type === "tool.execution.error") {
-        toolErrorEvents.push(event as unknown as Record<string, unknown>);
-      }
-    });
-    let stdoutListener: ((chunk: string) => void) | undefined;
-    const cancel = vi.fn();
-    const stdin = {
-      write: vi.fn((data: string, callback?: (error?: Error | null) => void) => {
-        emitClaudeInputStarted(stdoutListener, data);
-        stdoutListener?.(
-          [
-            JSON.stringify({ type: "system", subtype: "init", session_id: "live-quiet-tool" }),
-            JSON.stringify({
-              type: "assistant",
-              message: {
-                content: [{ type: "tool_use", id: "tool-quiet-1", name: "Bash", input: {} }],
-              },
-            }),
-          ].join("\n") + "\n",
-        );
-        callback?.();
-      }),
-      end: vi.fn(),
-    };
-    supervisorSpawnMock.mockImplementationOnce(async (...args: unknown[]) => {
-      const input = (args[0] ?? {}) as { onStdout?: (chunk: string) => void };
-      stdoutListener = input.onStdout;
-      return {
-        pid: 2345,
-        startedAtMs: Date.now(),
-        stdin,
-        wait: vi.fn(() => new Promise(() => {})),
-        cancel,
-      };
-    });
-
-    const run = executePreparedCliRun(
-      buildClaudeLiveRunContext({
-        timeoutMs: 3_600_000,
-      }),
-    );
-    const rejection = run.then(
-      () => undefined,
-      (error: unknown) => error,
-    );
-    await vi.waitFor(() => {
-      expect(stdin.write).toHaveBeenCalledOnce();
-    });
-
-    // Fake the clock only after the spawn path settled, then emit one more
-    // stdout line so the watchdog re-arms on the faked setTimeout/Date.
-    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
-    stdoutListener?.(
-      `${JSON.stringify({
-        type: "stream_event",
-        event: { type: "content_block_delta", delta: { type: "text_delta", text: "running" } },
-      })}\n`,
-    );
-
-    // Base watchdog (600s cap for a 1h budget) must not kill the quiet tool.
-    vi.advanceTimersByTime(650_000);
-    expect(cancel).not.toHaveBeenCalled();
-
-    // The blocked-tool floor (15min of quiet) still terminates a wedged tool.
-    try {
-      vi.advanceTimersByTime(300_000);
-      expect(cancel).toHaveBeenCalledWith("manual-cancel");
-      const error = await rejection;
-      expect(error).toBeInstanceOf(Error);
-      expect((error as Error).message).toMatch(/produced no output for 900s/);
-      // Watchdog-killed turns must keep timeout provenance for active tools.
-      expect(toolErrorEvents).toContainEqual(
-        expect.objectContaining({
-          toolCallId: "tool-quiet-1",
-          terminalReason: "timed_out",
-        }),
-      );
-    } finally {
-      stopDiagnostics();
-    }
-  });
-
-  it("keeps non-capture live prepared backend cleanup with the whole-run owner", async () => {
-    mockClaudeLiveRun(supervisorSpawnMock, {
-      runId: "live-cleanup-run",
-      pid: 2346,
-      events: [
-        { type: "system", subtype: "init", session_id: "live-session-cleanup" },
-        { type: "result", session_id: "live-session-cleanup", result: "ok" },
-      ],
-    });
-    const preparedBackendCleanup = vi.fn(async () => {});
-    const context = buildClaudeLiveRunContext({
-      prompt: "first",
-      backend: {
-        args: ["-p", "--strict-mcp-config", "--mcp-config", "/tmp/mcp-cleanup.json"],
-      },
-      mcpConfigHash: "cleanup-mcp-config",
-    });
-    context.preparedBackend.cleanup = preparedBackendCleanup;
-
-    const result = await executePreparedCliRun(context);
-
-    expect(result.text).toBe("ok");
-    expect(context.preparedBackend.cleanup).toBe(preparedBackendCleanup);
-    expect(preparedBackendCleanup).not.toHaveBeenCalled();
-
-    resetClaudeLiveSessionsForTest();
-    expect(preparedBackendCleanup).not.toHaveBeenCalled();
-    await context.preparedBackend.cleanup?.();
-    expect(preparedBackendCleanup).toHaveBeenCalledOnce();
-  });
-
-  it("keeps captured live prepared backend cleanup with the whole-run owner", async () => {
-    const mcpConfigDir = await fs.mkdtemp(
-      path.join(os.tmpdir(), "openclaw-cli-captured-mcp-config-"),
-    );
-    const mcpConfigPath = path.join(mcpConfigDir, "mcp.json");
-    await fs.writeFile(
-      mcpConfigPath,
-      `${JSON.stringify(
-        {
-          mcpServers: {
-            openclaw: {
-              type: "http",
-              url: "http://127.0.0.1:23119/mcp",
-              headers: {},
-            },
-          },
-        },
-        null,
-        2,
-      )}\n`,
-      "utf-8",
-    );
-    try {
-      mockClaudeLiveRun(supervisorSpawnMock, {
-        cancelable: true,
-        pid: 2347,
-        events: [
-          { type: "system", subtype: "init", session_id: "captured-live-cleanup" },
-          { type: "result", session_id: "captured-live-cleanup", result: "ok" },
-        ],
-      });
-      const preparedBackendCleanup = vi.fn(async () => {});
-      const context = buildClaudeLiveRunContext({
-        prompt: "first",
-        backend: {
-          args: ["-p", "--strict-mcp-config", "--mcp-config", mcpConfigPath],
-        },
-        mcpConfigHash: "captured-cleanup-mcp-config",
-        mcpDeliveryCapture: true,
-      });
-      context.preparedBackend.cleanup = preparedBackendCleanup;
-
-      const result = await executePreparedCliRun(context);
-
-      expect(result.text).toBe("ok");
-      expect(context.preparedBackend.cleanup).toBe(preparedBackendCleanup);
-      expect(preparedBackendCleanup).not.toHaveBeenCalled();
-
-      await context.preparedBackend.cleanup?.();
-      expect(preparedBackendCleanup).toHaveBeenCalledOnce();
-    } finally {
-      await fs.rm(mcpConfigDir, { recursive: true, force: true });
     }
   });
 
@@ -2491,16 +1943,7 @@ describe("runCliAgent spawn path", () => {
       });
       markMcpLoopbackToolCallFinished(captureHandle);
       input.onStdout?.("done");
-      return createManagedRun({
-        reason: "exit",
-        exitCode: 0,
-        exitSignal: null,
-        durationMs: 50,
-        stdout: "",
-        stderr: "",
-        timedOut: false,
-        noOutputTimedOut: false,
-      });
+      return createManagedRun(createSuccessfulProcessExit());
     });
     const context = buildPreparedCliRunContext({
       provider: "codex-cli",
@@ -2776,42 +2219,6 @@ describe("runCliAgent spawn path", () => {
     expect(authLog).not.toContain("token-child");
     expect(authLog).not.toContain("/tmp/child-gemini-home");
     expect(authLog).not.toContain("sk-openai-child");
-  });
-
-  it("prepends bootstrap warnings to the CLI prompt body", async () => {
-    supervisorSpawnMock.mockResolvedValueOnce(
-      createManagedRun({
-        reason: "exit",
-        exitCode: 0,
-        exitSignal: null,
-        durationMs: 50,
-        stdout: "ok",
-        stderr: "",
-        timedOut: false,
-        noOutputTimedOut: false,
-      }),
-    );
-    const context = buildPreparedCliRunContext({
-      provider: "codex-cli",
-      model: "gpt-5.4",
-    });
-    context.reusableCliSession = { mode: "reuse", sessionId: "thread-123" };
-    context.bootstrapPromptWarningLines = [
-      "[Bootstrap truncation warning]",
-      "- AGENTS.md: 200 raw -> 20 injected",
-    ];
-
-    await executePreparedCliRun(context, "thread-123");
-
-    const input = mockCallArg(supervisorSpawnMock) as {
-      argv?: string[];
-      input?: string;
-    };
-    const promptCarrier = [input.input ?? "", ...(input.argv ?? [])].join("\n");
-
-    expect(promptCarrier).toContain("[Bootstrap truncation warning]");
-    expect(promptCarrier).toContain("- AGENTS.md: 200 raw -> 20 injected");
-    expect(promptCarrier).toContain("hi");
   });
 });
 /* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

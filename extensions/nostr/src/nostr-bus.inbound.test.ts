@@ -5,7 +5,7 @@ import path from "node:path";
 import {
   closeOpenClawStateDatabaseForTest,
   createChannelIngressQueueForTests,
-} from "openclaw/plugin-sdk/plugin-state-test-runtime";
+} from "openclaw/plugin-sdk/channel-ingress-test-runtime";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { PluginRuntime } from "../runtime-api.js";
 import { startNostrBus } from "./nostr-bus.js";
@@ -28,7 +28,7 @@ const mockState = vi.hoisted(() => ({
     onclose?: (reason: string[]) => void;
   }>,
   subscribeMany: vi.fn(),
-  publish: vi.fn((_relays: string[], _event: unknown) => [Promise.resolve("ok")]),
+  publish: vi.fn(async (_event: unknown) => "ok"),
   close: vi.fn(),
   subscriptionClose: vi.fn(),
   finalizeEvent: vi.fn((event: unknown) => event),
@@ -50,6 +50,7 @@ const mockState = vi.hoisted(() => ({
 vi.mock("nostr-tools", () => {
   class MockSimplePool {
     onRelayConnectionSuccess?: (relay: string) => void;
+    maxWaitForConnection = 3_000;
 
     subscribeMany(
       relays: string[],
@@ -71,8 +72,8 @@ vi.mock("nostr-tools", () => {
       };
     }
 
-    publish(relays: string[], event: unknown) {
-      return mockState.publish(relays, event);
+    async ensureRelay() {
+      return { publish: mockState.publish };
     }
 
     close(relays: string[]) {
@@ -162,7 +163,7 @@ describe("startNostrBus inbound guards", () => {
     ingressTasks = [];
     mockState.subscribeMany.mockClear();
     mockState.publish.mockReset();
-    mockState.publish.mockReturnValue([Promise.resolve("ok")]);
+    mockState.publish.mockResolvedValue("ok");
     mockState.close.mockClear();
     mockState.subscriptionClose.mockReset();
     mockState.finalizeEvent.mockClear();

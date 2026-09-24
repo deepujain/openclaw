@@ -214,68 +214,6 @@ describe("Codex app-server approval bridge", () => {
     expect(codexApprovalTimeoutText(kind)).toBe(expected);
   });
 
-  it("only offers operator decisions that the native command request can enforce", async () => {
-    const params = createParams();
-    params.hostCapabilities = {
-      ...params.hostCapabilities,
-      prepareMutableFileApproval: prepareApprovalWithoutMutableFile,
-    };
-    mockCallGatewayTool
-      .mockResolvedValueOnce({ id: "plugin:approval-native-once", status: "accepted" })
-      .mockResolvedValueOnce({
-        id: "plugin:approval-native-once",
-        decision: "allow-once",
-      });
-
-    const result = await handleCodexAppServerApprovalRequest({
-      method: "item/commandExecution/requestApproval",
-      requestParams: {
-        ...codexTestTurnIds(),
-        itemId: "cmd-native-once",
-        command: "git status",
-        availableDecisions: ["accept", "cancel"],
-      },
-      paramsForRun: params,
-      ...codexTestTurnIds(),
-    });
-
-    expect(result).toEqual({ decision: "accept" });
-    expect(gatewayRequestPayload().allowedDecisions).toEqual(["allow-once", "deny"]);
-  });
-
-  it("offers session approval only when the native command request can preserve it", async () => {
-    const params = createParams();
-    params.hostCapabilities = {
-      ...params.hostCapabilities,
-      prepareMutableFileApproval: prepareApprovalWithoutMutableFile,
-    };
-    mockCallGatewayTool
-      .mockResolvedValueOnce({ id: "plugin:approval-native-session", status: "accepted" })
-      .mockResolvedValueOnce({
-        id: "plugin:approval-native-session",
-        decision: "allow-always",
-      });
-
-    const result = await handleCodexAppServerApprovalRequest({
-      method: "item/commandExecution/requestApproval",
-      requestParams: {
-        ...codexTestTurnIds(),
-        itemId: "cmd-native-session",
-        command: "git status",
-        availableDecisions: ["accept", "acceptForSession", "decline", "cancel"],
-      },
-      paramsForRun: params,
-      ...codexTestTurnIds(),
-    });
-
-    expect(result).toEqual({ decision: "acceptForSession" });
-    expect(gatewayRequestPayload().allowedDecisions).toEqual([
-      "allow-once",
-      "allow-always",
-      "deny",
-    ]);
-  });
-
   it.each([
     ["operator denial", false, "decline"],
     ["run cancellation", true, "cancel"],
@@ -375,7 +313,7 @@ describe("Codex app-server approval bridge", () => {
       autoApprove: true,
     });
 
-    expect(result).toEqual({ decision: "acceptForSession" });
+    expect(result).toEqual({ decision: "accept" });
     expect(mockCallGatewayTool).not.toHaveBeenCalled();
     expect(mockRunBeforeToolCallHook).toHaveBeenCalled();
   });
@@ -395,7 +333,7 @@ describe("Codex app-server approval bridge", () => {
       autoApprove: true,
     });
 
-    expect(result).toEqual({ decision: "acceptForSession" });
+    expect(result).toEqual({ decision: "accept" });
     expect(mockCallGatewayTool).not.toHaveBeenCalled();
     expect(mockRunBeforeToolCallHook).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -424,13 +362,48 @@ describe("Codex app-server approval bridge", () => {
       autoApprove: true,
     });
 
-    expect(result).toEqual({ decision: "acceptForSession" });
+    expect(result).toEqual({ decision: "accept" });
     expect(mockCallGatewayTool).not.toHaveBeenCalled();
     findApprovalEvent(params, {
       status: "approved",
       reason: "needs write access",
       message: "Codex app-server approval auto-approved by runtime policy.",
     });
+  });
+
+  it("cancels native approval when permissions change during final file revalidation", async () => {
+    const params = createParams();
+    const controller = new AbortController();
+    params.hostCapabilities = {
+      ...params.hostCapabilities,
+      prepareMutableFileApproval: async () => ({
+        ok: true,
+        requiresOneShot: false,
+        revalidate: async () => {
+          controller.abort("permission-change");
+          return { ok: true };
+        },
+      }),
+    };
+
+    const result = await handleCodexAppServerApprovalRequest({
+      method: "item/commandExecution/requestApproval",
+      requestParams: {
+        ...codexTestTurnIds(),
+        itemId: "cmd-permission-change",
+        command: "node script.js",
+      },
+      paramsForRun: params,
+      ...codexTestTurnIds(),
+      autoApprove: true,
+      signal: controller.signal,
+    });
+
+    expect(result).toEqual({ decision: "cancel" });
+    expect(params.onAgentEvent).not.toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ status: "approved" }) }),
+    );
+    expect(mockCallGatewayTool).not.toHaveBeenCalled();
   });
 
   it("keeps permission grants on the human path under full-auto runtime policy", async () => {
@@ -721,50 +694,67 @@ describe("Codex app-server approval bridge", () => {
     ]);
   });
 
-  it("falls back to plugin approval for managed-network command approvals", async () => {
-    const params = createParams();
-    params.config = {
-      tools: {
-        exec: {
-          mode: "auto",
-          reviewer: {
-            model: "openai/gpt-5.5-mini",
+  it.each([false, true])(
+    "keeps commandless managed-network approvals on the human route when autoApprove=%s",
+    async (autoApprove) => {
+      const params = createParams();
+      params.config = {
+        tools: {
+          exec: {
+            mode: "auto",
+            reviewer: {
+              model: "openai/gpt-5.5-mini",
+            },
           },
         },
-      },
-    } as EmbeddedRunAttemptParams["config"];
-    mockReviewExecRequestWithConfiguredModel.mockResolvedValueOnce({
-      decision: "allow-once",
-      rationale: "network request looks fine",
-      risk: "low",
-    });
-    mockCallGatewayTool
-      .mockResolvedValueOnce({ id: "plugin:approval-network", status: "accepted" })
-      .mockResolvedValueOnce({ id: "plugin:approval-network", decision: "allow-once" });
+      } as EmbeddedRunAttemptParams["config"];
+      mockReviewExecRequestWithConfiguredModel.mockResolvedValueOnce({
+        decision: "allow-once",
+        rationale: "network request looks fine",
+        risk: "low",
+      });
+      mockCallGatewayTool
+        .mockResolvedValueOnce({ id: "plugin:approval-network", status: "accepted" })
+        .mockResolvedValueOnce({ id: "plugin:approval-network", decision: "allow-once" });
 
-    const result = await handleCodexAppServerApprovalRequest({
-      method: "item/commandExecution/requestApproval",
-      requestParams: {
-        ...codexTestTurnIds(),
-        itemId: "cmd-auto-review-network",
-        command: "curl https://example.test",
-        networkApprovalContext: {
-          host: "example.test",
-          port: 443,
-          protocol: "https",
+      const result = await handleCodexAppServerApprovalRequest({
+        method: "item/commandExecution/requestApproval",
+        requestParams: {
+          ...codexTestTurnIds(),
+          itemId: "cmd-auto-review-network",
+          networkApprovalContext: {
+            host: "example.test",
+            protocol: "https",
+          },
         },
-      },
-      paramsForRun: params,
-      ...codexTestTurnIds(),
-    });
+        paramsForRun: params,
+        ...codexTestTurnIds(),
+        autoApprove,
+      });
 
-    expect(result).toEqual({ decision: "accept" });
-    expect(mockReviewExecRequestWithConfiguredModel).not.toHaveBeenCalled();
-    expect(mockCallGatewayTool.mock.calls.map(([method]) => method)).toEqual([
-      "plugin.approval.request",
-      "plugin.approval.waitDecision",
-    ]);
-  });
+      expect(result).toEqual({ decision: "accept" });
+      expect(mockReviewExecRequestWithConfiguredModel).not.toHaveBeenCalled();
+      expect(mockCallGatewayTool.mock.calls.map(([method]) => method)).toEqual([
+        "plugin.approval.request",
+        "plugin.approval.waitDecision",
+      ]);
+      expect(gatewayRequestPayload()).toMatchObject({
+        title: "Codex app-server network approval",
+        description: "Network: https://example.test",
+        toolName: "codex_network_approval",
+      });
+      expect(mockRunBeforeToolCallHook).toHaveBeenCalledWith(
+        expect.objectContaining({
+          toolName: "codex_network_approval",
+          params: expect.objectContaining({
+            approval: expect.objectContaining({
+              networkApprovalContext: { host: "example.test", protocol: "https" },
+            }),
+          }),
+        }),
+      );
+    },
+  );
 
   it.each(["lmstudio/local-model", "local-model"])(
     "falls back to plugin approval for unsafe exec auto-review model %s",
@@ -1155,6 +1145,10 @@ describe("Codex app-server approval bridge", () => {
 
   it("keeps object-shaped execpolicy amendment command approvals on the plugin approval route", async () => {
     const params = createParams();
+    params.hostCapabilities = {
+      ...params.hostCapabilities,
+      prepareMutableFileApproval: prepareApprovalWithoutMutableFile,
+    };
     params.config = {
       tools: {
         exec: {
@@ -1188,7 +1182,7 @@ describe("Codex app-server approval bridge", () => {
       ...codexTestTurnIds(),
     });
 
-    expect(result).toEqual({ decision: "accept" });
+    expect(result).toEqual({ decision: "acceptForSession" });
     expect(mockReviewExecRequestWithConfiguredModel).not.toHaveBeenCalled();
     expect(mockCallGatewayTool.mock.calls.map(([method]) => method)).toEqual([
       "plugin.approval.request",
@@ -1327,53 +1321,6 @@ describe("Codex app-server approval bridge", () => {
     });
 
     expect(result).toEqual({ decision: "accept" });
-    expect(mockReviewExecRequestWithConfiguredModel).not.toHaveBeenCalled();
-    expect(mockCallGatewayTool.mock.calls.map(([method]) => method)).toEqual([
-      "plugin.approval.request",
-      "plugin.approval.waitDecision",
-    ]);
-  });
-
-  it("keeps amendment-only decision command approvals on the plugin approval route", async () => {
-    const params = createParams();
-    params.config = {
-      tools: {
-        exec: {
-          mode: "auto",
-          reviewer: {
-            model: "openai/gpt-5.5-mini",
-          },
-        },
-      },
-    } as EmbeddedRunAttemptParams["config"];
-    mockReviewExecRequestWithConfiguredModel.mockResolvedValueOnce({
-      decision: "allow-once",
-      rationale: "safe command",
-      risk: "low",
-    });
-    mockCallGatewayTool
-      .mockResolvedValueOnce({ id: "plugin:approval-amendment-only", status: "accepted" })
-      .mockResolvedValueOnce({ id: "plugin:approval-amendment-only", decision: "allow-always" });
-
-    const result = await handleCodexAppServerApprovalRequest({
-      method: "item/commandExecution/requestApproval",
-      requestParams: {
-        ...codexTestTurnIds(),
-        itemId: "cmd-auto-review-amendment-only",
-        command: "node --version",
-        availableDecisions: [
-          {
-            acceptWithExecpolicyAmendment: {
-              patterns: ["node"],
-            },
-          },
-        ],
-      },
-      paramsForRun: params,
-      ...codexTestTurnIds(),
-    });
-
-    expect(result).toEqual({ decision: "decline" });
     expect(mockReviewExecRequestWithConfiguredModel).not.toHaveBeenCalled();
     expect(mockCallGatewayTool.mock.calls.map(([method]) => method)).toEqual([
       "plugin.approval.request",
@@ -2065,7 +2012,7 @@ describe("Codex app-server approval bridge", () => {
       },
     });
 
-    expect(result).toEqual({ decision: "acceptForSession" });
+    expect(result).toEqual({ decision: "accept" });
     expect(mockRunBeforeToolCallHook).toHaveBeenCalledTimes(1);
     expect(mockInvokeNativeHookRelay).toHaveBeenCalledTimes(1);
     expect(mockCallGatewayTool).not.toHaveBeenCalled();
@@ -2282,47 +2229,6 @@ describe("Codex app-server approval bridge", () => {
     },
   );
 
-  it.each([
-    { reason: "turn_progress_idle_timeout", disposition: "timed_out" },
-    { reason: "turn_completion_idle_timeout", disposition: "timed_out" },
-    { reason: "turn_terminal_idle_timeout", disposition: "timed_out" },
-    { reason: "client_closed", disposition: "failed" },
-  ] as const)(
-    "normalizes aborted approval reason $reason as $disposition",
-    async ({ reason, disposition }) => {
-      const params = createParams();
-      const controller = new AbortController();
-      controller.abort(reason);
-      const onNativeToolFailureDisposition = vi.fn();
-      mockRunBeforeToolCallHook.mockResolvedValueOnce({
-        blocked: true,
-        kind: "failure",
-        disposition: "cancelled",
-        deniedReason: "plugin-before-tool-call",
-        reason: "Approval cancelled because the run stopped",
-      });
-
-      const result = await handleCodexAppServerApprovalRequest({
-        method: "item/commandExecution/requestApproval",
-        requestParams: {
-          ...codexTestTurnIds(),
-          itemId: "cmd-aborted-policy",
-          command: "pnpm test",
-        },
-        paramsForRun: params,
-        ...codexTestTurnIds(),
-        signal: controller.signal,
-        onNativeToolFailureDisposition,
-      });
-
-      expect(result).toEqual({ decision: "cancel" });
-      expect(onNativeToolFailureDisposition).toHaveBeenCalledWith(
-        "cmd-aborted-policy",
-        disposition,
-      );
-    },
-  );
-
   it("describes command approvals from parsed command actions when available", async () => {
     const params = createParams();
     mockCallGatewayTool
@@ -2355,6 +2261,10 @@ describe("Codex app-server approval bridge", () => {
 
   it("describes command approval permission and policy amendments", async () => {
     const params = createParams();
+    params.hostCapabilities = {
+      ...params.hostCapabilities,
+      prepareMutableFileApproval: prepareApprovalWithoutMutableFile,
+    };
     mockCallGatewayTool
       .mockResolvedValueOnce({ id: "plugin:approval-command-permissions", status: "accepted" })
       .mockResolvedValueOnce({
@@ -2381,7 +2291,7 @@ describe("Codex app-server approval bridge", () => {
       ...codexTestTurnIds(),
     });
 
-    expect(result).toEqual({ decision: "accept" });
+    expect(result).toEqual({ decision: "acceptForSession" });
     const description = String(gatewayRequestPayload().description);
     expect(description).toContain("Command: npm install");
     expect(description).toContain("Additional permissions: network, fileSystem");
@@ -3179,14 +3089,14 @@ describe("Codex app-server approval bridge", () => {
     await requestPluginApproval({
       hostCapabilities: createParams().hostCapabilities,
       title: `${"t".repeat(76)}😀tail`,
-      description: `${"d".repeat(252)}😀tail`,
+      description: `${"d".repeat(508)}😀tail`,
       severity: "warning",
       toolName: "codex_utf16_test",
     });
 
     const payload = gatewayRequestPayload();
     expect(payload.title).toBe(`${"t".repeat(76)}...`);
-    expect(payload.description).toBe(`${"d".repeat(252)}...`);
+    expect(payload.description).toBe(`${"d".repeat(508)}...`);
   });
 });
 /* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

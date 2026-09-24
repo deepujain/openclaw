@@ -5,7 +5,9 @@ import type { ClawHubPackageSearchResult } from "../infra/clawhub-packages.js";
 import { formatErrorMessage } from "../infra/errors.js";
 import { searchInstallablePluginPackages } from "../plugins/catalog-search.js";
 import { defaultRuntime, writeRuntimeJson, type RuntimeEnv } from "../runtime.js";
+import { formatCliCommand } from "./command-format.js";
 import { ExpectedCliError } from "./failure-output.js";
+import { formatVersionLabel } from "./version-format.js";
 
 /** Options accepted by `openclaw plugins search`. */
 type PluginsSearchOptions = {
@@ -19,10 +21,10 @@ function formatPackageSearchLine(entry: ClawHubPackageSearchResult): string {
     pkg.family,
     pkg.channel,
     pkg.isOfficial && pkg.channel !== "official" ? "official" : undefined,
-    pkg.latestVersion ? `v${pkg.latestVersion}` : undefined,
+    pkg.latestVersion ? formatVersionLabel(pkg.latestVersion) : undefined,
   ].filter(Boolean);
   const summary = pkg.summary ? theme.muted(` — ${pkg.summary}`) : "";
-  return `${pkg.name}  ${theme.muted(flags.join(" | "))}${summary}\n  ${theme.muted(`Install: openclaw plugins install clawhub:${pkg.name}`)}`;
+  return `${pkg.name}  ${theme.muted(flags.join(" | "))}${summary}\n  ${theme.muted(`Install: ${formatCliCommand(`openclaw plugins install clawhub:${pkg.name}`)}`)}`;
 }
 
 /** Search ClawHub for installable plugins and write JSON or terminal output. */

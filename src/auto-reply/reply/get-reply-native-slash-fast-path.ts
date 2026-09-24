@@ -1,69 +1,55 @@
 // Handles native slash commands before full get-reply pipeline execution.
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
+import type { QueueMode } from "../../../packages/gateway-protocol/src/schema/logs-chat.js";
+import type { ModelCatalogSnapshot } from "../../agents/model-catalog.types.js";
 import {
   resolveModelRefFromString,
-  resolveThinkingDefaultWithRuntimeCatalog,
+  resolveThinkingDefault,
   type ModelAliasIndex,
 } from "../../agents/model-selection.js";
-import { loadPreparedModelCatalog } from "../../agents/prepared-model-catalog.js";
+import { readPreparedModelCatalog } from "../../agents/prepared-model-catalog.js";
 import { resolveChannelModelOverride } from "../../channels/model-overrides.js";
 import type { OpenClawConfig } from "../../config/config.js";
 import { isModelSelectionLocked } from "../../sessions/model-overrides.js";
-import { recordSessionCreated } from "../../sessions/session-state-events.js";
+import { recordSessionCreated } from "../../sessions/session-created.js";
 import { resolveStoredModelOverride } from "../../sessions/stored-model-overrides.js";
 import { createLazyImportLoader } from "../../shared/lazy-promise.js";
 import type { SkillCommandSpec } from "../../skills/types.js";
 import {
   sessionDeliveryChannel,
   sessionDeliveryOrigin,
-} from "../../utils/delivery-context.shared.js";
+} from "../../utils/delivery-context.read.js";
 import { isInternalMessageChannel, normalizeMessageChannel } from "../../utils/message-channel.js";
 import {
   isAuthorizedTextSlashCommandTurn,
   isNativeCommandTurn,
   resolveCommandTurnContext,
 } from "../command-turn-context.js";
-import type { GetReplyOptions } from "../get-reply-options.types.js";
 import { markCommandReplyForDelivery, type ReplyPayload } from "../reply-payload.js";
 import type { FinalizedRuntimeMsgContext as MsgContext } from "../templating.js";
-import { normalizeThinkLevel, type ThinkLevel } from "../thinking.js";
-import {
-  takeCommandSessionMetadataChangesFromTargets,
-  type CommandSessionMetadataChange,
-} from "./command-session-metadata.js";
+import { normalizeThinkLevel } from "../thinking.js";
+import { takeCommandSessionMetadataChangesFromTargets } from "./command-session-metadata.js";
 import { buildCommandContext } from "./commands-context.js";
 import { clearInlineDirectives } from "./get-reply-directives-utils.js";
 import { resolveReplyDirectives } from "./get-reply-directives.js";
 import { initFastReplySessionState } from "./get-reply-fast-path.js";
 import { handleInlineActions } from "./get-reply-inline-actions.js";
+import type { InternalGetReplyOptions } from "./get-reply.types.js";
 import { stripStructuralPrefixes } from "./mentions.js";
 import { resolveContextTokens } from "./model-selection-context.js";
+import { prepareReplyConversation } from "./prompt-session-context.js";
 import { persistReplySessionEntry } from "./session-entry-persistence.js";
+import { createSkillCommandLoaders } from "./skill-command-loaders.js";
 import type { createTypingController } from "./typing.js";
 
 type AgentDefaults = NonNullable<NonNullable<OpenClawConfig["agents"]>["defaults"]> | undefined;
 type SkillCommandsRuntime = typeof import("../../skills/discovery/chat-commands.runtime.js");
-type InternalGetReplyOptions = GetReplyOptions & {
-  onSessionMetadataChanges?: (changes: CommandSessionMetadataChange[]) => void;
-};
 
 const commandsRuntimeLoader = createLazyImportLoader(() => import("./commands.runtime.js"));
 const skillCommandsRuntimeLoader = createLazyImportLoader<SkillCommandsRuntime>(
   () => import("../../skills/discovery/chat-commands.runtime.js"),
 );
 const statusCommandRuntimeLoader = createLazyImportLoader(() => import("./commands-status.js"));
-
-function loadCommandsRuntime() {
-  return commandsRuntimeLoader.load();
-}
-
-function loadSkillCommandsRuntime() {
-  return skillCommandsRuntimeLoader.load();
-}
-
-function loadStatusCommandRuntime() {
-  return statusCommandRuntimeLoader.load();
-}
 
 function resolveNativeSlashCommandName(ctx: MsgContext): string | undefined {
   const commandTurn = resolveCommandTurnContext(ctx);
@@ -82,6 +68,9 @@ function shouldRunNativeSlashCommandFastPath(ctx: MsgContext): boolean {
     commandName &&
     commandName !== "new" &&
     commandName !== "reset" &&
+    // Dashboard creates an agent prompt with exact skill selections. The full
+    // reply pipeline must consume that command once, without re-resolving its text.
+    commandName !== "dashboard" &&
     (isNativeCommandTurn(commandTurn) ||
       shouldRunInternalTextSlashCommandFastPath(ctx, commandTurn, commandName)),
   );
@@ -103,29 +92,6 @@ function shouldRunInternalTextSlashCommandFastPath(
   );
 }
 
-async function resolveNativeSlashDefaultThinkingLevel(params: {
-  cfg: OpenClawConfig;
-  agentId: string;
-  provider: string;
-  model: string;
-  agentDir: string;
-  workspaceDir: string;
-}): Promise<ThinkLevel> {
-  return resolveThinkingDefaultWithRuntimeCatalog({
-    cfg: params.cfg,
-    provider: params.provider,
-    model: params.model,
-    loadRuntimeCatalog: () =>
-      loadPreparedModelCatalog({
-        config: params.cfg,
-        agentId: params.agentId,
-        agentDir: params.agentDir,
-        workspaceDir: params.workspaceDir,
-        readOnly: true,
-      }),
-  });
-}
-
 export async function maybeResolveNativeSlashCommandFastReply(params: {
   ctx: MsgContext;
   cfg: OpenClawConfig;
@@ -140,10 +106,12 @@ export async function maybeResolveNativeSlashCommandFastReply(params: {
   model: string;
   workspaceDir: string;
   typing: ReturnType<typeof createTypingController>;
-  opts?: GetReplyOptions;
+  preparedModelCatalog?: ModelCatalogSnapshot;
+  opts?: InternalGetReplyOptions;
   skillFilter?: string[];
 }): Promise<
-  { handled: true; reply: ReplyPayload | ReplyPayload[] | undefined } | { handled: false }
+  | { handled: true; reply: ReplyPayload | ReplyPayload[] | undefined }
+  | { handled: false; queueModeOverride?: QueueMode }
 > {
   if (!shouldRunNativeSlashCommandFastPath(params.ctx)) {
     return { handled: false };
@@ -178,7 +146,7 @@ export async function maybeResolveNativeSlashCommandFastReply(params: {
     }
     const persistedInitialEntry = persistence.entry;
     if (creatingSession) {
-      recordSessionCreated({
+      recordSessionCreated(params.cfg, {
         sessionKey: sessionState.sessionKey,
         agentId: params.agentId,
         entry: persistedInitialEntry,
@@ -271,39 +239,28 @@ export async function maybeResolveNativeSlashCommandFastReply(params: {
             model: storedModelOverride.model,
           })
         : null;
-    // Native status returns before normal channel routing; select once before
-    // preparing model-bound thinking, runtime, auth, context, or fast-mode facts.
+    // Parent/channel preferences replace the base route. Direct session pins stay
+    // with status's selected/active-model owner, which also supplies thinking defaults.
     const statusProvider =
       resolvedInheritedModel?.provider ?? resolvedChannelModel?.ref.provider ?? params.provider;
     const statusModel =
       resolvedInheritedModel?.model ?? resolvedChannelModel?.ref.model ?? params.model;
-    let resolvedDefaultThinkingLevel: ThinkLevel | undefined;
-    const resolveDefaultThinkingLevel = async () => {
-      resolvedDefaultThinkingLevel ??= await resolveNativeSlashDefaultThinkingLevel({
-        cfg: params.cfg,
-        agentId: params.agentId,
-        provider: statusProvider,
-        model: statusModel,
-        agentDir: params.agentDir,
-        workspaceDir: params.workspaceDir,
-      });
-      return resolvedDefaultThinkingLevel;
-    };
     const resolvedThinkLevel = normalizeThinkLevel(targetSessionEntry?.thinkingLevel);
     // This fast path has no model-state owner; prepare side-effect-free catalog facts directly.
-    const thinkingCatalog = await loadPreparedModelCatalog({
+    const thinkingCatalog = await readPreparedModelCatalog({
       config: params.cfg,
       agentId: params.agentId,
       agentDir: params.agentDir,
       workspaceDir: params.workspaceDir,
       readOnly: true,
     });
-    const { buildStatusReply } = await loadStatusCommandRuntime();
+    const { buildStatusReply } = await statusCommandRuntimeLoader.load();
     return {
       handled: true,
       reply: markCommandReplyForDelivery(
         await buildStatusReply({
           cfg: params.cfg,
+          agentId: params.agentId,
           command,
           sessionEntry: targetSessionEntry,
           sessionKey: sessionState.sessionKey,
@@ -318,7 +275,15 @@ export async function maybeResolveNativeSlashCommandFastReply(params: {
           resolvedVerboseLevel: "off",
           resolvedReasoningLevel: "off",
           resolvedElevatedLevel: "off",
-          resolveDefaultThinkingLevel,
+          resolveDefaultThinkingLevel: async (selection) =>
+            resolveThinkingDefault({
+              cfg: params.cfg,
+              agentId: params.agentId,
+              provider: statusProvider,
+              model: statusModel,
+              ...selection,
+              catalog: thinkingCatalog,
+            }),
           isGroup: sessionState.isGroup,
           defaultGroupActivation: () => "always",
           mediaDecisions: params.ctx.MediaUnderstandingDecisions,
@@ -329,7 +294,9 @@ export async function maybeResolveNativeSlashCommandFastReply(params: {
 
   let loadedSkillCommands: SkillCommandSpec[] | undefined;
   const loadNativeSkillCommands = async () => {
-    loadedSkillCommands ??= (await loadSkillCommandsRuntime()).listSkillCommandsForWorkspace({
+    loadedSkillCommands ??= await (
+      await skillCommandsRuntimeLoader.load()
+    ).prepareSkillCommandsForWorkspace({
       workspaceDir: params.workspaceDir,
       cfg: params.cfg,
       agentId: params.agentId,
@@ -348,7 +315,7 @@ export async function maybeResolveNativeSlashCommandFastReply(params: {
   const commandResult = compactNeedsModelSelection
     ? { shouldContinue: true, reply: undefined }
     : await (
-        await loadCommandsRuntime()
+        await commandsRuntimeLoader.load()
       ).handleCommands({
         ctx: sessionState.sessionCtx,
         rootCtx: params.ctx,
@@ -371,9 +338,11 @@ export async function maybeResolveNativeSlashCommandFastReply(params: {
         workspaceDir: params.workspaceDir,
         opts: params.opts,
         defaultGroupActivation: () => "always",
-        resolvedThinkLevel: undefined,
+        resolveModelLevels: async () => ({
+          resolvedThinkLevel: undefined,
+          resolvedReasoningLevel: "off",
+        }),
         resolvedVerboseLevel: "off",
-        resolvedReasoningLevel: "off",
         resolvedElevatedLevel: "off",
         blockReplyChunking: undefined,
         resolvedBlockStreamingBreak: "text_end",
@@ -386,7 +355,15 @@ export async function maybeResolveNativeSlashCommandFastReply(params: {
           model: params.model,
         }),
         isGroup: sessionState.isGroup,
-        loadSkillCommands: loadNativeSkillCommands,
+        ...createSkillCommandLoaders(() => skillCommandsRuntimeLoader.load(), {
+          workspaceDir: params.workspaceDir,
+          cfg: params.cfg,
+          agentId: params.agentId,
+          skillFilter: params.skillFilter,
+          sessionEntry: sessionState.sessionEntry,
+          sessionKey: sessionState.sessionKey,
+          loadSkillCommands: loadNativeSkillCommands,
+        }),
         typing: params.typing,
       });
   const commandSessionMetadataChanges = takeCommandSessionMetadataChangesFromTargets([
@@ -394,9 +371,7 @@ export async function maybeResolveNativeSlashCommandFastReply(params: {
     params.ctx,
   ]);
   if (commandSessionMetadataChanges) {
-    (params.opts as InternalGetReplyOptions | undefined)?.onSessionMetadataChanges?.(
-      commandSessionMetadataChanges,
-    );
+    params.opts?.onSessionMetadataChanges?.(commandSessionMetadataChanges);
   }
   if (!commandResult.shouldContinue) {
     params.typing.cleanup();
@@ -417,7 +392,11 @@ export async function maybeResolveNativeSlashCommandFastReply(params: {
     sessionKey: sessionState.sessionKey,
     storePath: sessionState.storePath,
     sessionScope: sessionState.sessionScope,
-    groupResolution: sessionState.groupResolution,
+    conversation: prepareReplyConversation({
+      ctx: sessionState.sessionCtx,
+      sessionEntry: sessionState.sessionStore[sessionState.sessionKey] ?? sessionState.sessionEntry,
+      groupResolution: sessionState.groupResolution,
+    }),
     isGroup: sessionState.isGroup,
     triggerBodyNormalized: continuationTriggerBodyNormalized,
     resetTriggered: false,
@@ -428,6 +407,8 @@ export async function maybeResolveNativeSlashCommandFastReply(params: {
     provider: params.provider,
     model: params.model,
     hasResolvedHeartbeatModelOverride: false,
+    // Native selections reuse the admitted catalog just like ordinary turns.
+    preparedModelCatalog: params.preparedModelCatalog,
     typing: params.typing,
     opts: params.opts,
     skillFilter: params.skillFilter,
@@ -467,6 +448,7 @@ export async function maybeResolveNativeSlashCommandFastReply(params: {
     typing: params.typing,
     allowTextCommands: directiveResult.result.allowTextCommands,
     inlineStatusRequested: directiveResult.result.inlineStatusRequested,
+    inlineCommand: directiveResult.result.inlineCommand,
     command: directiveResult.result.command,
     skillCommands: loadedSkillCommands ?? directiveResult.result.skillCommands,
     directives: directiveResult.result.directives,
@@ -476,9 +458,8 @@ export async function maybeResolveNativeSlashCommandFastReply(params: {
     elevatedFailures: directiveResult.result.elevatedFailures,
     defaultActivation: () => directiveResult.result.defaultActivation,
     thinkingCatalog,
-    resolvedThinkLevel: directiveResult.result.resolvedThinkLevel,
+    resolveModelLevels: directiveResult.result.resolveModelLevels,
     resolvedVerboseLevel: directiveResult.result.resolvedVerboseLevel,
-    resolvedReasoningLevel: directiveResult.result.resolvedReasoningLevel,
     resolvedElevatedLevel: directiveResult.result.resolvedElevatedLevel,
     execOverrides: directiveResult.result.execOverrides,
     blockReplyChunking: directiveResult.result.blockReplyChunking,
@@ -497,5 +478,13 @@ export async function maybeResolveNativeSlashCommandFastReply(params: {
       reply: markCommandReplyForDelivery(inlineActionResult.reply),
     };
   }
-  return { handled: false };
+  return {
+    handled: false,
+    ...((inlineActionResult.queueModeOverride ?? commandResult.queueModeOverride)
+      ? {
+          queueModeOverride:
+            inlineActionResult.queueModeOverride ?? commandResult.queueModeOverride,
+        }
+      : {}),
+  };
 }
