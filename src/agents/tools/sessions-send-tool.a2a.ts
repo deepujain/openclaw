@@ -312,7 +312,7 @@ export async function runSessionsSendA2AFlow(params: {
         const current = turn % 2 === 1 ? requester : target;
         const source = turn % 2 === 1 ? target : requester;
         const replyPrompt = buildAgentToAgentReplyContext({
-      requesterName: params.requesterName,
+          requesterName: params.requesterName,
           requesterSessionKey: params.requesterSessionKey,
           requesterChannel: params.requesterChannel,
           targetSessionKey: params.displayKey,

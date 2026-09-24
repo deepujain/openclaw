@@ -1592,10 +1592,12 @@ describe("sessions tools", () => {
       agentSessionKey: requesterKey,
       config: {
         ...TEST_CONFIG,
-        agents: { list: [
-          { id: "main", default: true, identity: { name: "Wrong Main" } },
-          { id: "stevo", identity: { name: "Stevo" } },
-        ] },
+        agents: {
+          list: [
+            { id: "main", default: true, identity: { name: "Wrong Main" } },
+            { id: "stevo", identity: { name: "Stevo" } },
+          ],
+        },
       },
       agentChannel: "whatsapp",
     });
