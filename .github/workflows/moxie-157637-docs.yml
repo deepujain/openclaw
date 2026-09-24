@@ -1,0 +1,29 @@
+name: Temporary Nextcloud Talk docs proof
+on:
+  push:
+    branches: [moxie-validation/157637-docs-20260924]
+permissions:
+  contents: read
+jobs:
+  docs:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: f70355f63ddef858cfc6c88e2fc135ae5414d019
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.21.0
+      - name: Verify candidate and install pinned dependencies
+        env:
+          CI: 'true'
+        run: |
+          test "$(git rev-parse HEAD)" = f70355f63ddef858cfc6c88e2fc135ae5414d019
+          corepack enable
+          corepack pnpm install --frozen-lockfile
+      - name: Documentation checks
+        env:
+          CI: 'true'
+        run: corepack pnpm check:docs
