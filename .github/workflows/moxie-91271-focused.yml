@@ -1,0 +1,30 @@
+name: Temporary 91271 focused proof
+on:
+  push:
+    branches: [moxie-validation/91271-focused-20260924]
+permissions:
+  contents: read
+jobs:
+  focused:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 85181443cb9459c7f77f164c2e8eb23c91871674
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.21.0
+      - name: Verify candidate and install pinned dependencies
+        env:
+          CI: 'true'
+        run: |
+          test "$(git rev-parse HEAD)" = 85181443cb9459c7f77f164c2e8eb23c91871674
+          corepack enable
+          corepack pnpm install --frozen-lockfile
+      - name: Tool helper worker and full Gateway regressions
+        env:
+          CI: 'true'
+        run: |
+          corepack pnpm test src/agents/tools/sessions-send-helpers.test.ts src/agents/openclaw-tools.sessions.test.ts src/gateway/worker-environments/worker-session-tool-executor.send.test.ts src/gateway/server.sessions-send.test.ts
