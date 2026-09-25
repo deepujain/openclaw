@@ -593,13 +593,25 @@ extension TalkModeRuntime {
                 "chars=\(prompt.count, privacy: .public)")
 
         do {
+            let capturedRoute = await GatewayConnection.shared.captureRoute()
+            guard self.isCurrent(gen), !Task.isCancelled else { return }
+            guard let route = capturedRoute else {
+                await self.resumeListeningIfNeeded()
+                return
+            }
             let response = try await GatewayConnection.shared.chatSend(
                 sessionKey: sessionKey,
                 message: prompt,
                 thinking: nil,
                 idempotencyKey: runId,
-                attachments: [])
-            guard self.isCurrent(gen) else { return }
+                attachments: [],
+                ifCurrentRoute: route)
+            let responseRouteIsCurrent = await GatewayConnection.shared.isCurrentRoute(route)
+            guard self.isCurrent(gen), !Task.isCancelled else { return }
+            guard responseRouteIsCurrent else {
+                await self.resumeListeningIfNeeded()
+                return
+            }
             let normalizedStatus = ChatSendStatus.normalized(response.status)
             self.logger.info(
                 "talk chat.send ok runId=\(response.runId, privacy: .public) " +
@@ -621,19 +633,42 @@ extension TalkModeRuntime {
                 assistantText = await self.waitForAssistantTextFromHistory(
                     sessionKey: sessionKey,
                     since: nil,
-                    timeoutSeconds: 12)
+                    timeoutSeconds: 12,
+                    route: route,
+                    generation: gen)
             } else {
                 assistantText = await self.waitForAssistantEventText(
                     sessionKey: sessionKey,
                     runId: response.runId,
+                    route: route,
                     timeoutSeconds: 45)
                 if assistantText == nil {
-                    self.logger.warning("talk assistant event text missing; using history fallback")
-                    assistantText = await self.waitForAssistantTextFromHistory(
-                        sessionKey: sessionKey,
-                        since: startedAt,
-                        timeoutSeconds: 12)
+                    // An event-observation timeout is not an execution deadline. The Gateway
+                    // owns that deadline; keep observing this accepted run until it settles.
+                    assistantText = await Self.waitForAcceptedReply(
+                        runID: response.runId,
+                        request: { request in
+                            try await GatewayConnection.shared.request(request, ifCurrentRoute: route)
+                        },
+                        history: {
+                            await self.waitForAssistantTextFromHistory(
+                                sessionKey: sessionKey,
+                                since: startedAt,
+                                timeoutSeconds: 12,
+                                route: route,
+                                generation: gen)
+                        },
+                        isCurrent: {
+                            guard await self.isCurrent(gen) else { return false }
+                            return await GatewayConnection.shared.isCurrentRoute(route)
+                        })
                 }
+            }
+            let replyRouteIsCurrent = await GatewayConnection.shared.isCurrentRoute(route)
+            guard self.isCurrent(gen), !Task.isCancelled else { return }
+            guard replyRouteIsCurrent else {
+                await self.resumeListeningIfNeeded()
+                return
             }
             guard let assistantText
             else {
@@ -651,10 +686,49 @@ extension TalkModeRuntime {
             await self.resumeListeningIfNeeded()
             return
         } catch {
+            guard self.isCurrent(gen), !Task.isCancelled else { return }
             self.logger.error("talk chat.send failed: \(error.localizedDescription, privacy: .public)")
             await self.resumeListeningIfNeeded()
             return
         }
+    }
+
+    static func waitForAcceptedReply(
+        runID: String,
+        request: @Sendable (OpenClawChatGatewayRequest) async throws -> Data,
+        history: @Sendable () async -> String?,
+        isCurrent: @Sendable () async -> Bool,
+        pause: @Sendable (Duration) async throws -> Void = { try await Task.sleep(for: $0) }) async -> String?
+    {
+        while !Task.isCancelled, await isCurrent() {
+            let observation: OpenClawChatRunObservation
+            do {
+                let wait = OpenClawChatGatewayRequests.agentWait(runID: runID, timeoutMs: 30000)
+                observation = try OpenClawChatGatewayPayloadCodec.decodeAgentWaitObservation(await request(wait))
+            } catch {
+                observation = .unavailable
+            }
+            guard !Task.isCancelled, await isCurrent() else { return nil }
+            let retryDelay: Duration
+            switch observation {
+            case .checkAgain:
+                retryDelay = .seconds(2)
+            case .unavailable:
+                retryDelay = .seconds(30)
+            case .terminal(.completed):
+                let text = await history()
+                guard !Task.isCancelled, await isCurrent() else { return nil }
+                return text
+            case .terminal(.failed):
+                return nil
+            }
+            do {
+                try await pause(retryDelay)
+            } catch {
+                return nil
+            }
+        }
+        return nil
     }
 
     private func resumeListeningIfNeeded() async {
@@ -682,6 +756,7 @@ extension TalkModeRuntime {
     private func waitForAssistantEventText(
         sessionKey: String,
         runId: String,
+        route: GatewayConnection.Route,
         timeoutSeconds: Int) async -> String?
     {
         let stream = await GatewayConnection.shared.subscribe(bufferingNewest: 200)
@@ -692,7 +767,8 @@ extension TalkModeRuntime {
                     if Task.isCancelled {
                         return latestText
                     }
-                    guard delivery.isCurrent, case let .event(evt) = delivery.push else { continue }
+                    guard delivery.isCurrent, delivery.serverLease.route == route,
+                          case let .event(evt) = delivery.push else { continue }
                     guard evt.event == "chat", let payload = evt.payload else { continue }
                     guard let chatEvent = try? GatewayPayloadDecoding.decode(
                         payload,
@@ -746,11 +822,15 @@ extension TalkModeRuntime {
     private func waitForAssistantTextFromHistory(
         sessionKey: String,
         since: Double?,
-        timeoutSeconds: Int) async -> String?
+        timeoutSeconds: Int,
+        route: GatewayConnection.Route,
+        generation: Int) async -> String?
     {
         let deadline = Date().addingTimeInterval(TimeInterval(timeoutSeconds))
         while Date() < deadline {
-            if let text = await latestAssistantText(sessionKey: sessionKey, since: since) {
+            guard self.isCurrent(generation), !Task.isCancelled,
+                  await GatewayConnection.shared.isCurrentRoute(route) else { return nil }
+            if let text = await latestAssistantText(sessionKey: sessionKey, since: since, route: route) {
                 return text
             }
             try? await Task.sleep(nanoseconds: 300_000_000)
@@ -758,9 +838,13 @@ extension TalkModeRuntime {
         return nil
     }
 
-    private func latestAssistantText(sessionKey: String, since: Double? = nil) async -> String? {
+    private func latestAssistantText(
+        sessionKey: String,
+        since: Double? = nil,
+        route: GatewayConnection.Route) async -> String?
+    {
         do {
-            let history = try await GatewayConnection.shared.chatHistory(sessionKey: sessionKey)
+            let history = try await GatewayConnection.shared.chatHistory(sessionKey: sessionKey, ifCurrentRoute: route)
             let messages = history.messages ?? []
             let decoded: [OpenClawChatMessage] = messages.compactMap { item in
                 guard let data = try? JSONEncoder().encode(item) else { return nil }
