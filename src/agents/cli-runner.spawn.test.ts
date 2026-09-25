@@ -22,10 +22,9 @@ import {
   resetDiagnosticRunActivityForTest,
   startDiagnosticRunActivityTracking,
 } from "../logging/diagnostic-run-activity.js";
+import type { CliBackendLiveSessionHandle } from "../plugins/cli-backend.types.js";
 import type { getProcessSupervisor } from "../process/supervisor/index.js";
 import { prepareSystemAgentRunAdmission } from "./admitted-run-context.js";
-import { createCliLiveSessionCapability } from "./cli-runner/cli-live-session-registry.js";
-import type { CliBackendLiveSessionHandle } from "../plugins/cli-backend.types.js";
 import {
   buildPreparedCliRunContext,
   captureModelCallDiagnostics,
@@ -37,6 +36,7 @@ import {
   requireRecord,
   requireRegexMatch,
 } from "./cli-runner.test-helpers.js";
+import { createCliLiveSessionCapability } from "./cli-runner/cli-live-session-registry.js";
 import {
   attachCliMessagingDeliveryEvidence,
   getCliMessagingDeliveryEvidence,
@@ -1565,12 +1565,15 @@ describe("runCliAgent spawn path", () => {
     }
   });
 
-  it.each(["compact", "ordinary", "revoked"] as const)(
+  it.for(["compact", "ordinary", "revoked"] as const)(
     "retires only the compacted owner's warm process before execution: %s",
     async (mode, { onTestFinished }) => {
       const context = buildPreparedCliRunContext({ provider: "claude-cli" });
       const admission = prepareSystemAgentRunAdmission(
-        {}, context.params.runId, "main", "native-compaction-test",
+        {},
+        context.params.runId,
+        "main",
+        "native-compaction-test",
       );
       onTestFinished(admission.close);
       context.params.admittedRunContext = await admission.admit("plugin-harness");
@@ -1612,7 +1615,9 @@ describe("runCliAgent spawn path", () => {
       if (mode !== "ordinary") {
         context.params.controlOperation = "compact";
         context.backendResolved.manualCompaction = {
-          input: "arg", buildPrompt: () => "/compact", validateOutput: () => ({ ok: true }),
+          input: "arg",
+          buildPrompt: () => "/compact",
+          validateOutput: () => ({ ok: true }),
         };
       }
       if (mode === "revoked") {
