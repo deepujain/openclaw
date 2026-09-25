@@ -1620,16 +1620,16 @@ describe("runCliAgent spawn path", () => {
           throw new Error("caller revoked");
         };
       }
-      supervisorSpawnMock.mockImplementationOnce(async () => {
-        expect(warm.close).toHaveBeenCalledTimes(mode === "compact" ? 1 : 0);
-        expect(unrelated.close).not.toHaveBeenCalled();
-        return createManagedRun({ ...createSuccessfulProcessExit(), stdout: CLAUDE_OK_JSONL });
-      });
       if (mode === "revoked") {
         await expect(executePreparedCliRun(context)).rejects.toThrow("caller revoked");
         expect(supervisorSpawnMock).not.toHaveBeenCalled();
         expect(warm.close).not.toHaveBeenCalled();
       } else {
+        supervisorSpawnMock.mockImplementationOnce(async () => {
+          expect(warm.close).toHaveBeenCalledTimes(mode === "compact" ? 1 : 0);
+          expect(unrelated.close).not.toHaveBeenCalled();
+          return createManagedRun({ ...createSuccessfulProcessExit(), stdout: CLAUDE_OK_JSONL });
+        });
         await executePreparedCliRun(context);
         expect(warm.capability.current()).toBe(mode === "compact" ? undefined : warm.handle);
       }
