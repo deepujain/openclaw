@@ -127,11 +127,12 @@ describe("native CLI manual compaction", () => {
           beginCapture: () => {},
           abortSignal: new AbortController().signal,
         });
+        const close = vi.fn(() => capability.remove(handle));
         const handle: CliBackendLiveSessionHandle = {
           generation: context.params.agentAccountId ?? "unscoped",
           fingerprint: capability.fingerprint,
           isIdle: () => true,
-          close: vi.fn(() => capability.remove(handle)),
+          close,
           waitForExit: async () => {},
         };
         capability.register(handle);
@@ -139,7 +140,7 @@ describe("native CLI manual compaction", () => {
           handle.close("restart");
           await context.preparedBackend.closeLiveSession?.("restart");
         });
-        return { capability, handle };
+        return { capability, handle, close };
       };
       const warm = register(warmContext);
       const unrelated = register({
@@ -179,8 +180,8 @@ describe("native CLI manual compaction", () => {
         };
       });
       supervisorSpawnMock.mockImplementationOnce(async () => {
-        expect(warm.handle.close).toHaveBeenCalledOnce();
-        expect(unrelated.handle.close).not.toHaveBeenCalled();
+        expect(warm.close).toHaveBeenCalledOnce();
+        expect(unrelated.close).not.toHaveBeenCalled();
         return createManagedRun({
           ...createSuccessfulProcessExit(),
           stdout: `${JSON.stringify({ type: "result", result: "compacted" })}\n`,
