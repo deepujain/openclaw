@@ -11,7 +11,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: a571a60d1ead9fd2291c2630722efdb8e14949f4
+          ref: e460256f011d95615c11a68c46a4a22e3efe79c2
           fetch-depth: 0
           persist-credentials: false
       - uses: actions/setup-node@v4
@@ -21,7 +21,7 @@ jobs:
         env:
           CI: 'true'
         run: |
-          test "$(git rev-parse HEAD)" = a571a60d1ead9fd2291c2630722efdb8e14949f4
+          test "$(git rev-parse HEAD)" = e460256f011d95615c11a68c46a4a22e3efe79c2
           corepack enable
           corepack pnpm install --frozen-lockfile
       - name: Format candidate and record exact tested tree
