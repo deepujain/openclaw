@@ -1,0 +1,19 @@
+name: Temporary Talk native validation
+on:
+  push:
+    branches: [moxie-validation/153145-talk-20260925]
+permissions:
+  contents: read
+jobs:
+  native:
+    runs-on: macos-latest
+    timeout-minutes: 40
+    steps:
+      - name: Identify disposable runner toolchain
+        run: |
+          set -euo pipefail
+          sw_vers
+          xcodebuild -version
+          swift --version
+          ls -d /Applications/Xcode*.app
+          test ! -e "$HOME/.openclaw/openclaw.json"
