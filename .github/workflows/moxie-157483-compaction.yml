@@ -1,0 +1,62 @@
+name: Temporary native compaction proof
+on:
+  push:
+    branches: [moxie-validation/157483-native-compaction-20260924]
+permissions:
+  contents: read
+jobs:
+  focused:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: a571a60d1ead9fd2291c2630722efdb8e14949f4
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.21.0
+      - name: Verify candidate and install pinned dependencies
+        env:
+          CI: 'true'
+        run: |
+          test "$(git rev-parse HEAD)" = a571a60d1ead9fd2291c2630722efdb8e14949f4
+          corepack enable
+          corepack pnpm install --frozen-lockfile
+      - name: Format candidate and record exact tested tree
+        run: |
+          corepack pnpm exec oxfmt --write src/agents/cli-runner.spawn.test.ts src/agents/cli-runner/execute.ts src/agents/embedded-agent-runner/compact.ts
+          git diff --binary > /tmp/format.patch
+          echo FORMAT_PATCH_BASE64_BEGIN
+          base64 -w0 /tmp/format.patch
+          echo
+          echo FORMAT_PATCH_BASE64_END
+          git add src/agents/cli-runner.spawn.test.ts src/agents/cli-runner/execute.ts src/agents/embedded-agent-runner/compact.ts
+          echo "TESTED_TREE=$(git write-tree)"
+      - name: Prove regression fails on unchanged production source
+        env:
+          CI: 'true'
+        run: |
+          git show 8cd71d28c9fe66818dd8378004ede6a463954b6b:src/agents/cli-runner/execute.ts > src/agents/cli-runner/execute.ts
+          set +e
+          corepack pnpm test src/agents/cli-runner.spawn.test.ts -t 'retires only the compacted owner' > /tmp/baseline.log 2>&1
+          result=$?
+          set -e
+          cat /tmp/baseline.log
+          test "$result" -ne 0
+          grep -Eq 'expected.*to be called.*1.*times.*0' /tmp/baseline.log
+          git checkout -- src/agents/cli-runner/execute.ts
+      - name: Focused lifecycle and adjacent native compaction suites
+        env:
+          CI: 'true'
+        run: |
+          corepack pnpm test src/agents/cli-runner.spawn.test.ts src/agents/cli-runner/cli-live-session-registry.test.ts src/agents/embedded-agent-runner/compact.native-cli.test.ts
+      - name: Core types and changed-file lint
+        env:
+          CI: 'true'
+        run: |
+          corepack pnpm tsgo:core
+          corepack pnpm exec node scripts/run-tsgo.mjs -p test/tsconfig/tsconfig.core.test.agents-root.json
+          corepack pnpm exec node scripts/run-oxlint.mjs --deny-warnings src/agents/cli-runner.spawn.test.ts src/agents/cli-runner/execute.ts src/agents/embedded-agent-runner/compact.ts
+          git diff --check
