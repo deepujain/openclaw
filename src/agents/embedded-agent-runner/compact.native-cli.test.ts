@@ -1,14 +1,26 @@
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../../test/helpers/temp-dir.js";
-import type { CliBackendPlugin } from "../../plugins/cli-backend.types.js";
-import type { PreparedAgentRunAdmission } from "../admitted-run-context.js";
+import type {
+  CliBackendLiveSessionHandle,
+  CliBackendPlugin,
+} from "../../plugins/cli-backend.types.js";
+import { prepareSystemAgentRunAdmission } from "../admitted-run-context.js";
 import { testing as cliBackendsTesting } from "../cli-backends.test-support.js";
+import { buildPreparedCliRunContext } from "../cli-runner.test-helpers.js";
+import { createCliLiveSessionCapability } from "../cli-runner/cli-live-session-registry.js";
+import { executePreparedCliRun } from "../cli-runner/execute.js";
+import {
+  createManagedRun,
+  createSuccessfulProcessExit,
+  supervisorSpawnMock,
+} from "../cli-runner/execute.test-support.js";
+import type { PreparedCliRunContext, RunCliAgentParams } from "../cli-runner/types.js";
 
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 
 const { runCliAgentMock } = vi.hoisted(() => ({
-  runCliAgentMock: vi.fn(async (_params: { preparedRunAdmission?: PreparedAgentRunAdmission }) => ({
+  runCliAgentMock: vi.fn(async (_params: RunCliAgentParams) => ({
     meta: {
       durationMs: 1,
       agentMeta: { sessionId: "native-session", provider: "claude-cli", model: "opus" },
@@ -87,9 +99,103 @@ function compactParams(overrides: Record<string, unknown> = {}) {
 afterEach(() => {
   cliBackendsTesting.resetDepsForTest();
   runCliAgentMock.mockClear();
+  supervisorSpawnMock.mockReset();
 });
 
 describe("native CLI manual compaction", () => {
+  it.for([undefined, "channel-account"])(
+    "retires the matching warm owner through the native command (account=%s)",
+    async (agentAccountId, { onTestFinished }) => {
+      registerBackend();
+      const input: Parameters<typeof testing.compactNativeCliSession>[0]["compactParams"] =
+        compactParams({ agentAccountId, sessionEntry: undefined });
+      const admission = prepareSystemAgentRunAdmission({}, "warm-owner", "main", "compact-test");
+      onTestFinished(admission.close);
+      const warmContext = buildPreparedCliRunContext({
+        agentId: input.agentId,
+        sessionId: input.sessionId,
+        sessionKey: input.sessionKey,
+      });
+      warmContext.params.agentAccountId = agentAccountId;
+      warmContext.params.admittedRunContext = await admission.admit("embedded");
+      warmContext.effectiveAuthProfileId = input.cliSessionBinding?.authProfileId;
+      const register = (context: PreparedCliRunContext) => {
+        const capability = createCliLiveSessionCapability({
+          context,
+          argv: ["claude", "-p"],
+          env: {},
+          beginCapture: () => {},
+          abortSignal: new AbortController().signal,
+        });
+        const handle: CliBackendLiveSessionHandle = {
+          generation: context.params.agentAccountId ?? "unscoped",
+          fingerprint: capability.fingerprint,
+          isIdle: () => true,
+          close: vi.fn(() => capability.remove(handle)),
+          waitForExit: async () => {},
+        };
+        capability.register(handle);
+        onTestFinished(async () => {
+          handle.close("restart");
+          await context.preparedBackend.closeLiveSession?.("restart");
+        });
+        return { capability, handle };
+      };
+      const warm = register(warmContext);
+      const unrelated = register({
+        ...warmContext,
+        params: { ...warmContext.params, agentAccountId: "other-channel-account" },
+        preparedBackend: { ...warmContext.preparedBackend, closeLiveSession: undefined },
+      });
+      // Preparation is outside this test's boundary. Pass only the command's actual
+      // arguments into a fresh context; borrowing warmContext would hide dropped identity.
+      runCliAgentMock.mockImplementationOnce(async (params) => {
+        if (!params.preparedRunAdmission) {
+          throw new Error("native compaction did not prepare run admission");
+        }
+        const context = buildPreparedCliRunContext({
+          agentId: params.agentId,
+          sessionId: params.sessionId,
+          sessionKey: params.sessionKey,
+          workspaceDir: params.workspaceDir,
+        });
+        context.params = {
+          ...context.params,
+          ...params,
+          admittedRunContext: await params.preparedRunAdmission.admit("embedded"),
+        };
+        context.effectiveAuthProfileId = params.authProfileId;
+        context.backendResolved.manualCompaction = {
+          input: "arg",
+          buildPrompt: () => "/compact",
+          validateOutput: () => ({ ok: true }),
+        };
+        await executePreparedCliRun(context, params.cliSessionId);
+        return {
+          meta: {
+            durationMs: 1,
+            agentMeta: { sessionId: "native-session", provider: "claude-cli", model: "opus" },
+          },
+        };
+      });
+      supervisorSpawnMock.mockImplementationOnce(async () => {
+        expect(warm.handle.close).toHaveBeenCalledOnce();
+        expect(unrelated.handle.close).not.toHaveBeenCalled();
+        return createManagedRun({
+          ...createSuccessfulProcessExit(),
+          stdout: `${JSON.stringify({ type: "result", result: "compacted" })}\n`,
+        });
+      });
+
+      await expect(
+        testing.compactNativeCliSession({ runtime: "claude-cli", compactParams: input }),
+      ).resolves.toMatchObject({ ok: true, compacted: true });
+      expect(supervisorSpawnMock).toHaveBeenCalledOnce();
+      expect(warm.capability.current()).toBeUndefined();
+      expect(unrelated.capability.current()).toBe(unrelated.handle);
+    },
+  );
+
   it("resumes the bound backend session with the backend-owned command", async () => {
     registerBackend();
 
