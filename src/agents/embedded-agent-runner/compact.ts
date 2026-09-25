@@ -136,6 +136,7 @@ export async function compactNativeCliSession(params: {
         sessionKey: params.compactParams.sessionKey,
         sessionFile: params.compactParams.sessionFile,
         agentId: params.compactParams.agentId,
+        agentAccountId: params.compactParams.agentAccountId,
         workspaceDir: params.compactParams.workspaceDir,
         cwd: params.compactParams.cwd,
         agentDir: params.compactParams.agentDir,
