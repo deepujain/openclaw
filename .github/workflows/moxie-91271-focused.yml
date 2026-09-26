@@ -1,7 +1,7 @@
 name: Temporary 91271 focused proof
 on:
   push:
-    branches: [moxie-validation/91271-focused-20260925]
+    branches: [moxie-validation/91271-focused-20260926]
 permissions:
   contents: read
 jobs:
@@ -11,7 +11,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 30786e6f8e3f301ed54cc3539ae988a92519513e
+          ref: 010072ed577169c878d691cb2f8a663df1869eea
           persist-credentials: false
       - uses: actions/setup-node@v4
         with:
@@ -20,14 +20,14 @@ jobs:
         env:
           CI: 'true'
         run: |
-          test "$(git rev-parse HEAD)" = 30786e6f8e3f301ed54cc3539ae988a92519513e
+          test "$(git rev-parse HEAD)" = 010072ed577169c878d691cb2f8a663df1869eea
           corepack enable
           corepack pnpm install --frozen-lockfile
       - name: Tool helper worker and full Gateway regressions
         env:
           CI: 'true'
         run: |
-          corepack pnpm test src/agents/tools/sessions-send-helpers.test.ts src/agents/openclaw-tools.sessions.test.ts src/gateway/worker-environments/worker-session-tool-executor.send.test.ts src/gateway/server.sessions-send.test.ts
+          corepack pnpm test src/agents/tools/sessions-send-helpers.test.ts src/agents/openclaw-tools.sessions.test.ts src/gateway/worker-environments/worker-session-tool-executor.send.test.ts src/gateway/server.sessions-send.test.ts src/agents/tools/sessions-send-followup.test.ts
       - name: Changed ownership boundary static checks
         env:
           CI: 'true'
@@ -35,4 +35,4 @@ jobs:
           corepack pnpm exec oxfmt --check src/agents/tools/sessions-send-tool.ts src/agents/tools/sessions-send-tool.a2a.ts
           corepack pnpm exec oxlint src/agents/tools/sessions-send-tool.ts src/agents/tools/sessions-send-tool.a2a.ts
           corepack pnpm tsgo:core
-          corepack pnpm tsgo:core:test
+          corepack pnpm tsgo:core:test --ci-graphs-json '["core-test-agents-tools","core-test-agents-root","core-test-gateway-root","core-test-gateway-other","core-test-gateway-server"]' --concurrency 2
