@@ -11,6 +11,7 @@ import {
   utimesSync,
   writeFileSync,
 } from "node:fs";
+import * as fsPromises from "node:fs/promises";
 import os, { tmpdir } from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
@@ -39,6 +40,9 @@ import { getUnitFastIsolatedTestFiles } from "../vitest/vitest.unit-fast-paths.m
 vi.mock("node:child_process", async (importOriginal) => ({
   ...(await importOriginal<typeof import("node:child_process")>()),
 }));
+vi.mock("node:fs/promises", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("node:fs/promises")>()),
+}));
 
 const scratchDirs: string[] = [];
 const bunConfig = "test/vitest/vitest.unit-fast.config.ts";
@@ -49,6 +53,9 @@ const worktreeRecoveryTarget = "src/agents/worktrees/service.removal-recovery.te
 const gatewayCoreConfig = "test/vitest/vitest.gateway-core.config.ts";
 const gatewayClientConfig = "test/vitest/vitest.gateway-client.config.ts";
 const gatewayClientTarget = "src/gateway/talk/handlers/client-native-control.test.ts";
+const memoryConfig = "test/vitest/vitest.extension-memory.config.ts";
+const memoryTarget = "extensions/memory-lancedb/config.test.ts";
+const memoryIncludes = ["extensions/memory-lancedb", "extensions/memory-wiki"];
 
 function makeScratchDir(): string {
   const dir = mkdtempSync(path.join(tmpdir(), "openclaw-shard-test-"));
@@ -246,10 +253,29 @@ describe("scripts/ci-run-node-test-shard.mts", () => {
   );
 
   it.each([
-    { policy: undefined, expected: ["eligible", "mixed", "unknown", "gateway-client", bunTarget] },
+    {
+      policy: undefined,
+      expected: [
+        "eligible",
+        "mixed",
+        "unknown",
+        "gateway-client",
+        "memory",
+        bunTarget,
+        memoryTarget,
+      ],
+    },
     {
       policy: "bun-compatible",
-      expected: ["bun:eligible", "mixed", "unknown", "bun:gateway-client", `bun:${bunTarget}`],
+      expected: [
+        "bun:eligible",
+        "mixed",
+        "unknown",
+        "bun:gateway-client",
+        "bun:memory",
+        `bun:${bunTarget}`,
+        `bun:${memoryTarget}`,
+      ],
     },
     {
       policy: "dual",
@@ -260,8 +286,12 @@ describe("scripts/ci-run-node-test-shard.mts", () => {
         "unknown",
         "gateway-client",
         "bun:gateway-client",
+        "memory",
+        "bun:memory",
         bunTarget,
         `bun:${bunTarget}`,
+        memoryTarget,
+        `bun:${memoryTarget}`,
       ],
     },
   ])("preserves complete process envelopes under $policy", async ({ policy, expected }) => {
@@ -284,10 +314,20 @@ describe("scripts/ci-run-node-test-shard.mts", () => {
           shard_name: "gateway-client",
           includePatterns: [gatewayClientTarget],
         },
+        {
+          configs: [memoryConfig],
+          shard_name: "memory",
+          includePatterns: memoryIncludes,
+          env: { OPENCLAW_VITEST_MAX_WORKERS: "2" },
+        },
       ]),
     });
     const exitCode = await runShardPlans(
-      [...groups, { kind: "target", name: bunTarget, target: bunTarget }],
+      [
+        ...groups,
+        { kind: "target", name: bunTarget, target: bunTarget },
+        { kind: "target", name: memoryTarget, target: memoryTarget },
+      ],
       {
         concurrency: 1,
         env: {
@@ -315,6 +355,12 @@ describe("scripts/ci-run-node-test-shard.mts", () => {
               gatewayClientTarget,
             ]);
           }
+          if (label.endsWith("memory")) {
+            expect(JSON.parse(readFileSync(env.OPENCLAW_VITEST_INCLUDE_FILE!, "utf8"))).toEqual(
+              memoryIncludes,
+            );
+            expect(env.OPENCLAW_VITEST_MAX_WORKERS).toBe("2");
+          }
           await Promise.resolve();
           active -= 1;
           return 0;
@@ -336,7 +382,11 @@ describe("scripts/ci-run-node-test-shard.mts", () => {
             ? ["unknown.config.ts"]
             : label.endsWith("gateway-client")
               ? [gatewayClientConfig]
-              : [bunTarget];
+              : label.endsWith("memory")
+                ? [memoryConfig]
+                : label.endsWith(memoryTarget)
+                  ? [memoryTarget]
+                  : [bunTarget];
       expect(args).toEqual([...targets, "--", "--maxWorkers=1"]);
     }
   });
@@ -618,10 +668,7 @@ describe("scripts/ci-run-node-test-shard.mts", () => {
     "keeps isolated Node-dependent coverage without losing other files under %s",
     (policy) => {
       const config = "test/vitest/vitest.unit-fast-isolated.config.ts";
-      const nodeFiles = [
-        "src/agents/code-mode.action-output.test.ts",
-        "src/proxy-capture/proxy-server.test.ts",
-      ];
+      const nodeFiles = ["src/agents/code-mode.action-output.test.ts"];
       const files = getUnitFastIsolatedTestFiles();
       const selection = { configs: [config] };
       const selected = resolveCiTestRuntimeSelections(selection, policy);
@@ -643,6 +690,15 @@ describe("scripts/ci-run-node-test-shard.mts", () => {
             policy,
           ),
         ).toEqual([{ runtime: "node" }]);
+      }
+      const captureFile = "src/proxy-capture/proxy-server.test.ts";
+      for (const captureSelection of [
+        { targets: [captureFile] },
+        { configs: ["test/vitest/vitest.infra.config.ts"], includePatterns: [captureFile] },
+      ]) {
+        expect(resolveCiTestRuntimeSelections(captureSelection, policy)).toEqual([
+          { runtime: "node" },
+        ]);
       }
       expect(resolveCiTestRuntimeSelections({ targets: ["src/version.test.ts"] }, policy)).toEqual(
         policy === "dual" ? [{ runtime: "node" }, { runtime: "bun" }] : [{ runtime: "bun" }],
@@ -869,7 +925,7 @@ describe("scripts/ci-run-node-test-shard.mts", () => {
               const included = JSON.parse(
                 readFileSync(env.OPENCLAW_VITEST_POST_SHARD_INCLUDE_FILE!, "utf8"),
               );
-              expect(included).toEqual([nodeFile]);
+              expect(included).toEqual(["ui/src/pages/chat/chat-thread.test.ts", nodeFile]);
               return 0;
             }
             receiptFile = env.OPENCLAW_VITEST_NATIVE_SHARD_RECEIPT;
@@ -935,6 +991,8 @@ describe("scripts/ci-run-node-test-shard.mts", () => {
 
   it.each([
     { shard: { configs: [bunConfig] }, expected: true },
+    { shard: { configs: [memoryConfig] }, expected: true },
+    { shard: { targets: [memoryTarget] }, expected: true },
     { shard: { configs: [] }, expected: false },
     { shard: { configs: [bunConfig, "unknown.config.ts"] }, expected: false },
     {
@@ -1065,6 +1123,9 @@ describe("scripts/ci-run-node-test-shard.mts", () => {
     async ({ key, shared }) => {
       vi.spyOn(groupOwner, "shouldUseDetachedVitestProcessGroup").mockReturnValue(shared);
       const scratchDir = makeScratchDir();
+      if (shared) {
+        vi.spyOn(os, "tmpdir").mockReturnValue(scratchDir);
+      }
       const runChild = vi.fn(async (_args: string[], _env: NodeJS.ProcessEnv) => 0);
       const plans = resolveShardPlans({
         OPENCLAW_NODE_TEST_GROUPS_JSON: JSON.stringify([
@@ -1072,7 +1133,11 @@ describe("scripts/ci-run-node-test-shard.mts", () => {
           { configs: ["two.config.ts"], env: { [key]: "different-loader" } },
         ]),
       });
-      const pending = runShardPlans(plans, { env: {}, scratchDir, runChild });
+      const pending = runShardPlans(plans, {
+        env: {},
+        scratchDir: shared ? undefined : scratchDir,
+        runChild,
+      });
       if (shared) {
         await expect(pending).rejects.toThrow(
           `CI groups cannot share a compiler with differing ${key}`,
@@ -1635,9 +1700,11 @@ describe("scripts/ci-run-node-test-shard.mts", () => {
   });
 
   it.each(["exit", "rejection"] as const)(
-    "joins admitted plans and stops scheduling after a %s failure",
+    "retires generated scratch only after admitted plans settle on a %s failure",
     async (failure) => {
+      vi.spyOn(groupOwner, "shouldUseDetachedVitestProcessGroup").mockReturnValue(true);
       const started: string[] = [];
+      const ownedScratch = new Set<string>();
       const held = createDeferred();
       const failed = createDeferred();
       const children: Promise<number>[] = [];
@@ -1655,8 +1722,13 @@ describe("scripts/ci-run-node-test-shard.mts", () => {
         {
           concurrency: 2,
           env: {},
-          scratchDir: makeScratchDir(),
           runChild: (_args, _env, label) => {
+            const cache = _env.OPENCLAW_VITEST_FS_MODULE_CACHE_ROOT!;
+            const scratch = path.dirname(cache);
+            ownedScratch.add(scratch);
+            scratchDirs.push(scratch);
+            mkdirSync(cache);
+            writeFileSync(path.join(cache, "transform"), "cached");
             const child = (async () => {
               started.push(label);
               if (label === "a") {
@@ -1688,6 +1760,7 @@ describe("scripts/ci-run-node-test-shard.mts", () => {
         await nextTurn();
         expect(settled).toBe(false);
         expect(started).toEqual(["a", "b"]);
+        expect([...ownedScratch].every(existsSync)).toBe(true);
       } finally {
         held.resolve();
         await nextTurn();
@@ -1701,8 +1774,28 @@ describe("scripts/ci-run-node-test-shard.mts", () => {
         expect(outcome.exitCode).toBe(7);
       }
       expect(started).toEqual(["a", "b"]);
+      expect([...ownedScratch].some(existsSync)).toBe(false);
     },
   );
+
+  it.each([0, 7])("preserves shard exit %i when scratch removal fails", async (exitCode) => {
+    vi.spyOn(groupOwner, "shouldUseDetachedVitestProcessGroup").mockReturnValue(true);
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.spyOn(fsPromises, "rm").mockRejectedValue(new Error("scratch removal denied"));
+    let scratch = "";
+    await expect(
+      runShardPlans([{ kind: "target", name: "one", target: "one.test.ts" }], {
+        env: {},
+        runChild: async (_args, env) => {
+          scratch = path.dirname(env.OPENCLAW_VITEST_FS_MODULE_CACHE_ROOT!);
+          scratchDirs.push(scratch);
+          return exitCode;
+        },
+      }),
+    ).resolves.toBe(exitCode);
+    expect(existsSync(scratch)).toBe(true);
+    expect(warning).toHaveBeenCalledWith(expect.stringContaining(`retained ${scratch}`));
+  });
 
   it("continues through failed plans only when explicitly requested", async () => {
     const started: string[] = [];

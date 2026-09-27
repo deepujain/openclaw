@@ -51,12 +51,16 @@ describe("worker session tool send delivery", () => {
     resetGlobalHookRunner();
   });
 
-  it("delivers across exact live family incarnations with the source channel", async () => {
+  function setParentAndChild() {
     setEntry(SOURCE.sessionKey, SOURCE.sessionId);
     setEntry(TARGET.sessionKey, TARGET.sessionId, {
       sessionKey: SOURCE.sessionKey,
       sessionId: SOURCE.sessionId,
     });
+  }
+
+  it("delivers across exact live family incarnations with the source channel", async () => {
+    setParentAndChild();
     await expect(send("parent-to-child")).resolves.toBeDefined();
 
     setEntry(SOURCE.sessionKey, SOURCE.sessionId, {
@@ -145,11 +149,7 @@ describe("worker session tool send delivery", () => {
   );
 
   it("deduplicates retries without collapsing distinct identical sends", async () => {
-    setEntry(SOURCE.sessionKey, SOURCE.sessionId);
-    setEntry(TARGET.sessionKey, TARGET.sessionId, {
-      sessionKey: SOURCE.sessionKey,
-      sessionId: SOURCE.sessionId,
-    });
+    setParentAndChild();
 
     const first = await send("identical-send-one");
     const replay = await send("identical-send-one");
@@ -169,11 +169,7 @@ describe("worker session tool send delivery", () => {
   });
 
   it("delivers a validated policy rewrite with the original tool-call identity", async () => {
-    setEntry(SOURCE.sessionKey, SOURCE.sessionId);
-    setEntry(TARGET.sessionKey, TARGET.sessionId, {
-      sessionKey: SOURCE.sessionKey,
-      sessionId: SOURCE.sessionId,
-    });
+    setParentAndChild();
     initializeGlobalHookRunner(
       createMockPluginRegistry([
         {
@@ -214,11 +210,7 @@ describe("worker session tool send delivery", () => {
   });
 
   it("suppresses policy receipts and effects when worker authority closes during the hook", async () => {
-    setEntry(SOURCE.sessionKey, SOURCE.sessionId);
-    setEntry(TARGET.sessionKey, TARGET.sessionId, {
-      sessionKey: SOURCE.sessionKey,
-      sessionId: SOURCE.sessionId,
-    });
+    setParentAndChild();
     const { promise: policy, resolve: resolvePolicy } = createDeferred();
     const beforeToolCall = vi.fn(async () => {
       await policy;
@@ -252,11 +244,7 @@ describe("worker session tool send delivery", () => {
   });
 
   it("suppresses dispatch when worker authority closes after policy", async () => {
-    setEntry(SOURCE.sessionKey, SOURCE.sessionId);
-    setEntry(TARGET.sessionKey, TARGET.sessionId, {
-      sessionKey: SOURCE.sessionKey,
-      sessionId: SOURCE.sessionId,
-    });
+    setParentAndChild();
     gatewayRequest.mockResolvedValue({ runId: "target-run", status: "accepted" });
     const { promise: dispatchEntered, resolve: enterDispatch } = createDeferred();
     const { promise: dispatch, resolve: finishDispatch } = createDeferred();
@@ -283,11 +271,7 @@ describe("worker session tool send delivery", () => {
   });
 
   it("coalesces concurrent retries into one message effect", async () => {
-    setEntry(SOURCE.sessionKey, SOURCE.sessionId);
-    setEntry(TARGET.sessionKey, TARGET.sessionId, {
-      sessionKey: SOURCE.sessionKey,
-      sessionId: SOURCE.sessionId,
-    });
+    setParentAndChild();
     let finishDelivery: (() => void) | undefined;
     delivered.mockImplementation(
       async () =>
@@ -305,11 +289,7 @@ describe("worker session tool send delivery", () => {
   });
 
   it("coalesces concurrent policy blocks before message effects", async () => {
-    setEntry(SOURCE.sessionKey, SOURCE.sessionId);
-    setEntry(TARGET.sessionKey, TARGET.sessionId, {
-      sessionKey: SOURCE.sessionKey,
-      sessionId: SOURCE.sessionId,
-    });
+    setParentAndChild();
     const { promise: policy, resolve: resolvePolicy } = createDeferred<{
       block: true;
       blockReason: string;
@@ -335,11 +315,7 @@ describe("worker session tool send delivery", () => {
   });
 
   it("replays a completed send after the target incarnation changes", async () => {
-    setEntry(SOURCE.sessionKey, SOURCE.sessionId);
-    setEntry(TARGET.sessionKey, TARGET.sessionId, {
-      sessionKey: SOURCE.sessionKey,
-      sessionId: SOURCE.sessionId,
-    });
+    setParentAndChild();
 
     const first = await send("completed-before-target-replacement");
     setEntry(TARGET.sessionKey, "replacement-target", {
@@ -353,11 +329,7 @@ describe("worker session tool send delivery", () => {
   });
 
   it("records repeated downstream send failures as unknown instead of replayable failure", async () => {
-    setEntry(SOURCE.sessionKey, SOURCE.sessionId);
-    setEntry(TARGET.sessionKey, TARGET.sessionId, {
-      sessionKey: SOURCE.sessionKey,
-      sessionId: SOURCE.sessionId,
-    });
+    setParentAndChild();
     delivered.mockImplementation(() => {
       throw new Error("target send response was lost");
     });
@@ -427,7 +399,7 @@ describe("worker session tool send delivery", () => {
       scopedSessionAccess.mockImplementationOnce(async (params) => {
         if (replaced === "target") {
           setEntry(TARGET.sessionKey, "replacement-target", PARENT);
-          activate({ ...TARGET, sessionId: "replacement-target" });
+          await activate({ ...TARGET, sessionId: "replacement-target" });
         } else {
           setEntry(PARENT.sessionKey, "replacement-parent");
         }
