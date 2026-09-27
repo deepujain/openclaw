@@ -1,7 +1,7 @@
 name: Temporary 91271 focused proof
 on:
   push:
-    branches: [moxie-validation/91271-focused-20260926]
+    branches: [moxie-validation/91271-focused-20260927]
 permissions:
   contents: read
 jobs:
@@ -11,7 +11,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 010072ed577169c878d691cb2f8a663df1869eea
+          ref: a1bf4fe56cc0e7c5edec8794a9f19932a28a17cc
           persist-credentials: false
       - uses: actions/setup-node@v4
         with:
@@ -20,7 +20,7 @@ jobs:
         env:
           CI: 'true'
         run: |
-          test "$(git rev-parse HEAD)" = 010072ed577169c878d691cb2f8a663df1869eea
+          test "$(git rev-parse HEAD)" = a1bf4fe56cc0e7c5edec8794a9f19932a28a17cc
           corepack enable
           corepack pnpm install --frozen-lockfile
       - name: Tool helper worker and full Gateway regressions
@@ -32,7 +32,7 @@ jobs:
         env:
           CI: 'true'
         run: |
-          corepack pnpm exec oxfmt --check src/agents/tools/sessions-send-tool.ts src/agents/tools/sessions-send-tool.a2a.ts
-          corepack pnpm exec oxlint src/agents/tools/sessions-send-tool.ts src/agents/tools/sessions-send-tool.a2a.ts
+          corepack pnpm exec oxfmt --check src/agents/tools/sessions-send-helpers.ts src/agents/tools/sessions-send-tool.ts src/agents/tools/sessions-send-tool.a2a.ts
+          corepack pnpm exec oxlint src/agents/tools/sessions-send-helpers.ts src/agents/tools/sessions-send-tool.ts src/agents/tools/sessions-send-tool.a2a.ts
           corepack pnpm tsgo:core
           corepack pnpm tsgo:core:test --ci-graphs-json '["core-test-agents-tools","core-test-agents-root","core-test-gateway-root","core-test-gateway-other","core-test-gateway-server"]' --concurrency 2
