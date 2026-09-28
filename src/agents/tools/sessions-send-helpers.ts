@@ -8,7 +8,6 @@ import { normalizeChatChannelId } from "../../channels/registry.js";
 import { parseSessionDeliveryRoute } from "../../sessions/session-key-utils.js";
 import { sanitizeAgentIdentityLine } from "../identity-file.js";
 import { ANNOUNCE_SKIP_TOKEN, REPLY_SKIP_TOKEN } from "./sessions-send-tokens.js";
-export { isNonDeliverableSessionsReply } from "./sessions-send-tokens.js";
 
 const MAX_A2A_REQUESTER_NAME_PROMPT_CHARS = 120;
 
