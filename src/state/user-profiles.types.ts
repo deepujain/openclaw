@@ -50,6 +50,7 @@ export type UserChannelIdentityLink = { profileId: string; identity: UserChannel
 export type UserChannelIdentityAuthorityFacts = {
   authorization?: UserChannelAuthorization;
   profileId: string;
+  displayName: string | null;
   role: string | null;
   emails: string[];
   loginIdentities: string[];
@@ -94,7 +95,10 @@ export type UserProfileAccessFacts = Readonly<{
 }>;
 
 export type PreparedUserProfileIdentity = {
-  readCurrentProfile(this: void): Pick<UserProfileAccessFacts, "profileId" | "assignedRole">;
+  readCurrentProfile(
+    this: void,
+    requiredEmailBindingIds?: readonly string[],
+  ): Pick<UserProfileAccessFacts, "profileId" | "assignedRole">;
   readonly emailBindingIds: readonly string[];
   readCurrentFacts(
     this: void,

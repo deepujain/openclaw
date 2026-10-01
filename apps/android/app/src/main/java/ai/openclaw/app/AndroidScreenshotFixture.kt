@@ -21,6 +21,7 @@ import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonArray
 import kotlinx.serialization.json.putJsonObject
 import java.time.Instant
+import java.time.ZoneId
 import java.util.concurrent.atomic.AtomicReference
 
 internal object AndroidScreenshotFixture {
@@ -37,8 +38,15 @@ internal object AndroidScreenshotFixture {
     get() = scene in setOf(AndroidScreenshotScene.CompletedWork, AndroidScreenshotScene.ActiveWork, AndroidScreenshotScene.WorkBoundaries)
 
   const val gatewayId = "android-screenshot-gateway"
+  val browserFocusAvailable: Boolean get() = scene == AndroidScreenshotScene.Browser
   const val controlUiBaseUrl = "http://127.0.0.1:18789"
-  val mainSessionKey: String get() = if (workScene) "agent:main:node-work-proof" else "agent:main:node-screenshot"
+  val mainSessionKey: String
+    get() =
+      when {
+        workScene -> "agent:main:node-work-proof"
+        scene == AndroidScreenshotScene.Snooze -> "agent:main:dashboard:snooze-active"
+        else -> "agent:main:node-screenshot"
+      }
   val sourcePreviewConfig: GatewaySourcePreviewConfig?
     get() = if (scene == AndroidScreenshotScene.Sources) GatewaySourcePreviewConfig(controlUiBaseUrl, "", "https://gateway.example", true, 0L) else null
 
@@ -54,6 +62,7 @@ internal object AndroidScreenshotFixture {
   private val branchLeaves = (1..12).map { "android-screenshot-branch-${it.toString().padStart(2, '0')}" }
 
   fun createRequester(branchesEnabled: Boolean = this.branchesEnabled): (String, String?) -> String {
+    val fixtureNowMs = System.currentTimeMillis()
     val activeLeaf = AtomicReference(branchLeaves.first())
     // A runtime gets a fresh lifetime; list refreshes and scene re-entry keep its exact record.
     val pendingQuestion =
@@ -130,6 +139,8 @@ internal object AndroidScreenshotFixture {
             branchHistory(activeLeaf.get())
           } else if (scene == AndroidScreenshotScene.Sources) {
             sourceHistory()
+          } else if (scene == AndroidScreenshotScene.Browser) {
+            browserHistory(paramsJson)
           } else if (workScene) {
             workHistory()
           } else {
@@ -138,7 +149,7 @@ internal object AndroidScreenshotFixture {
         }
 
         "sessions.list" -> {
-          if (branchesEnabled) branchSessionList(paramsJson, activeLeaf.get()) else sessionList(paramsJson)
+          if (branchesEnabled) branchSessionList(paramsJson, activeLeaf.get()) else sessionList(paramsJson, fixtureNowMs)
         }
 
         "sessions.branches.list" -> {
@@ -164,16 +175,8 @@ internal object AndroidScreenshotFixture {
           modelCatalog()
         }
 
-        "tasks.list" -> {
-          backgroundTasks(paramsJson)
-        }
-
-        "tasks.get" -> {
-          backgroundTask(paramsJson)
-        }
-
         "question.list" -> {
-          Json.encodeToString(QuestionListResult(if (workScene) emptyList() else questionRecords.get().filter { it.status == "pending" && it.expiresAtMs > System.currentTimeMillis() }))
+          Json.encodeToString(QuestionListResult(if (workScene || scene == AndroidScreenshotScene.Browser) emptyList() else questionRecords.get().filter { it.status == "pending" && it.expiresAtMs > System.currentTimeMillis() }))
         }
 
         "question.get" -> {
@@ -321,69 +324,6 @@ internal object AndroidScreenshotFixture {
         )
       }
     }.toString()
-
-  private fun taskRecords(): List<JsonObject> =
-    (1..16).map { index ->
-      buildJsonObject {
-        put("id", JsonPrimitive("screenshot-ledger-$index"))
-        put("taskId", JsonPrimitive("screenshot-runtime-$index"))
-        put("agentId", JsonPrimitive(if (index == 16) "other-agent" else "main"))
-        put("title", JsonPrimitive("Release task ${index.toString().padStart(2, '0')}"))
-        put("status", JsonPrimitive(if (index <= 8) "running" else "completed"))
-        put("runtime", JsonPrimitive("subagent"))
-        put("createdAt", JsonPrimitive(1_783_555_200_000L + index))
-        put("updatedAt", JsonPrimitive(1_783_555_260_000L + index))
-        put("progressSummary", JsonPrimitive("Reviewing the synthetic release checklist, item $index."))
-      }
-    }
-
-  private fun backgroundTasks(paramsJson: String?): String {
-    val params = Json.parseToJsonElement(checkNotNull(paramsJson)).jsonObject
-    val agentId = params["agentId"]?.jsonPrimitive?.contentOrNull
-    val statuses = (params["status"] as? JsonArray)?.map { it.jsonPrimitive.content }?.toSet()
-    val limit =
-      params["limit"]
-        ?.jsonPrimitive
-        ?.content
-        ?.toIntOrNull()
-        ?.coerceAtLeast(0) ?: 100
-    val tasks =
-      taskRecords()
-        .filter {
-          (agentId == null || it["agentId"]?.jsonPrimitive?.content == agentId) &&
-            (statuses == null || it["status"]?.jsonPrimitive?.content in statuses)
-        }.take(limit)
-    return buildJsonObject { put("tasks", JsonArray(tasks)) }.toString()
-  }
-
-  private fun backgroundTask(paramsJson: String?): String {
-    val id =
-      Json
-        .parseToJsonElement(checkNotNull(paramsJson))
-        .jsonObject["taskId"]
-        ?.jsonPrimitive
-        ?.content
-    val task =
-      taskRecords().firstOrNull { it["id"]?.jsonPrimitive?.content == id }
-        ?: error("Screenshot fixture has no task with canonical ledger ID $id")
-    val detail =
-      buildJsonObject {
-        task.forEach { (key, value) -> put(key, value) }
-        put(
-          "prompt",
-          JsonPrimitive(
-            (1..24).joinToString("\n\n") { "Checklist section $it: inspect the release notes and report the result without changing any files." },
-          ),
-        )
-        put(
-          "terminalSummary",
-          JsonPrimitive(
-            (1..24).joinToString("\n\n") { "Result section $it: the synthetic release checklist remains readable and selectable across layout changes." },
-          ),
-        )
-      }
-    return buildJsonObject { put("task", detail) }.toString()
-  }
 
   val agents =
     listOf(
@@ -567,6 +507,53 @@ internal object AndroidScreenshotFixture {
         }
       }
     }.toString()
+
+  private fun browserHistory(paramsJson: String?): String {
+    val sessionKey =
+      paramsJson?.let {
+        Json
+          .parseToJsonElement(it)
+          .jsonObject["sessionKey"]
+          ?.jsonPrimitive
+          ?.contentOrNull
+      } ?: mainSessionKey
+    val secondSession = sessionKey == "agent:main:node-browser-reading"
+    val title = if (secondSession) "Reading list" else "Travel checklist"
+    val targetId = if (secondSession) "browser-reading-proof" else "browser-proof"
+    val url = if (secondSession) "https://example.test/reading" else "https://example.test/travel"
+    return buildJsonObject {
+      put("sessionId", JsonPrimitive(if (secondSession) "screenshot-browser-reading" else "screenshot-browser-travel"))
+      put("sessionInfo", session(sessionKey, title, 1_783_555_320_000))
+      putJsonArray("messages") {
+        add(chatMessage("user", "Open my ${title.lowercase()} in the browser.", 1_783_555_260_000))
+        addJsonObject {
+          put("role", JsonPrimitive("toolResult"))
+          put("id", JsonPrimitive("$targetId-result"))
+          put("runId", JsonPrimitive("$targetId-run"))
+          put("toolName", JsonPrimitive("browser"))
+          put("toolCallId", JsonPrimitive("$targetId-call"))
+          put("timestamp", JsonPrimitive(1_783_555_275_000))
+          putJsonObject("details") {
+            putJsonObject("browserTab") {
+              put("target", JsonPrimitive("host"))
+              put("profile", JsonPrimitive("openclaw"))
+              put("targetId", JsonPrimitive(targetId))
+              put("url", JsonPrimitive(url))
+              put("title", JsonPrimitive(title))
+            }
+          }
+          put("content", JsonPrimitive("Opened $title in the agent's browser."))
+        }
+        addJsonObject {
+          put("role", JsonPrimitive("assistant"))
+          put("runId", JsonPrimitive("$targetId-run"))
+          put("phase", JsonPrimitive("final_answer"))
+          put("timestamp", JsonPrimitive(1_783_555_290_000))
+          put("content", JsonPrimitive("The **${title.lowercase()}** is ready. You can continue here while reviewing the browser."))
+        }
+      }
+    }.toString()
+  }
 
   private fun sourceHistory(): String =
     buildJsonObject {
@@ -869,7 +856,50 @@ internal object AndroidScreenshotFixture {
     cost?.let { put("cost", it) }
   }
 
-  private fun sessionList(paramsJson: String?): String {
+  private fun sessionList(
+    paramsJson: String?,
+    fixtureNowMs: Long,
+  ): String {
+    if (scene == AndroidScreenshotScene.Snooze) {
+      val wakeAtMs =
+        Instant
+          .ofEpochMilli(fixtureNowMs)
+          .atZone(ZoneId.systemDefault())
+          .toLocalDate()
+          .plusDays(1)
+          .atTime(9, 0)
+          .atZone(ZoneId.systemDefault())
+          .toInstant()
+          .toEpochMilli()
+      return buildJsonObject {
+        putJsonArray("sessions") {
+          addJsonObject {
+            session("agent:main:dashboard:snooze-active", "Trip checklist", fixtureNowMs).forEach { (key, value) -> put(key, value) }
+            put("sessionId", "screenshot-snooze-active")
+          }
+          addJsonObject {
+            session("agent:main:dashboard:snooze-sleeping", "Weekend reading", fixtureNowMs - 60_000).forEach { (key, value) -> put(key, value) }
+            put("sessionId", "screenshot-snooze-sleeping")
+            put("snoozedAt", fixtureNowMs)
+            put("snoozedUntil", wakeAtMs)
+          }
+        }
+        put("count", 2)
+        put("totalCount", 2)
+        put("hasMore", false)
+      }.toString()
+    }
+    if (scene == AndroidScreenshotScene.Browser) {
+      return buildJsonObject {
+        putJsonArray("sessions") {
+          add(session(mainSessionKey, "Travel checklist", 1_783_555_320_000))
+          add(session("agent:main:node-browser-reading", "Reading list", 1_783_555_200_000))
+        }
+        put("count", JsonPrimitive(2))
+        put("totalCount", JsonPrimitive(2))
+        put("hasMore", JsonPrimitive(false))
+      }.toString()
+    }
     val spawnedBy =
       paramsJson
         ?.let {

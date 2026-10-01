@@ -1,3 +1,7 @@
+import {
+  hasProviderTransportDispatcherPool,
+  stopActiveManagedProviderLocalServices,
+} from "../agents/provider-runtime-lifecycle.js";
 import { finalizeActiveDebugProxyCaptures } from "../proxy-capture/runtime-cleanup.js";
 import type { CliHarnessCleanup } from "./runtime-cleanup-scope.js";
 
@@ -48,6 +52,11 @@ export async function runCliDisposer(
 
 export async function closeCliResources(cleanup?: CliHarnessCleanup): Promise<void> {
   const runCleanup = cleanup?.pluginResources?.runCleanup;
+  if (cleanup) {
+    const scheduledWork = cleanup.scheduler.stop();
+    await runCliDisposer("scheduled-work", () => scheduledWork, runCleanup);
+    await scheduledWork;
+  }
   const finalizers: Record<string, () => Promise<void>> = {
     "agent-harnesses": async () => {
       const { listRegisteredAgentHarnesses, disposeRegisteredAgentHarnesses } =
@@ -76,18 +85,8 @@ export async function closeCliResources(cleanup?: CliHarnessCleanup): Promise<vo
         cleanup.registries.clear();
       }
     },
-    "provider-local-services": async () => {
-      const { hasManagedProviderLocalServices } =
-        await import("../agents/provider-runtime-lifecycle.js");
-      if (hasManagedProviderLocalServices()) {
-        const { stopManagedProviderLocalServices } =
-          await import("../agents/provider-local-service.js");
-        await stopManagedProviderLocalServices();
-      }
-    },
+    "provider-local-services": stopActiveManagedProviderLocalServices,
     "provider-transport-dispatchers": async () => {
-      const { hasProviderTransportDispatcherPool } =
-        await import("../agents/provider-runtime-lifecycle.js");
       if (hasProviderTransportDispatcherPool()) {
         const { closeProviderTransportDispatcherPool } =
           await import("../agents/provider-transport-dispatcher-pool.js");

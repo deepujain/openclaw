@@ -298,7 +298,7 @@ export async function createPluginReloadRecoveryFixture(
           loadGatewayPluginBootstrapModule: async () => ({
             prepareGatewayPluginLoad: preparePlugins,
           }),
-          prepareAttachedPluginRuntime: async (candidate) => {
+          prepareAttachedPluginRuntime: async (candidate, trackActivationCleanup) => {
             await options.prepareAttached?.();
             return {
               publish: () => {
@@ -309,6 +309,7 @@ export async function createPluginReloadRecoveryFixture(
                   "gateway-bindable",
                   undefined,
                   registryOwner.registry,
+                  trackActivationCleanup,
                 );
                 registryOwner.publish(candidate.pluginRegistry);
               },
@@ -368,6 +369,7 @@ export type RecoveryFixtureFactory = (
 
 export function createRecoveryChannelManager(fixture: Awaited<ReturnType<RecoveryFixtureFactory>>) {
   return createChannelManager({
+    scheduler: createTestGatewayScheduler(),
     getRuntimeConfig: fixture.getConfig,
     getPluginRegistry: () => fixture.registryOwner.registry,
     channelLogs: {},
