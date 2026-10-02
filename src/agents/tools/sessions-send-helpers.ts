@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import { truncateWithMarker } from "@openclaw/normalization-core/utf16-slice";
 import {
   getChannelPlugin,
@@ -7,6 +8,7 @@ import { resolveSessionConversationRef } from "../../channels/plugins/session-co
 import { normalizeChatChannelId } from "../../channels/registry.js";
 import { parseSessionDeliveryRoute } from "../../sessions/session-key-utils.js";
 import { sanitizeAgentIdentityLine } from "../identity-file.js";
+import { jsonResult } from "./tool-results.js";
 
 const MAX_A2A_REQUESTER_NAME_PROMPT_CHARS = 120;
 
@@ -16,6 +18,20 @@ export type SessionDeliveryTarget = {
   accountId?: string;
   threadId?: string; // Forum topic/thread ID
 };
+
+export function sendFailure(
+  status: "error" | "forbidden",
+  error: string,
+  sessionKey?: string,
+  runId: string = crypto.randomUUID(),
+) {
+  return jsonResult({
+    runId,
+    status,
+    error,
+    ...(sessionKey !== undefined ? { sessionKey } : {}),
+  });
+}
 
 export function resolveSessionDeliveryTargetFromKey(
   sessionKey: string,

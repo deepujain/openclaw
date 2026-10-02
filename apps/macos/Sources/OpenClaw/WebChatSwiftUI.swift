@@ -652,10 +652,16 @@ struct MacGatewayChatTransport: OpenClawChatGatewayTransport {
             throw OpenClawChatTransportSendError.notDispatched
         }
         try await self.requireCurrentOutboxGateway()
-        return try await MacChatMessageSpeechClient.synthesize(
-            text: text,
-            serverLease: serverLease,
-            connection: self.connection)
+        let encoded = try JSONEncoder().encode(TtsSpeakParams(text: text))
+        guard let params = try JSONSerialization.jsonObject(with: encoded) as? [String: Any] else {
+            throw MacChatMessageSpeechError.invalidRequest
+        }
+        let responseData = try await self.connection.request(
+            method: "tts.speak",
+            params: params.mapValues(AnyCodable.init),
+            timeoutMs: 60000,
+            ifCurrentServerLease: serverLease)
+        return try OpenClawChatGatewayPayloadCodec.decodeSpeechClip(responseData)
     }
 
     func loadSourceContext() async -> OpenClawChatSourceContext? {
@@ -685,10 +691,6 @@ struct MacGatewayChatTransport: OpenClawChatGatewayTransport {
             kind: kind,
             playback: playback,
             ifCurrentServerLease: serverLease)
-    }
-
-    var supportsSlashCommandCatalog: Bool {
-        true
     }
 
     func createSession(
@@ -784,7 +786,7 @@ struct MacGatewayChatTransport: OpenClawChatGatewayTransport {
                 }
 
                 let stream = await self.connection.subscribe()
-                var hasSeenSnapshot = false
+                var previousLease: GatewayConnection.ServerLease?
                 for await delivery in stream {
                     if Task.isCancelled {
                         return
@@ -793,10 +795,12 @@ struct MacGatewayChatTransport: OpenClawChatGatewayTransport {
                     if case .snapshot = push {
                         try? await self.connection.updateNativeChatSubscription(owner: nil, target: nil)
                         guard delivery.isCurrent else { continue }
-                        if hasSeenSnapshot {
-                            continuation.yield(.routeChanged)
+                        if let previousLease {
+                            let event = await self.snapshotTransportEvent(previousLease: previousLease)
+                            guard delivery.isCurrent else { continue }
+                            continuation.yield(event)
                         }
-                        hasSeenSnapshot = true
+                        previousLease = delivery.serverLease
                     }
                     if let evt = Self.mapPushToTransportEvent(push) {
                         continuation.yield(evt)
@@ -840,27 +844,6 @@ private enum MacChatMessageSpeechError: LocalizedError {
         case .unsupportedTransport:
             "Gateway TTS is unavailable for this chat transport"
         }
-    }
-}
-
-private enum MacChatMessageSpeechClient {
-    private static let requestTimeoutMs: Double = 60000
-
-    static func synthesize(
-        text: String,
-        serverLease: GatewayConnection.ServerLease,
-        connection: GatewayConnection) async throws -> OpenClawChatSpeechClip
-    {
-        let encoded = try JSONEncoder().encode(TtsSpeakParams(text: text))
-        guard let params = try JSONSerialization.jsonObject(with: encoded) as? [String: Any] else {
-            throw MacChatMessageSpeechError.invalidRequest
-        }
-        let responseData = try await connection.request(
-            method: "tts.speak",
-            params: params.mapValues(AnyCodable.init),
-            timeoutMs: self.requestTimeoutMs,
-            ifCurrentServerLease: serverLease)
-        return try OpenClawChatGatewayPayloadCodec.decodeSpeechClip(responseData)
     }
 }
 
@@ -1282,7 +1265,7 @@ final class WebChatSwiftUIWindowController: NSObject, NSWindowDelegate {
               case let .snapshot(hello) = delivery.push else { return }
         let lease = delivery.serverLease
         let base = hello.controluiurl.flatMap(URL.init(string:)) ?? lease.route.url
-        commands.setSessionMenuConnection(OpenClawSessionMenuConnection(
+        var menuConnection = OpenClawSessionMenuConnection(
             hello: hello,
             local: target == .local || (target == .primary && AppStateStore.shared.connectionMode == .local),
             selfProfileID: hello.snapshot.presence.first {
@@ -1302,7 +1285,9 @@ final class WebChatSwiftUIWindowController: NSObject, NSWindowDelegate {
                     newWindow: true,
                     route: WebChatRoute(sessionKey: session.key, agentID: session.agentId),
                     sourceIsCurrent: { connection.serverLeaseMatchesCurrentState(lease) })
-            }))
+            })
+        menuConnection.groupDefaultsBrowser = MacGatewayGroupDefaults.browser(connection: menuConnection)
+        commands.setSessionMenuConnection(menuConnection)
     }
 
     var acceptsNativeDraft: Bool {

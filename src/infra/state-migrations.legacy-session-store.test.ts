@@ -3,11 +3,11 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
+import { readLegacySessionStoreEntries } from "../config/sessions/legacy-store-inspection.js";
 import {
   loadLegacySessionStore,
   saveLegacySessionStore,
 } from "./state-migrations.legacy-session-store.js";
-import { resolveStaleLegacySessionFile } from "./state-migrations.session-store.js";
 
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -19,7 +19,6 @@ const legacyEntry = {
   channel: "slack",
   provider: false,
   lastProvider: false,
-  room: false,
   pendingFinalDeliveryAttemptCount: -1,
 };
 let root: string;
@@ -150,6 +149,32 @@ it("normalizes file-era rows and drops malformed entries", async () => {
   expect(store[MAIN_KEY]?.pluginExtensions).toEqual({ demo: { valid: { ok: true } } });
 });
 
+it("preserves retired room-only source bytes across inspection, loading, and refused writes", async () => {
+  const store = { [MAIN_KEY]: { sessionId: "session-room", updatedAt: 1, room: "#legacy" } };
+  const raw = `${JSON.stringify(store, null, 2)}\n`;
+  await fs.writeFile(storePath, raw);
+  expect(() => readLegacySessionStoreEntries({ storePath }, [])).toThrow(/2026\.9\.5/);
+  expect(() => loadLegacySessionStore(storePath)).toThrow(/2026\.9\.5/);
+  await expect(saveLegacySessionStore(storePath, store, { skipMaintenance: true })).rejects.toThrow(
+    /2026\.9\.5/,
+  );
+  expect(await fs.readFile(storePath, "utf8")).toBe(raw);
+});
+
+it("imports provider-only fields still preserved by the July Doctor writer", async () => {
+  await writeStore({
+    [MAIN_KEY]: {
+      sessionId: "session-1",
+      updatedAt: 1,
+      provider: "slack",
+      lastProvider: "telegram",
+    },
+  });
+  const raw = await fs.readFile(storePath, "utf8");
+  expectNormalized(loadLegacySessionStore(storePath), "telegram");
+  expect(await fs.readFile(storePath, "utf8")).toBe(raw);
+});
+
 it("normalizes compatibility writes before persistence", async () => {
   const skillsSnapshot = {
     prompt: "compact skill prompt",
@@ -179,27 +204,4 @@ it("normalizes compatibility writes before persistence", async () => {
   expect(persisted[MAIN_KEY]?.skillsSnapshot).toMatchObject(skillsSnapshot);
   expect(persisted[MAIN_KEY]?.skillsSnapshot).not.toHaveProperty("resolvedSkills");
   expectNormalized(loadLegacySessionStore(storePath), "slack");
-});
-
-it("repairs a stale session file whose header straddles the read chunk boundary", async () => {
-  const sessionId = "sess-boundary-1";
-  const legacyDir = path.join(root, "legacy-sessions");
-  const targetDir = path.join(root, "sessions");
-  await fs.mkdir(legacyDir);
-  await fs.mkdir(targetDir);
-  const legacySessionFile = path.join(legacyDir, `${sessionId}.jsonl`);
-  const targetSessionFile = path.join(targetDir, `${sessionId}.jsonl`);
-  // The three-byte character begins at 8191, splitting it across read chunks.
-  const prefix = Buffer.from(`{"type":"session","id":"${sessionId}","pad":"`);
-  await fs.writeFile(
-    targetSessionFile,
-    Buffer.concat([prefix, Buffer.from("a".repeat(8191 - prefix.length)), Buffer.from('中"}\n')]),
-  );
-  expect(
-    resolveStaleLegacySessionFile({
-      entry: { sessionId, sessionFile: legacySessionFile },
-      legacyDir,
-      targetDir,
-    }),
-  ).toBe(targetSessionFile);
 });

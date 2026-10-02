@@ -60,7 +60,7 @@ import {
   PLACED_SESSIONS_SEND_DESCRIPTION,
 } from "./sessions-placement-tool-contract.js";
 import { dispatchSessionsSendFollowup } from "./sessions-send-followup.js";
-import { buildSessionsSendRequesterContext } from "./sessions-send-helpers.js";
+import { buildSessionsSendRequesterContext, sendFailure } from "./sessions-send-helpers.js";
 import { startSessionsSendReplyFlow } from "./sessions-send-reply-flow.js";
 import { captureSessionsSendResumeCaller, resumeSessionsSendTask } from "./sessions-send-resume.js";
 import {
@@ -82,20 +82,6 @@ function resolveRequesterIdentityName(params: {
 }): string | undefined {
   const name = resolveAgentConfig(params.cfg, params.requesterAgentId)?.identity?.name?.trim();
   return name || undefined;
-}
-
-function sendFailure(
-  status: "error" | "forbidden",
-  error: string,
-  sessionKey?: string,
-  runId: string = crypto.randomUUID(),
-) {
-  return jsonResult({
-    runId,
-    status,
-    error,
-    ...(sessionKey !== undefined ? { sessionKey } : {}),
-  });
 }
 
 export function createSessionsSendTool(opts?: SessionsSendToolOptions): AnyAgentTool {
@@ -297,6 +283,17 @@ export function createSessionsSendTool(opts?: SessionsSendToolOptions): AnyAgent
           });
       if (!resolvedSession.ok) {
         return sendFailure(resolvedSession.status, resolvedSession.error);
+      }
+      if (
+        resolvedSession.resolvedViaSessionId &&
+        !resolvedSession.agentId &&
+        classifySessionKeyShape(resolvedSession.key) === "legacy_or_alias"
+      ) {
+        return sendFailure(
+          "forbidden",
+          "Session ownership could not be verified. Upgrade the gateway or use an agent-prefixed session key.",
+          sessionKey,
+        );
       }
       const resolutionAccess = createSessionVisibilityRowChecker({
         action: "send",
