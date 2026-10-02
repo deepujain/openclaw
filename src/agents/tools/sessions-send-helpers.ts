@@ -7,18 +7,19 @@ import { resolveSessionConversationRef } from "../../channels/plugins/session-co
 import { normalizeChatChannelId } from "../../channels/registry.js";
 import { parseSessionDeliveryRoute } from "../../sessions/session-key-utils.js";
 import { sanitizeAgentIdentityLine } from "../identity-file.js";
-import { ANNOUNCE_SKIP_TOKEN, REPLY_SKIP_TOKEN } from "./sessions-send-tokens.js";
 
 const MAX_A2A_REQUESTER_NAME_PROMPT_CHARS = 120;
 
-export type AnnounceTarget = {
+export type SessionDeliveryTarget = {
   channel: string;
   to: string;
   accountId?: string;
   threadId?: string; // Forum topic/thread ID
 };
 
-export function resolveAnnounceTargetFromKey(sessionKey: string): AnnounceTarget | null {
+export function resolveSessionDeliveryTargetFromKey(
+  sessionKey: string,
+): SessionDeliveryTarget | null {
   const parsed = resolveSessionConversationRef(sessionKey);
   if (!parsed) {
     const directRoute = parseSessionDeliveryRoute(sessionKey);
@@ -66,80 +67,15 @@ export function resolveAnnounceTargetFromKey(sessionKey: string): AnnounceTarget
   };
 }
 
-function buildAgentSessionLines(params: {
-  requesterName?: string;
-  requesterSessionKey?: string;
-  requesterChannel?: string;
-  targetChannel?: string;
-}): string[] {
-  const requesterName = params.requesterName
-    ? truncateWithMarker(
-        sanitizeAgentIdentityLine(params.requesterName),
-        MAX_A2A_REQUESTER_NAME_PROMPT_CHARS,
-        { marker: "...", reserve: 3, trimEnd: true },
-      )
+export function buildSessionsSendRequesterContext(name: string | undefined): string | undefined {
+  const requesterName = name
+    ? truncateWithMarker(sanitizeAgentIdentityLine(name), MAX_A2A_REQUESTER_NAME_PROMPT_CHARS, {
+        marker: "...",
+        reserve: 3,
+        trimEnd: true,
+      })
     : undefined;
-  return [
-    requesterName ? `Agent 1 (requester) name: ${requesterName}.` : undefined,
-    // Session keys are high-cardinality (thread/run ids), so concrete values churn the
-    // system prompt and break provider prompt-cache reuse across A2A turns. Channels are
-    // low-cardinality and inform reply formatting, so they stay concrete.
-    params.requesterSessionKey ? "Agent 1 (requester) session: <REQUESTER_SESSION>." : undefined,
-    params.requesterChannel
-      ? `Agent 1 (requester) channel: ${params.requesterChannel}.`
-      : undefined,
-    "Agent 2 (target) session: <TARGET_SESSION>.",
-    params.targetChannel ? `Agent 2 (target) channel: ${params.targetChannel}.` : undefined,
-  ].filter((line): line is string => Boolean(line));
-}
-
-export function buildAgentToAgentMessageContext(params: {
-  requesterName?: string;
-  requesterSessionKey?: string;
-  requesterChannel?: string;
-}) {
-  return ["Agent-to-agent message context:", ...buildAgentSessionLines(params)].join("\n");
-}
-
-export function buildAgentToAgentReplyContext(params: {
-  requesterName?: string;
-  requesterSessionKey?: string;
-  requesterChannel?: string;
-  targetChannel?: string;
-  currentRole: "requester" | "target";
-  turn: number;
-  maxTurns: number;
-}) {
-  const currentLabel =
-    params.currentRole === "requester" ? "Agent 1 (requester)" : "Agent 2 (target)";
-  return [
-    "Agent-to-agent reply step:",
-    `Current agent: ${currentLabel}.`,
-    `Turn ${params.turn} of ${params.maxTurns}.`,
-    ...buildAgentSessionLines(params),
-    `If you want to stop the ping-pong, reply exactly "${REPLY_SKIP_TOKEN}".`,
-  ].join("\n");
-}
-
-export function buildAgentToAgentAnnounceContext(params: {
-  requesterName?: string;
-  requesterSessionKey?: string;
-  requesterChannel?: string;
-  targetChannel?: string;
-  originalMessage: string;
-  roundOneReply?: string;
-  latestReply?: string;
-}) {
-  return [
-    "Agent-to-agent announce step:",
-    ...buildAgentSessionLines(params),
-    `Original request: ${params.originalMessage}`,
-    params.roundOneReply
-      ? `Round 1 reply: ${params.roundOneReply}`
-      : "Round 1 reply: (not available).",
-    params.latestReply ? `Latest reply: ${params.latestReply}` : "Latest reply: (not available).",
-    `If you want to remain silent, reply exactly "${ANNOUNCE_SKIP_TOKEN}".`,
-    "Any other reply is recorded in the target session. External delivery is attempted only if the target has a delivery route.",
-    "After this reply, the agent-to-agent conversation is over.",
-  ].join("\n");
+  return requesterName
+    ? `Agent-to-agent message context:\nAgent 1 (requester) name: ${requesterName}.`
+    : undefined;
 }
