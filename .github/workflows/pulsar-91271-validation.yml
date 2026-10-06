@@ -1,0 +1,41 @@
+name: Pulsar 91271 saved repair validation
+on:
+  push:
+    branches: [pulsar-validation/91271-20261006]
+permissions:
+  contents: read
+jobs:
+  focused:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 003a844fe17cb474cceb3fa243700ea5f1ca1a24
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.21.0
+      - name: Verify reviewed tree and install pinned dependencies
+        env:
+          CI: 'true'
+        run: |
+          test "$(git rev-parse HEAD)" = 003a844fe17cb474cceb3fa243700ea5f1ca1a24
+          test "$(git rev-parse HEAD^{tree})" = 72508d0b6924535414ceff6f8047a1a1e2008050
+          corepack enable
+          corepack pnpm install --frozen-lockfile
+      - name: Focused requester identity regressions
+        env:
+          CI: 'true'
+        run: |
+          corepack pnpm test src/agents/tools/sessions-send-helpers.test.ts src/agents/openclaw-tools.sessions.test.ts src/gateway/server.sessions-send.test.ts src/gateway/worker-environments/worker-session-tool-executor.send.test.ts
+      - name: Scoped formatting lint and type checks
+        env:
+          CI: 'true'
+        run: |
+          corepack pnpm exec oxfmt --check src/agents/tools/sessions-send-helpers.ts src/agents/tools/sessions-send-tool.ts src/agents/openclaw-tools.sessions.test.ts
+          node scripts/run-oxlint.mjs --tsconfig config/tsconfig/oxlint.core.json src/agents/tools/sessions-send-helpers.ts src/agents/tools/sessions-send-tool.ts
+          corepack pnpm tsgo:core
+          for graph in agents-root agents-tools gateway-root gateway-other gateway-server; do
+            node scripts/run-tsgo.mjs -p "test/tsconfig/tsconfig.core.test.$graph.json" --incremental --tsBuildInfoFile ".artifacts/tsgo-cache/pulsar-91271-$graph.tsbuildinfo"
+          done
