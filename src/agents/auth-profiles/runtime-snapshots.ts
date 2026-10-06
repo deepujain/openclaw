@@ -4,6 +4,7 @@ import path from "node:path";
  * Snapshots are cloned at boundaries so callers cannot mutate shared state.
  */
 import { isDeepStrictEqual } from "node:util";
+import { registerListener } from "../../shared/listeners.js";
 import { cloneAuthProfileStore } from "./clone.js";
 import { observeCachedCanonicalAuthProfileCredentials } from "./credential-observation.js";
 import {
@@ -217,8 +218,7 @@ function authProfileSetChanged(
 export function registerRuntimeAuthProfileStoreMutationListener(
   listener: RuntimeAuthProfileStoreMutationListener,
 ): () => void {
-  runtimeAuthStoreMutationListeners.add(listener);
-  return () => runtimeAuthStoreMutationListeners.delete(listener);
+  return registerListener(runtimeAuthStoreMutationListeners, listener);
 }
 
 /** Reads a cloned runtime auth profile store snapshot for an agent dir. */
@@ -391,14 +391,12 @@ export function listRuntimeAuthProfileStoreSnapshotsForSharedOwner(owner: AuthPr
   );
 }
 
-/** Returns true when a runtime snapshot exists for an agent dir. */
-export function hasRuntimeAuthProfileStoreSnapshot(agentDir?: string): boolean {
-  return runtimeAuthStoreSnapshots.has(resolveRuntimeStoreKey(agentDir));
-}
-
 /** Checks the owned profile keys without copying private credential data out of the owner. */
-export function hasRuntimeAuthProfileStoreSource(agentDir?: string): boolean {
-  const store = runtimeAuthStoreSnapshots.get(resolveRuntimeStoreKey(agentDir))?.store;
+export function hasRuntimeAuthProfileStoreSource(
+  agentDir?: string,
+  env?: NodeJS.ProcessEnv,
+): boolean {
+  const store = runtimeAuthStoreSnapshots.get(resolveRuntimeStoreKey(agentDir, env))?.store;
   return Boolean(store && Object.keys(store.profiles).length > 0);
 }
 
