@@ -11,10 +11,16 @@ import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
 import { executeGitWorktreeOperation } from "../agents/worktrees/git-worktree-operations.runtime.js";
 import * as worktreeGit from "../agents/worktrees/git.js";
 import { ensureStagedInputDirectory, stagedInputDirectory } from "../media/staged-inputs.js";
+import { emitChildProcessSpawnSample } from "../process/spawn-diagnostics.js";
 import { createDeferredCore } from "../shared/deferred.js";
 import { drainGlobalSingletonLifecycleState } from "../shared/global-singleton.js";
 import { isPidAlive } from "../shared/pid-alive.js";
 import { killPidIfAlive } from "../test-utils/process-tree.js";
+import {
+  onDiagnosticEvent,
+  setDiagnosticsEnabledForProcess,
+  type DiagnosticEventPayload,
+} from "./diagnostic-events.js";
 import * as gitExec from "./git-exec.js";
 import { installUnknownDirentFixture } from "./git-worker-dir.test-support.js";
 import { runGitWorkerOperation, type GitWorkerOperationOptions } from "./git-worker.js";
@@ -199,7 +205,7 @@ describe("Git operation host lifecycle", () => {
         },
       },
       {
-        onEffect: (effect) => (effect.type === "worktree.snapshot-provisioned" ? [] : undefined),
+        onEffect: () => undefined,
       },
     );
     expect(await git(repo, "show", `${snapshot.snapshotRef}:${input}`)).toBe("retain task input");
@@ -243,8 +249,7 @@ describe("Git operation host lifecycle", () => {
             },
           },
           {
-            onEffect: (effect) =>
-              effect.type === "worktree.snapshot-provisioned" ? [] : undefined,
+            onEffect: () => undefined,
           },
         ),
       ).rejects.toThrow("nested git repositories cannot be snapshotted losslessly");
@@ -312,6 +317,18 @@ describe("Git operation host lifecycle", () => {
     const peerRoot = path.join(root, "peer");
     await fs.mkdir(peerRoot);
     const peer = await repository(peerRoot);
+    let now = 0;
+    vi.spyOn(performance, "now").mockImplementation(() => now);
+    setDiagnosticsEnabledForProcess(false);
+    emitChildProcessSpawnSample();
+    setDiagnosticsEnabledForProcess(true);
+    const spawns: Extract<DiagnosticEventPayload, { type: "diagnostic.child_process.spawn" }>[] =
+      [];
+    const stop = onDiagnosticEvent((event) => {
+      if (event.type === "diagnostic.child_process.spawn") {
+        spawns.push(event);
+      }
+    });
     const entered = createDeferredCore();
     const release = createDeferredCore();
     const realRun = worktreeGit.runGitBytes;
@@ -358,7 +375,18 @@ describe("Git operation host lifecycle", () => {
     } finally {
       release.resolve();
       await Promise.all(pending);
+      now = 60_000;
+      emitChildProcessSpawnSample();
+      stop();
+      setDiagnosticsEnabledForProcess(false);
+      emitChildProcessSpawnSample();
     }
+    expect(
+      spawns
+        .map(({ operation }) => operation ?? "unknown")
+        .toSorted((left, right) => left.localeCompare(right)),
+    ).toEqual(["checkout.diff", "repository.branches"]);
+    expect(spawns.every(({ family, count }) => family === "git" && count > 0)).toBe(true);
   });
 
   it.each(["cleanup-inspection", "snapshot"] as const)(
@@ -402,8 +430,7 @@ describe("Git operation host lifecycle", () => {
                 input: { kind: "nested-repository", checkoutPath: repo },
               },
           {
-            onEffect: (effect) =>
-              effect.type === "worktree.snapshot-provisioned" ? [] : undefined,
+            onEffect: () => undefined,
           },
         );
       const first = settle(startMaintenance());
@@ -432,9 +459,18 @@ describe("Git operation host lifecycle", () => {
             type: "worktree.directory-size",
             input: { root: peer, excludeGit: true },
           }),
+          runGitWorkerOperation({
+            type: "worktree.eviction-source",
+            input: {
+              sourceRoot: peer,
+              commonDir: path.join(peer, ".git"),
+              requiredPaths: [],
+              records: [{ id: "preparation-source", path: peer, repoRoot: peer }],
+            },
+          }),
         ]);
         pending.push(settle(preparation));
-        const [gitBytes, provisioned, transition, directoryBytes] = await within(
+        const [gitBytes, provisioned, transition, directoryBytes, source] = await within(
           preparation,
           "Worktree preparation waited behind maintenance Git requests",
         );
@@ -446,6 +482,7 @@ describe("Git operation host lifecycle", () => {
           requiresFullCheckout: false,
         });
         expect(directoryBytes).toBe(43);
+        expect(source).toEqual({ worktreeIds: ["preparation-source"], complete: true });
         expect(heldRequests).toBe(1);
       } finally {
         release.resolve();
@@ -694,9 +731,6 @@ describe("Git operation host lifecycle", () => {
             await release.promise;
           }
         }
-        if (effect.type === "worktree.snapshot-provisioned") {
-          return [];
-        }
         return undefined;
       };
       let completed = 0;
@@ -736,11 +770,9 @@ describe("Git operation host lifecycle", () => {
         const result = await within(pending);
         expect(result.rejected).toBe(true);
         if (ending === "worker-error") {
-          expect(
-            result.rejected &&
-              result.error instanceof Error &&
-              result.error.message.includes("provisioned path entered Git snapshot"),
-          ).toBe(true);
+          expect(result.rejected && result.error).toMatchObject({
+            message: "provisioned path is now tracked: README.md",
+          });
         }
         expect(await exists(temporaryDirectory)).toBe(false);
         expect((await fs.readFile(neighbor)).length).toBe(4);
@@ -812,9 +844,6 @@ describe("Git operation host lifecycle", () => {
                 effect.input.purpose === "worktree safety snapshot index"
               ) {
                 temporaryDirectory = effect.input.demands[0]?.path ?? "";
-              }
-              if (effect.type === "worktree.snapshot-provisioned") {
-                return [];
               }
               return undefined;
             },

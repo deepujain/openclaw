@@ -214,15 +214,6 @@ function resolveTerminalMainSessionTranscriptRegistryCheck(
   return { sessionId, registryTimestampMs };
 }
 
-function isTranscriptMutationNewerThanRegistry(params: {
-  transcriptMutationAtMs: number;
-  registryTimestampMs: number;
-}): boolean {
-  const transcriptMutationAtMs = Math.floor(params.transcriptMutationAtMs);
-  const registryTimestampMs = Math.floor(params.registryTimestampMs);
-  return Number.isFinite(transcriptMutationAtMs) && transcriptMutationAtMs > registryTimestampMs;
-}
-
 export function hasTerminalMainSessionTranscriptNewerThanRegistrySync(
   params: TerminalMainSessionTranscriptRegistryParams,
 ): boolean {
@@ -241,17 +232,10 @@ export function hasTerminalMainSessionTranscriptNewerThanRegistrySync(
     if (mutation.updatedAt === null) {
       return false;
     }
-    return isTranscriptMutationNewerThanRegistry({
-      transcriptMutationAtMs: mutation.updatedAt,
-      registryTimestampMs: mutation.observedAt ?? check.registryTimestampMs,
-    });
+    const transcriptMutationAtMs = Math.floor(mutation.updatedAt);
+    const registryTimestampMs = Math.floor(mutation.observedAt ?? check.registryTimestampMs);
+    return Number.isFinite(transcriptMutationAtMs) && transcriptMutationAtMs > registryTimestampMs;
   } catch {
     return false;
   }
-}
-
-export async function hasTerminalMainSessionTranscriptNewerThanRegistry(
-  params: TerminalMainSessionTranscriptRegistryParams,
-): Promise<boolean> {
-  return hasTerminalMainSessionTranscriptNewerThanRegistrySync(params);
 }

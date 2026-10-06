@@ -1,5 +1,4 @@
 import { AsyncLocalStorage } from "node:async_hooks";
-import path from "node:path";
 import {
   sessionChanges,
   type SessionRowChange,
@@ -12,10 +11,12 @@ import { findOpenClawAgentDatabaseIdentity } from "../../state/openclaw-agent-db
 import { invalidateOpenClawAgentWritableProjections } from "../../state/openclaw-agent-db-lifecycle.js";
 import { invalidateOpenClawAgentReadOnlyProjections } from "../../state/openclaw-agent-db-readonly-scope.js";
 import {
+  applyPendingSessionEntryOwnerChanges,
   pendingSessionEntryPublications,
   preparedSharingReads,
   recordCommittedSessionEntryPublication,
   recordCommittedSessionMetadataPublication,
+  recordCommittedSessionOwnerPublication,
   retainedSharingReads,
 } from "./session-accessor.sqlite-entry-cache-publication-state.js";
 import {
@@ -24,6 +25,9 @@ import {
 } from "./session-accessor.sqlite-entry-cache-state.js";
 import {
   createSessionEntryCreationOperation,
+  assertSessionEntryCreationCurrent,
+  assertSessionEntryCreationTarget,
+  type SessionEntryCreationTarget,
   projectSessionSharingEntry,
   readSessionEntryCreationIdentity,
   type SessionEntryCacheDatabase,
@@ -45,6 +49,7 @@ import {
   publishIncognitoSessionEntryChange,
   stageIncognitoSharingPublication,
 } from "./session-accessor.sqlite-incognito-sharing.js";
+import { publishSessionEntryMaintenanceAgeChanges } from "./session-accessor.sqlite-maintenance-age.js";
 import {
   publishRetainedSessionGeneration,
   updateSessionSharingField,
@@ -71,11 +76,23 @@ const preparedSharingChanges = resolveGlobalSingleton(
 
 /** Private owner metadata follows the original event object without changing its public fields. */
 export function isPreparedSessionSharingChange(change: SessionRowChange): boolean {
-  return preparedSharingChanges.changes.has(change);
+  const record = preparedSharingChanges.changes.get(change);
+  return record !== undefined && record.kind !== "source";
 }
 
 export function readPreparedSessionSharingChange(change: object) {
-  return preparedSharingChanges.changes.get(change)?.sharingChange;
+  const record = preparedSharingChanges.changes.get(change);
+  return record && "sharingChange" in record ? record.sharingChange : undefined;
+}
+
+/** Physical publication facts are captured by the writer, never resolved by observers. */
+export function readPreparedSessionEntryPublicationSource(change: object) {
+  const record = preparedSharingChanges.changes.get(change);
+  const source = record?.kind === "metadata" ? record.prepared.source : undefined;
+  return {
+    identity: record?.databaseIdentity ?? source?.identity,
+    canonicalPath: record?.canonicalPath ?? source?.canonicalPath,
+  };
 }
 
 /** Commit metadata follows the same original row or identity event through preparation. */
@@ -101,6 +118,21 @@ export function bindPreparedSessionEntryPublication(
   preparedSharingChanges.changes.set(change, record);
 }
 
+export function bindSessionEntryPublicationSource<T extends SessionRowChange>(
+  change: T,
+  database: SessionEntryCacheDatabase,
+): T {
+  const source = findOpenClawAgentDatabaseIdentity(database);
+  if (source) {
+    bindPreparedSessionEntryPublication(change, {
+      ...(preparedSharingChanges.changes.get(change) ?? { kind: "source" }),
+      databaseIdentity: source.identity,
+      canonicalPath: source.canonicalPath,
+    });
+  }
+  return change;
+}
+
 export function emitPreparedSessionSharingChange(
   database: SessionEntryCacheDatabase & { path: string },
   sessionKey: string,
@@ -115,7 +147,17 @@ export function emitPreparedSessionSharingChange(
     ...(facts ? { facts, scope: "session-entry" as const } : { factsInvalidated: true }),
   };
   bindPreparedSessionEntryPublication(change, record);
+  bindSessionEntryPublicationSource(change, database);
   sessionChanges.emit(change, database.db);
+}
+
+function invalidateSessionEntryCaches(databaseIdentity: string): void {
+  invalidateOpenClawAgentWritableProjections(databaseIdentity, (database) =>
+    sessionEntryCaches.delete(database),
+  );
+  invalidateOpenClawAgentReadOnlyProjections(databaseIdentity, (database) =>
+    sessionEntryCaches.delete(database),
+  );
 }
 
 /** A committed metadata-only worker write invalidates caches without changing retained identity. */
@@ -125,12 +167,7 @@ export function publishSessionEntryWorkerMetadataInvalidation(params: {
   databaseIdentity: string;
   sessionKey: string;
 }): void {
-  invalidateOpenClawAgentWritableProjections(params.databaseIdentity, (database) =>
-    sessionEntryCaches.delete(database),
-  );
-  invalidateOpenClawAgentReadOnlyProjections(params.databaseIdentity, (database) =>
-    sessionEntryCaches.delete(database),
-  );
+  invalidateSessionEntryCaches(params.databaseIdentity);
   const change: SessionRowChange = {
     agentId: params.agentId,
     storePath: params.storePath,
@@ -138,28 +175,19 @@ export function publishSessionEntryWorkerMetadataInvalidation(params: {
     scope: "session-entry",
     facts: { kind: "unchanged" },
   };
-  bindPreparedSessionEntryPublication(change, { kind: "marker", sharingChange: "unchanged" });
+  bindPreparedSessionEntryPublication(change, {
+    kind: "marker",
+    sharingChange: "unchanged",
+    databaseIdentity: params.databaseIdentity,
+  });
   sessionChanges.emit(change);
-}
-
-function assertCreationCurrent(
-  creation: CreationRecord | undefined,
-): asserts creation is CreationRecord {
-  if (!creation?.active) {
-    throw new Error("Session creation publication owner is no longer current");
-  }
-  const source = creation.source;
-  if (source.kind === "file") {
-    source.assertCurrent();
-  } else if (!source.database.db.isOpen || source.database.agentId !== source.agentId) {
-    throw new Error("Session creation publication owner is no longer current");
-  }
 }
 
 function creationMatchesDatabase(creation: CreationRecord, database: SessionEntryCacheDatabase) {
   return creation.source.kind === "native"
     ? creation.source.database.db === database.db
-    : creation.source.agentId === database.agentId &&
+    : creation.source.kind === "file" &&
+        creation.source.agentId === database.agentId &&
         findOpenClawAgentDatabaseIdentity(database)?.identity === creation.source.databaseIdentity;
 }
 
@@ -171,7 +199,12 @@ export async function withSessionEntryCreationPublication<T>(
     bind?: (operation: SessionEntryCreationOperation) => void;
   } & (
     | { database: SessionEntryCacheDatabase & { path: string }; file?: never }
-    | { database?: never; file: Omit<Extract<CreationDatabase, { kind: "file" }>, "kind"> }
+    | {
+        database?: never;
+        file: Omit<Exclude<CreationDatabase, { kind: "native" }>, "kind"> & {
+          kind?: "file" | "actor";
+        };
+      }
   ),
   run: (operation: SessionEntryCreationOperation) => Promise<T>,
 ): Promise<T> {
@@ -200,25 +233,15 @@ export function runWithSessionEntryCreationPublication<T>(
   run: () => Promise<T>,
 ): Promise<T> {
   const creation = preparedSharingChanges.operations.get(operation);
-  assertCreationCurrent(creation);
+  assertSessionEntryCreationCurrent(creation);
   return preparedSharingChanges.current.run(creation, run);
 }
 
 export function assertSessionEntryCreationPublication(
   operation: SessionEntryCreationOperation,
-  target: { agentId: string; sessionKey: string; paths: ReadonlySet<string> },
+  target: SessionEntryCreationTarget,
 ): void {
-  const creation = preparedSharingChanges.operations.get(operation);
-  assertCreationCurrent(creation);
-  const sourcePath =
-    creation.source.kind === "native" ? creation.source.database.path : creation.source.path;
-  if (
-    creation.agentId !== target.agentId ||
-    creation.sessionKey !== target.sessionKey ||
-    !target.paths.has(path.resolve(sourcePath))
-  ) {
-    throw new Error("Session creation publication owner is no longer current");
-  }
+  assertSessionEntryCreationTarget(preparedSharingChanges.operations.get(operation), target);
 }
 
 export function readSessionEntryCreationTransition(
@@ -232,7 +255,7 @@ export function readSessionEntryCreationTransition(
     return undefined;
   }
   try {
-    assertCreationCurrent(creation);
+    assertSessionEntryCreationCurrent(creation);
   } catch {
     return undefined;
   }
@@ -322,15 +345,7 @@ function publishSessionSharingFieldChange(
     database,
     () => {
       if (change.kind === "owner") {
-        const identity = findOpenClawAgentDatabaseIdentity(database)?.identity;
-        if (typeof identity === "string") {
-          for (const pending of pendingSessionEntryPublications.get(
-            `file:${identity}\0${sessionKey}`,
-          ) ?? []) {
-            // A field update supersedes its value, not the pending entry's generation fence.
-            pending.ownerChanges.set(sessionKey, structuredClone(change));
-          }
-        }
+        recordCommittedSessionOwnerPublication(database, sessionKey, change);
       }
       for (const read of retainedSharingReads(database, sessionKey) ?? []) {
         if (read.acquisition) {
@@ -457,16 +472,15 @@ export function publishSessionEntryWorkerInvalidations(
       sessionKey,
       factsInvalidated: true,
     };
-    bindPreparedSessionEntryPublication(change, { kind: "marker", sharingChange: "changed" });
+    bindPreparedSessionEntryPublication(change, {
+      kind: "marker",
+      sharingChange: "changed",
+      databaseIdentity: params.databaseIdentity,
+    });
     changes.push(change);
   }
   if (keys.length > 0) {
-    invalidateOpenClawAgentWritableProjections(params.databaseIdentity, (database) =>
-      sessionEntryCaches.delete(database),
-    );
-    invalidateOpenClawAgentReadOnlyProjections(params.databaseIdentity, (database) =>
-      sessionEntryCaches.delete(database),
-    );
+    invalidateSessionEntryCaches(params.databaseIdentity);
   }
   sessionChanges.emitBatch(changes, undefined, beforePublicNotifications);
 }
@@ -521,26 +535,10 @@ export function retainSessionEntryWorkerPublication(params: {
       if (!pending) {
         return undefined;
       }
-      let replacement = receipt?.kind === "session-entry-replacements" ? receipt : undefined;
-      if (replacement && owner.ownerChanges.size > 0) {
-        const current = new Map(replacement.current);
-        for (const [sessionKey, change] of owner.ownerChanges) {
-          const entry = current.get(sessionKey);
-          if (
-            !entry ||
-            entry.sessionId !== change.sessionId ||
-            (entry.lifecycleRevision ?? null) !== change.lifecycleRevision
-          ) {
-            continue;
-          }
-          const { owner: _previousOwner, ...metadata } = entry;
-          current.set(
-            sessionKey,
-            freezeJsonSnapshot({ ...metadata, ...(change.owner ? { owner: change.owner } : {}) }),
-          );
-        }
-        replacement = { ...replacement, current };
-      }
+      const replacement = applyPendingSessionEntryOwnerChanges(
+        receipt?.kind === "session-entry-replacements" ? receipt : undefined,
+        owner.ownerChanges,
+      );
       const initialization =
         receipt?.kind === "session-transcript-initialized" ? receipt : undefined;
       const current = (sessionKey: string) => !owner.superseded.has(sessionKey);
@@ -576,12 +574,7 @@ export function retainSessionEntryWorkerPublication(params: {
         ]),
       ];
       if (changed.length) {
-        invalidateOpenClawAgentWritableProjections(params.databaseIdentity, (database) =>
-          sessionEntryCaches.delete(database),
-        );
-        invalidateOpenClawAgentReadOnlyProjections(params.databaseIdentity, (database) =>
-          sessionEntryCaches.delete(database),
-        );
+        invalidateSessionEntryCaches(params.databaseIdentity);
       }
       const changes: SessionRowChange[] = [];
       const sharingUnchanged = new Set(replacement?.sharingUnchangedKeys);
@@ -656,6 +649,7 @@ export function retainSessionEntryWorkerPublication(params: {
               ? {
                   kind: "placeholder",
                   sharingChange: "changed",
+                  databaseIdentity: params.databaseIdentity,
                   receipt: {
                     creation,
                     databaseIdentity: params.databaseIdentity,
@@ -667,13 +661,26 @@ export function retainSessionEntryWorkerPublication(params: {
               : prepared &&
                   (replacement?.previous.has(sessionKey) || replacement?.current.has(sessionKey))
                 ? { kind: "metadata", sharingChange, prepared }
-                : { kind: "marker", sharingChange },
+                : { kind: "marker", sharingChange, databaseIdentity: params.databaseIdentity },
           );
+        } else {
+          bindPreparedSessionEntryPublication(change, {
+            kind: "source",
+            databaseIdentity: params.databaseIdentity,
+          });
         }
         changes.push(change);
       }
       owner.settled = true;
       try {
+        if (replacement) {
+          publishSessionEntryMaintenanceAgeChanges(
+            params.databaseIdentity,
+            replacement.ageChanges.filter(
+              ({ sessionKey }) => current(sessionKey) && !owner.metadataSuperseded.has(sessionKey),
+            ),
+          );
+        }
         sessionChanges.emitBatch(changes);
         return replacement
           ? {
