@@ -1,6 +1,5 @@
-/** Systemd service-definition authority and atomic, cross-process publication. */
 import { randomUUID } from "node:crypto";
-import { constants, promises as fs, type Stats } from "node:fs";
+import { constants, promises as fs, type BigIntStats } from "node:fs";
 import path from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { toErrorObject } from "@openclaw/normalization-core/error-coercion";
@@ -10,6 +9,7 @@ import { sha256Hex } from "../infra/crypto-digest.js";
 import { hasErrnoCode } from "../infra/errno.js";
 import { withFileLock } from "../infra/file-lock.js";
 import { canonicalPathFromExistingAncestor, findExistingAncestor } from "../infra/fs-safe.js";
+import { withServiceInspectionBudget } from "./service-inspection-budget.js";
 import {
   readServiceFileState,
   type GatewayServiceDefinitionTransactionHooks,
@@ -17,6 +17,7 @@ import {
 import {
   assertServiceDefinitionWritable,
   type GatewayServiceEnv,
+  type GatewayServiceReadOptions,
   type ServiceDefinitionMutationArtifact,
   type ServiceDefinitionMutationCapability,
   type SystemdServiceReadBinding,
@@ -46,11 +47,15 @@ type SystemdDefinitionMutation = {
   restoreAll: () => Promise<boolean>;
   remove: (file: string) => Promise<void>;
 };
-const identity = (stat: Stats, contents?: Buffer) =>
+const identity = (stat: BigIntStats, contents?: Buffer) =>
   [stat.dev, stat.ino, stat.uid, stat.gid, stat.mode, contents && sha256Hex(contents)].join(":");
 
-function resolveMutationTargets(env: GatewayServiceEnv, environment: GatewayServiceEnv) {
-  const unit = resolveSystemdUnitPath(env);
+function resolveMutationTargets(
+  env: GatewayServiceEnv,
+  environment: GatewayServiceEnv,
+  target?: SystemdServiceReadTarget,
+) {
+  const unit = target?.unitPath ?? resolveSystemdUnitPath(env);
   const generated = resolveSystemdEnvironmentFilePath({
     stateDir: resolveStateDir({ ...env, ...environment }),
     environment,
@@ -60,7 +65,7 @@ function resolveMutationTargets(env: GatewayServiceEnv, environment: GatewayServ
 
 async function readStableFile(
   file: string,
-  stat: Stats,
+  stat: BigIntStats,
   requireReplacement: boolean,
 ): Promise<{ contents: Buffer } | { sealed: true }> {
   const handle = await fs.open(
@@ -68,7 +73,7 @@ async function readStableFile(
     constants.O_RDONLY | constants.O_NOFOLLOW | (constants.O_NONBLOCK ?? 0),
   );
   try {
-    const opened = await handle.stat();
+    const opened = await handle.stat({ bigint: true });
     if (!opened.isFile() || identity(opened) !== identity(stat)) {
       throw new Error("changed artifact");
     }
@@ -100,11 +105,9 @@ async function readStableFile(
 async function inspect(
   env: GatewayServiceEnv,
   environment: GatewayServiceEnv,
-  timeoutMs?: number,
-  requireLoaded = false,
-  systemdReadBinding?: SystemdServiceReadBinding,
+  options?: GatewayServiceReadOptions,
 ) {
-  const { unit, generated } = resolveMutationTargets(env, environment);
+  const { unit, generated } = resolveMutationTargets(env, environment, options?.systemdReadTarget);
   const snapshots = new Map<string, Snapshot>();
   const fingerprint = new Map<string, string>();
   let shared = new Set<string>();
@@ -123,10 +126,8 @@ async function inspect(
   let artifact: ServiceDefinitionMutationArtifact | undefined;
   try {
     const command = await readSystemdServiceExecStart(env, {
+      ...options,
       requireEffective: true,
-      timeoutMs,
-      ...(systemdReadBinding ? { systemdReadBinding } : {}),
-      ...(requireLoaded ? { requireLoaded: true } : {}),
     });
     sourcePath = command?.sourcePath;
     const targets = new Set([unit, generated, `${unit}.bak`]);
@@ -159,7 +160,7 @@ async function inspect(
       const inspected =
         directory && !required ? ((await findExistingAncestor(file)) ?? file) : file;
       artifactPath = inspected;
-      const stat = await fs.lstat(inspected).catch((error: unknown) => {
+      const stat = await fs.lstat(inspected, { bigint: true }).catch((error: unknown) => {
         if (required || !hasErrnoCode(error, "ENOENT")) {
           throw error;
         }
@@ -172,14 +173,15 @@ async function inspect(
       if (!directory && stat.isSymbolicLink()) {
         return result({ kind: "unknown", reason: "symlink", artifact });
       }
-      const actual = directory && stat.isSymbolicLink() ? await fs.stat(inspected) : stat;
-      if (!shared.has(file) && actual.uid !== process.geteuid?.()) {
+      const actual =
+        directory && stat.isSymbolicLink() ? await fs.stat(inspected, { bigint: true }) : stat;
+      if (!shared.has(file) && actual.uid !== BigInt(process.geteuid?.() ?? -1)) {
         return result({ kind: "sealed", reason: "foreign-owner", artifact });
       }
       if (directory && !actual.isDirectory()) {
         return result({ kind: "unknown", reason: "invalid-artifact", artifact });
       }
-      if (actual.mode & 0o022) {
+      if (actual.mode & 0o022n) {
         return result({ kind: "unknown", reason: "unsafe-permissions", artifact });
       }
       if (directory) {
@@ -194,7 +196,7 @@ async function inspect(
       const { contents } = snapshot;
       fingerprint.set(file, identity(stat, contents));
       if (targets.has(file)) {
-        snapshots.set(file, { contents, mode: stat.mode & 0o777 });
+        snapshots.set(file, { contents, mode: Number(stat.mode & 0o777n) });
       }
     }
     return result({ kind: "writable" });
@@ -216,74 +218,71 @@ export async function readSystemdDefinitionMutationCapability(
     systemdReadTarget?: SystemdServiceReadTarget;
   },
 ): Promise<ServiceDefinitionMutationCapability> {
-  if (options?.systemdReadTarget?.scope === "system") {
-    return { kind: "sealed", reason: "system-owned" };
-  }
-  const selected = path.basename(resolveSystemdUnitPath(env));
-  const names =
-    selected === "openclaw-gateway.service" ? [selected, "openclaw.service"] : [selected];
-  const budget =
-    options?.timeoutMs && Number.isFinite(options.timeoutMs) && options.timeoutMs > 0
-      ? options.timeoutMs
-      : options?.requireLoaded
-        ? 5000
-        : undefined;
-  const deadlineAt = budget === undefined ? undefined : performance.now() + budget;
-  const remaining = () => {
-    if (deadlineAt === undefined) {
-      return undefined;
-    }
-    const value = deadlineAt - performance.now();
-    if (value <= 0) {
-      throw new Error("Definition inspection deadline expired.");
-    }
-    return value;
-  };
-  for (const name of names) {
-    try {
-      await assertNoSystemSystemdOwnership(
-        name,
-        remaining(),
-        ...(options?.requireLoaded ? [{ requireLoaded: true }] : []),
-      );
-    } catch (error) {
-      const owned =
-        isSystemSystemdOwnershipError(error) && error.ownership.status !== "unverifiable";
-      if (owned) {
+  return await withServiceInspectionBudget<Promise<ServiceDefinitionMutationCapability>>(
+    async (inspectionBudget) => {
+      if (options?.systemdReadTarget?.scope === "system") {
         return { kind: "sealed", reason: "system-owned" };
       }
-      const unverified = { kind: "unknown", reason: "system-ownership-unverified" } as const;
-      // A loaded user unit whose artifacts this account owns is the manager in
-      // charge; an unreachable system manager cannot make it a competing owner.
-      if (!options?.requireLoaded || !isSystemSystemdOwnershipError(error)) {
-        return unverified;
+      const selected =
+        options?.systemdReadTarget?.unitName ?? path.basename(resolveSystemdUnitPath(env));
+      const { environment = env, ...readOptions } = options ?? {};
+      const names =
+        selected === "openclaw-gateway.service" ? [selected, "openclaw.service"] : [selected];
+      const budget =
+        options?.timeoutMs && Number.isFinite(options.timeoutMs) && options.timeoutMs > 0
+          ? options.timeoutMs
+          : options?.requireLoaded
+            ? 5000
+            : undefined;
+      const deadlineAt = budget === undefined ? undefined : inspectionBudget.now() + budget;
+      const remaining = () => {
+        if (deadlineAt === undefined) {
+          return undefined;
+        }
+        const value = deadlineAt - inspectionBudget.now();
+        if (value <= 0) {
+          throw new Error("Definition inspection deadline expired.");
+        }
+        return value;
+      };
+      for (const name of names) {
+        try {
+          await assertNoSystemSystemdOwnership(
+            name,
+            remaining(),
+            ...(options?.requireLoaded ? [{ requireLoaded: true }] : []),
+          );
+        } catch (error) {
+          const owned =
+            isSystemSystemdOwnershipError(error) && error.ownership.status !== "unverifiable";
+          if (owned) {
+            return { kind: "sealed", reason: "system-owned" };
+          }
+          const unverified = { kind: "unknown", reason: "system-ownership-unverified" } as const;
+          // A loaded user unit whose artifacts this account owns is the manager in
+          // charge; an unreachable system manager cannot make it a competing owner.
+          if (!options?.requireLoaded || !isSystemSystemdOwnershipError(error)) {
+            return unverified;
+          }
+          const loaded = await inspect(env, environment, {
+            ...readOptions,
+            timeoutMs: remaining(),
+            requireLoaded: true,
+          }).then(
+            (inspection) => inspection.capability,
+            () => undefined,
+          );
+          return loaded?.kind === "writable" ? loaded : unverified;
+        }
       }
-      const loaded = await inspect(
-        env,
-        options.environment ?? env,
-        remaining(),
-        true,
-        options.systemdReadBinding,
-      ).then(
-        (inspection) => inspection.capability,
-        () => undefined,
-      );
-      return loaded?.kind === "writable" ? loaded : unverified;
-    }
-  }
-  try {
-    return (
-      await inspect(
-        env,
-        options?.environment ?? env,
-        remaining(),
-        options?.requireLoaded,
-        options?.systemdReadBinding,
-      )
-    ).capability;
-  } catch {
-    return { kind: "unknown", reason: "inspection-failed" };
-  }
+      try {
+        return (await inspect(env, environment, { ...readOptions, timeoutMs: remaining() }))
+          .capability;
+      } catch {
+        return { kind: "unknown", reason: "inspection-failed" };
+      }
+    },
+  );
 }
 
 export async function withSystemdDefinitionMutation<T>(
@@ -305,7 +304,7 @@ export async function withSystemdDefinitionMutation<T>(
     Promise.all([unit, generated].map(canonicalPathFromExistingAncestor));
   const preparation = await withGatewayServiceInstallationRecovery(
     async () => {
-      const initial = await inspect(env, environment, remainingTimeoutMs());
+      const initial = await inspect(env, environment, { timeoutMs: remainingTimeoutMs() });
       assertServiceDefinitionWritable(initial.capability);
       // Group-writable umasks must not create directories that inspect() would reject.
       assertGatewayServiceUpdateCurrent();
@@ -323,7 +322,7 @@ export async function withSystemdDefinitionMutation<T>(
     .toSorted();
   const execute = async (): Promise<T> => {
     const refresh = async (unchanged = false, firstUnitPublication = false) => {
-      const current = await inspect(env, environment, remainingTimeoutMs());
+      const current = await inspect(env, environment, { timeoutMs: remainingTimeoutMs() });
       assertServiceDefinitionWritable(current.capability);
       const expected = new Map(initial.fingerprint);
       // LoadUnit can reveal shared defaults only after the first base publication.
@@ -409,7 +408,7 @@ export async function withSystemdDefinitionMutation<T>(
         } finally {
           await temporaryHandle.close();
         }
-        const written = await fs.lstat(temporary);
+        const written = await fs.lstat(temporary, { bigint: true });
         if (file === unit || file === generated) {
           await options?.definitionTransaction?.filePrepared(file, temporary);
         }
@@ -430,8 +429,8 @@ export async function withSystemdDefinitionMutation<T>(
           const after = await readServiceFileState(file);
           if (
             !after ||
-            after.dev !== written.dev ||
-            after.ino !== written.ino ||
+            after.dev !== written.dev.toString() ||
+            after.ino !== written.ino.toString() ||
             after.sha256 !== sha256Hex(Buffer.from(contents)) ||
             after.mode !== mode
           ) {
@@ -476,7 +475,7 @@ export async function withSystemdDefinitionMutation<T>(
       if (published === undefined) {
         return false;
       }
-      const current = await inspect(env, environment, remainingTimeoutMs());
+      const current = await inspect(env, environment, { timeoutMs: remainingTimeoutMs() });
       // A refreshed global snapshot never grants ownership of another artifact's edit.
       if (current.capability.kind !== "writable" || current.fingerprint.get(file) !== published) {
         return false;

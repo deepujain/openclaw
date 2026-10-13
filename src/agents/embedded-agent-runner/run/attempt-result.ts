@@ -1,11 +1,11 @@
-/**
- * Projects stream state into the stable embedded-attempt result contract.
- */
+import { isSilentReplyText, SILENT_REPLY_TOKEN } from "../../../auto-reply/tokens.js";
 import { freezeDiagnosticTraceContext } from "../../../infra/diagnostic-trace-context.js";
 import { isTransientNetworkError } from "../../../infra/retryable-network-errors.js";
 import { projectAgentRunAttemptTerminal } from "../../agent-run-terminal-outcome.js";
 import { isCloudCodeAssistFormatError } from "../../embedded-agent-helpers.js";
+import type { CompletedAssistantAnswer } from "../../embedded-agent-subscribe.handlers.types.js";
 import type { subscribeEmbeddedAgentSession } from "../../embedded-agent-subscribe.js";
+import { extractEmbeddedAssistantText } from "../../embedded-agent-utils.js";
 import {
   INCOMPLETE_ASSISTANT_STREAM_RE,
   TERMINATED_TRANSPORT_MESSAGE_RE,
@@ -19,7 +19,6 @@ import { buildEmbeddedAgentHookContext } from "./agent-hook-context.js";
 import type { EmbeddedAttemptExecutionPhaseInput } from "./attempt-execution-types.js";
 import { finalizeEmbeddedAttempt } from "./attempt-finalize.js";
 import type { EmbeddedAttemptPromptState } from "./attempt-prompt-phase.js";
-import { shouldRunLlmOutputHooksForAttempt } from "./attempt-run-decisions.js";
 import type { PreparedStreamRuntime } from "./attempt-stream-runtime.types.js";
 import type { settleEmbeddedAttemptStream } from "./attempt-stream-settle.js";
 import {
@@ -29,7 +28,8 @@ import {
 import { hasComposedVisibleAnswerAfterSettledTools } from "./incomplete-turn-classification.js";
 import { shouldTreatEmptyAssistantReplyAsSilent } from "./incomplete-turn-recovery.js";
 import { resolveSilentToolResultReplyPayload } from "./incomplete-turn-resolution.js";
-import type { EmbeddedAttemptClientToolCallSlot, EmbeddedRunAttemptResult } from "./types.js";
+import { readSubscriptionCompletionEvidence } from "./subscription-completion-evidence.js";
+import type { EmbeddedRunAttemptResult } from "./types.js";
 
 type EmbeddedAttemptSubscription = ReturnType<typeof subscribeEmbeddedAgentSession>;
 
@@ -65,6 +65,7 @@ export function createAttemptCarryover() {
 
 export type EmbeddedRunAttemptWithReceiptEvidence = EmbeddedRunAttemptResult & {
   answerSegments?: EmbeddedAttemptSubscription["answerSegments"];
+  keptAnswer?: CompletedAssistantAnswer;
   successfulNestedToolNames?: string[];
 };
 
@@ -132,63 +133,6 @@ function isTransientSettledTurnFailure(failure: unknown): boolean {
   );
 }
 
-function normalizeEmbeddedAttemptToolMetas(
-  entries: EmbeddedAttemptSubscription["toolMetas"],
-): EmbeddedRunAttemptResult["toolMetas"] {
-  return entries
-    .filter(
-      (entry): entry is EmbeddedAttemptSubscription["toolMetas"][number] & { toolName: string } =>
-        typeof entry.toolName === "string" && entry.toolName.trim().length > 0,
-    )
-    .map((entry) => {
-      const normalized: EmbeddedRunAttemptResult["toolMetas"][number] = {
-        toolName: entry.toolName,
-        meta: entry.meta,
-        replaySafe: entry.replaySafe === true,
-      };
-      if (entry.toolCallId) {
-        normalized.toolCallId = entry.toolCallId;
-      }
-      if (typeof entry.isError === "boolean") {
-        normalized.isError = entry.isError;
-      }
-      if (entry.terminate === true) {
-        normalized.terminate = true;
-      }
-      if (entry.asyncStarted === true) {
-        normalized.asyncStarted = true;
-      }
-      if (entry.asyncTaskRunId) {
-        normalized.asyncTaskRunId = entry.asyncTaskRunId;
-      }
-      if (entry.asyncTaskId) {
-        normalized.asyncTaskId = entry.asyncTaskId;
-      }
-      if (entry.codeModeSuspended === true) {
-        normalized.codeModeSuspended = true;
-      }
-      return normalized;
-    });
-}
-
-function collectCompletedClientToolCalls(
-  slots: readonly EmbeddedAttemptClientToolCallSlot[],
-): NonNullable<EmbeddedRunAttemptResult["clientToolCalls"]> {
-  return slots.flatMap((slot) =>
-    slot.completed && slot.params ? [{ name: slot.name, params: slot.params }] : [],
-  );
-}
-
-function hasVisiblePendingToolMediaReply(
-  reply: { mediaUrls?: string[]; audioAsVoice?: boolean } | null | undefined,
-): boolean {
-  return Boolean(
-    reply &&
-    ((reply.mediaUrls ?? []).some((url) => url.trim().length > 0) || reply.audioAsVoice === true),
-  );
-}
-
-/** Runs output hooks, classifies terminal effects, and returns the finalized attempt result. */
 export function completeEmbeddedAttemptResult(
   input: EmbeddedAttemptExecutionPhaseInput & { preparedStreamRuntime: PreparedStreamRuntime },
   settled: Awaited<ReturnType<typeof settleEmbeddedAttemptStream>>,
@@ -230,42 +174,17 @@ export function completeEmbeddedAttemptResult(
     contextBudgetStatus: prompt.contextBudgetStatus,
     yieldDetected: input.lifecycle.readYieldState().yieldDetected,
     yieldAcknowledgment: input.lifecycle.readYieldState().yieldAcknowledgment,
+    yieldMessageWaitRegistered: input.lifecycle.readYieldState().yieldMessageWaitRegistered,
     didDeliverSourceReplyViaMessageTool: hasDeliveredSourceReply(),
   };
   const terminal = projectAgentRunAttemptTerminal(state.terminal);
-  const {
-    assistantTexts,
-    didSendDeterministicApprovalPrompt,
-    didSendViaMessagingTool,
-    getAcceptedSessionSpawns,
-    getAssistantTurnCount,
-    getCompactionCount,
-    getHeartbeatToolResponse,
-    getItemLifecycle,
-    getLastAssistantTextMessageIndex,
-    getLastCompactionTokensAfter,
-    getLastToolError,
-    getLatestMcpAppChannelView,
-    getLatestMcpConnectAction,
-    getMessagingToolSentMediaUrls,
-    getMessagingToolSentTargets,
-    getMessagingToolSentTexts,
-    getMessagingToolSourceReplyPayloads,
-    getPendingToolMediaReply,
-    getToolAutoDeliveryMediaUrls,
-    getReplayState,
-    getSuccessfulCronAdds,
-    getVisibleBlockReplyCount,
-    hasToolMediaBlockReply,
-    setTerminalLifecycleMeta,
-    toolMetas,
-  } = subscription;
-  const toolMetasNormalized = normalizeEmbeddedAttemptToolMetas(toolMetas);
+  const { assistantTexts, setTerminalLifecycleMeta } = subscription;
+  const evidence = readSubscriptionCompletionEvidence(subscription);
 
   if (
     attempt.operation !== "settled-tool-finalization" &&
     hookRunner?.hasHooks("llm_output") &&
-    shouldRunLlmOutputHooksForAttempt({ promptErrorSource: terminal.promptErrorSource })
+    terminal.promptErrorSource !== "hook:before_agent_run"
   ) {
     const contextWindow = {
       ...(attempt.contextWindowInfo?.tokens
@@ -310,36 +229,43 @@ export function completeEmbeddedAttemptResult(
       });
   }
 
-  const acceptedSessionSpawns = getAcceptedSessionSpawns();
-  const messagingToolSentMediaUrls = getMessagingToolSentMediaUrls();
+  const { messagingToolSentMediaUrls } = evidence;
   const sentMediaUrls = new Set(messagingToolSentMediaUrls.map((url) => url.trim()));
-  const toolAutoDeliveryMediaUrls = getToolAutoDeliveryMediaUrls().filter(
-    (url) => !sentMediaUrls.has(url.trim()),
-  );
-  const replayEvidence = {
-    toolMetas: toolMetasNormalized,
-    didSendViaMessagingTool: didSendViaMessagingTool(),
-    messagingToolSentTexts: getMessagingToolSentTexts(),
-    messagingToolSentMediaUrls,
-    acceptedSessionSpawns,
-    successfulCronAdds: getSuccessfulCronAdds(),
-  };
+  const toolAutoDeliveryMediaUrls = subscription
+    .getToolAutoDeliveryMediaUrls()
+    .filter((url) => !sentMediaUrls.has(url.trim()));
   // Structured start arguments already updated replayState for mutations and async work.
   // Reclassifying by tool name would incorrectly mark read-only cron actions as unsafe.
-  const observedReplayMetadata = buildAttemptReplayMetadata({ ...replayEvidence, toolMetas: [] });
-  const pendingToolMediaReply = getPendingToolMediaReply();
+  const observedReplayMetadata = buildAttemptReplayMetadata({ ...evidence, toolMetas: [] });
   const replayMetadata = replayMetadataFromState(
-    observeReplayMetadata(getReplayState(), observedReplayMetadata),
+    observeReplayMetadata(subscription.getReplayState(), observedReplayMetadata),
   );
-  const currentAttemptReplayMetadata = buildAttemptReplayMetadata(replayEvidence);
-  const completedClientToolCalls = collectCompletedClientToolCalls(clientToolCallSlots);
+  const currentAttemptReplayMetadata = buildAttemptReplayMetadata(evidence);
+  const completedClientToolCalls = clientToolCallSlots.flatMap((slot) =>
+    slot.completed && slot.params ? [{ name: slot.name, params: slot.params }] : [],
+  );
   const clientToolCalls =
     completedClientToolCalls.length > 0 ? completedClientToolCalls : undefined;
-  const didSendDeterministicApprovalPromptNow = didSendDeterministicApprovalPrompt();
-  const lastToolError = getLastToolError();
-  const heartbeatToolResponse = getHeartbeatToolResponse();
-  const messagingToolSourceReplyPayloads = getMessagingToolSourceReplyPayloads();
-  const hasToolMediaBlockReplyNow = hasToolMediaBlockReply();
+  // The runtime has settled. Progress sent as the last tool batch was written
+  // after every other tool result; an empty stop after it is the reply.
+  const terminalAssistant = state.currentAttemptAssistant;
+  const closingText = terminalAssistant
+    ? extractEmbeddedAssistantText(terminalAssistant).trim()
+    : "";
+  const progressIsReply =
+    subscription.endsWithSourceProgress() &&
+    state.terminal.kind === "ok" &&
+    terminalAssistant?.stopReason === "stop" &&
+    (!closingText || isSilentReplyText(closingText, SILENT_REPLY_TOKEN));
+  const completeLastProgress = <T extends { sourceReplyFinal?: boolean }>(sends: T[]): T[] => {
+    const index = sends.findLastIndex((send) => send.sourceReplyFinal === false);
+    return progressIsReply && index >= 0
+      ? sends.with(index, Object.assign({}, sends[index], { sourceReplyFinal: true }))
+      : sends;
+  };
+  const messagingToolSourceReplyPayloads = completeLastProgress(
+    evidence.messagingToolSourceReplyPayloads,
+  );
   const settledTurnFinalizationContext = resolveSettledTurnFinalizationContext({
     assistant: state.currentAttemptCompletedAssistant ?? state.currentAttemptAssistant,
     assistantTexts,
@@ -348,42 +274,28 @@ export function completeEmbeddedAttemptResult(
   });
   const result: EmbeddedRunAttemptWithReceiptEvidence = {
     ...state,
+    ...evidence,
+    sandboxRuntime: input.setup.sandboxRuntime,
     ...(settledTurnFinalizationContext ? { settledTurnFinalizationContext } : {}),
     replayMetadata,
     currentAttemptReplayMetadata,
-    itemLifecycle: getItemLifecycle(),
-    assistantTurns: getAssistantTurnCount(),
+    assistantTurns: subscription.getAssistantTurnCount(),
     setTerminalLifecycleMeta,
     bootstrapPromptWarningSignaturesSeen: bootstrapPromptWarning.warningSignaturesSeen,
     bootstrapPromptWarningSignature: bootstrapPromptWarning.signature,
-    assistantTexts,
     answerSegments: subscription.answerSegments,
-    latestMcpAppChannelView: getLatestMcpAppChannelView(),
-    latestMcpConnectAction: getLatestMcpConnectAction(),
-    lastAssistantTextMessageIndex: getLastAssistantTextMessageIndex(),
-    toolMetas: toolMetasNormalized,
-    acceptedSessionSpawns,
-    lastToolError,
-    didSendViaMessagingTool: replayEvidence.didSendViaMessagingTool,
-    didSendDeterministicApprovalPrompt: didSendDeterministicApprovalPromptNow,
-    messagingToolSentTexts: replayEvidence.messagingToolSentTexts,
-    messagingToolSentMediaUrls,
-    messagingToolSentTargets: getMessagingToolSentTargets(),
+    latestMcpAppChannelView: subscription.getLatestMcpAppChannelView(),
+    latestMcpConnectAction: subscription.getLatestMcpConnectAction(),
+    lastAssistantTextMessageIndex: subscription.getLastAssistantTextMessageIndex(),
+    messagingToolSentTargets: completeLastProgress(evidence.messagingToolSentTargets),
     messagingToolSourceReplyPayloads,
-    heartbeatToolResponse,
-    sourceReplyDelivered: subscription.getSourceReplyDelivered(),
-    sourceReplyDeliveryState: subscription.getSourceReplyDeliveryState(),
-    toolMediaUrls: pendingToolMediaReply?.mediaUrls,
-    toolAudioAsVoice: pendingToolMediaReply?.audioAsVoice,
-    toolTrustedLocalMedia: pendingToolMediaReply?.trustedLocalMedia,
-    hasToolMediaBlockReply: hasToolMediaBlockReplyNow,
-    successfulCronAdds: replayEvidence.successfulCronAdds,
+    sourceReplyDeliveryState: progressIsReply ? "delivered" : evidence.sourceReplyDeliveryState,
     cloudCodeAssistFormatError: Boolean(
       state.lastAssistant?.errorMessage &&
       isCloudCodeAssistFormatError(state.lastAssistant.errorMessage),
     ),
-    compactionCount: getCompactionCount(),
-    compactionTokensAfter: getLastCompactionTokensAfter(),
+    compactionCount: subscription.getCompactionCount(),
+    compactionTokensAfter: subscription.getLastCompactionTokensAfter(),
     clientToolCalls,
     yieldDetected: state.yieldDetected || undefined,
   };
@@ -391,10 +303,12 @@ export function completeEmbeddedAttemptResult(
   // The coarse messaging flag was never terminal evidence at this boundary.
   const { didSendViaMessagingTool: _coarseDelivery, ...terminalEvidence } = resultEvidence;
   const hasTerminalOutput = hasAttemptTerminalState(terminalEvidence);
-  const pendingToolMediaPayloadCount = hasVisiblePendingToolMediaReply(pendingToolMediaReply)
-    ? 1
-    : 0;
-  const visibleBlockReplyCount = getVisibleBlockReplyCount();
+  const pendingToolMediaPayloadCount =
+    evidence.toolMediaUrls?.some((url) => url.trim().length > 0) ||
+    evidence.toolAudioAsVoice === true
+      ? 1
+      : 0;
+  const visibleBlockReplyCount = subscription.getVisibleBlockReplyCount();
   const silentToolResultReplyPayload = resolveSilentToolResultReplyPayload({
     isCronTrigger: attempt.trigger === "cron",
     payloadCount: pendingToolMediaPayloadCount,

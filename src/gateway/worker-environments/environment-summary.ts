@@ -23,10 +23,15 @@ export function summarizeWorkerEnvironment(
   now = Date.now(),
   options: { includePreparedDetails?: boolean } = {},
 ): EnvironmentSummary {
+  const cleanupPending = record.destroyRequestedAtMs !== null && record.state !== "destroyed";
+  const error =
+    record.state === "failed" || record.state === "orphaned" || cleanupPending
+      ? record.error
+      : undefined;
   return {
     id: record.environmentId,
     type: "worker",
-    status: WORKER_STATUS[record.state],
+    status: error ? "error" : WORKER_STATUS[record.state],
     ...(record.sharedHost === null
       ? {}
       : { trust: record.sharedHost ? "persistent" : "disposable" }),
@@ -63,6 +68,7 @@ export function summarizeWorkerEnvironment(
       providerId: record.providerId,
       ...(record.leaseId ? { leaseId: record.leaseId } : {}),
       state: record.state,
+      ...(record.startStatus ? { startStatus: record.startStatus } : {}),
       ...(options.includePreparedDetails && record.destroyRequestedAtMs !== null
         ? { destroyRequestedAtMs: record.destroyRequestedAtMs }
         : {}),
@@ -72,9 +78,7 @@ export function summarizeWorkerEnvironment(
         : {}),
       attachedSessionIds: normalizeSortedUniqueTrimmedStringList(record.attachedSessionIds),
       tunnelStatus: record.tunnelStatus,
-      ...((record.state === "failed" || record.state === "orphaned") && record.error
-        ? { error: record.error }
-        : {}),
+      ...(error ? { error } : {}),
       ...(record.desktopAvailable ? { desktop: true } : {}),
       ...(record.desktopApps.length > 0 ? { desktopApps: [...record.desktopApps] } : {}),
     },

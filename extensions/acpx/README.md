@@ -12,12 +12,22 @@ openclaw plugins install @openclaw/acpx
 
 Restart the Gateway after installing or updating the plugin.
 
+The generated Codex and Claude ACP wrappers prefer the installed adapter while its
+entry file exists. If plugin capture cleanup removes that file, the next launch
+uses the existing pinned `npm exec` / `npx` fallback. This may require registry
+access when the pinned package is not cached. Restart the Gateway after updating
+to regenerate wrappers written by an older plugin version.
+
 ## What it provides
 
 - ACP-backed agent runtime sessions.
 - Plugin-owned session and transport management.
 - MCP bridge helpers for OpenClaw tools and plugin tools.
 - Static runtime assets used by the ACP process bridge.
+
+If the Gateway restarts before a one-shot session receives its first prompt, ACPX
+reuses the initialized conversation when the agent supports loading or resuming
+sessions. Completed one-shot runs still start a fresh conversation.
 
 ## Native agents in the model picker
 

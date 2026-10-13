@@ -19,6 +19,11 @@ policy utilities from `openclaw/plugin-sdk/channel-ingress-runtime`.
 
 ## Runtime resolver
 
+In this example, `cfg` is the root OpenClaw configuration and `config` is the
+resolved channel-account configuration. Supply `runtime`, `normalizePlatformUserId`,
+`route`, `agentRoute`, `readStoreAllowFrom`, and the message facts from your
+plugin's receive path.
+
 ```ts
 import { defineStableChannelIngressIdentity } from "openclaw/plugin-sdk/channel-ingress-runtime";
 
@@ -255,7 +260,7 @@ claim from message text, routing, or host evidence-carrier integrity.
 `accessGroup:<name>` entries stay redacted. Core resolves static
 `message.senders` groups itself and calls `resolveAccessGroupMembership` only
 for dynamic groups that require a platform lookup. Missing, unsupported, and
-failed groups fail closed.
+failed groups deny access.
 
 ## Event modes
 

@@ -1,18 +1,24 @@
 import type { Static } from "typebox";
 import type * as AgentSchema from "./schema/agent.js";
+import type { BackupRecordOutcomeParams, BackupStatusParams } from "./schema/backup.js";
 import type * as BoardSchema from "./schema/board.js";
 import type { CanvasDocumentPreviewParams, CanvasDocumentViewParams } from "./schema/canvas.js";
+import type { CatalogBrowseParams, CatalogSearchKeywordsParams } from "./schema/catalog.js";
 import type { CommandsListParams } from "./schema/commands.js";
+import type { CronHistoryParams } from "./schema/cron.js";
 import type {
   EnvironmentsSessionCreateParams,
   EnvironmentsSessionStatusParams,
   EnvironmentsSessionDestroyParams,
   EnvironmentsSessionExecParams,
+  EnvironmentsAdoptSuggestedProfileParams,
 } from "./schema/environments.js";
 import type * as HumanMentionsSchema from "./schema/human-mentions.js";
 import type { LogsTailParams } from "./schema/logs-chat.js";
 import type * as PortalSchema from "./schema/portals.js";
+import type { PresenceActivityParams, PresenceQueryParams } from "./schema/presence.js";
 import type * as GitHubSchema from "./schema/session-github-publication.js";
+import type { StorageLocationsListParams, StorageLocationsProbeParams } from "./schema/storage.js";
 import type {
   ThemesListParams,
   ThemesGetParams,
@@ -25,6 +31,14 @@ import type * as UsersSchema from "./schema/users.js";
 
 /** Schema-derived payload ownership for statically validated core Gateway methods. */
 export type GatewayCoreRequestParams = {
+  "catalog.browse": CatalogBrowseParams;
+  "catalog.searchKeywords": CatalogSearchKeywordsParams;
+  "backup.status": BackupStatusParams;
+  "backup.recordOutcome": BackupRecordOutcomeParams;
+  "storage.locations.list": StorageLocationsListParams;
+  "storage.locations.probe": StorageLocationsProbeParams;
+  "presence.activity": PresenceActivityParams;
+  "cron.history": CronHistoryParams;
   "users.personalFile.get": UsersSchema.UsersPersonalFileGetParams;
   "users.personalFile.set": UsersSchema.UsersPersonalFileSetParams;
   "canvas.document.preview": CanvasDocumentPreviewParams;
@@ -43,6 +57,7 @@ export type GatewayCoreRequestParams = {
   "environments.session.status": EnvironmentsSessionStatusParams;
   "environments.session.destroy": EnvironmentsSessionDestroyParams;
   "environments.session.exec": EnvironmentsSessionExecParams;
+  "environments.adoptSuggestedProfile": EnvironmentsAdoptSuggestedProfileParams;
   "conversations.list": AgentSchema.ConversationListParams;
   "conversations.send": AgentSchema.ConversationSendParams;
   "conversations.turn": AgentSchema.ConversationTurnParams;
@@ -53,6 +68,7 @@ export type GatewayCoreRequestParams = {
   "portal.close": PortalSchema.PortalCloseParams;
   "portal.list": PortalSchema.PortalListParams;
   "portal.open": PortalSchema.PortalOpenParams;
+  "presence.query": PresenceQueryParams;
   "portal.session.close": Static<typeof PortalSchema.SessionPortalCloseParamsSchema>;
   "portal.session.list": Static<typeof PortalSchema.SessionPortalListParamsSchema>;
   "portal.session.open": Static<typeof PortalSchema.SessionPortalOpenParamsSchema>;
@@ -72,6 +88,7 @@ export type GatewayCoreRequestParams = {
   "users.selectModelAccount": UsersSchema.UsersSelectModelAccountParams;
   "users.linkAuthProfile": UsersSchema.UsersLinkAuthProfileParams;
   "users.linkChannelIdentity": UsersSchema.UsersLinkChannelIdentityParams;
+  "users.merge": UsersSchema.UsersMergeParams;
   "users.unlinkChannelIdentity": UsersSchema.UsersUnlinkChannelIdentityParams;
   "users.listChannelIdentities": UsersSchema.UsersListChannelIdentitiesParams;
   "users.unlinkAuthProfile": UsersSchema.UsersUnlinkAuthProfileParams;

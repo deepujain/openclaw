@@ -1,5 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
+import { withTempWorkspace } from "@openclaw/fs-safe/temp";
 import { resolveTimerTimeoutMs } from "@openclaw/normalization-core/number-coercion";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { resolveStateDir } from "../config/paths.js";
@@ -9,7 +10,6 @@ import {
   redactSupportString,
 } from "../logging/diagnostic-support-redaction.js";
 import { tryReadJson } from "./json-files.js";
-import { withTempWorkspace } from "./private-temp-workspace.js";
 import { resolvePreferredOpenClawTmpDir } from "./tmp-openclaw-dir.js";
 import {
   isUpdateAdmissionAuthorityEnvKey,
@@ -152,7 +152,7 @@ export async function runUpdateCandidateAdmission(params: {
         } finally {
           await terminateCanary(running.child, running.closed, deadline);
         }
-        const diagnostic = running.firstStderrLine();
+        const diagnostic = running.stderrDiagnostic();
         if (outcome.status !== "completed") {
           return fallback("timeout", diagnostic);
         }
@@ -184,16 +184,11 @@ export async function runUpdateCandidateAdmission(params: {
           owner: "candidate",
           verdict: {
             ...verdict,
-            reasons: verdict.reasons.map((reason) => {
-              const redacted: UpdateAdmissionVerdict["reasons"][number] = {
-                code: reason.code,
-                message: safe(reason.message),
-              };
-              if (reason.nextAction) {
-                redacted.nextAction = safe(reason.nextAction);
-              }
-              return redacted;
-            }),
+            reasons: verdict.reasons.map((reason) => ({
+              code: reason.code,
+              message: safe(reason.message),
+              ...(reason.nextAction ? { nextAction: safe(reason.nextAction) } : {}),
+            })),
             warnings: verdict.warnings.map((warning) => ({
               code: warning.code,
               message: safe(warning.message),
@@ -203,16 +198,12 @@ export async function runUpdateCandidateAdmission(params: {
               ...(verdict.facts.nodeEngines !== undefined
                 ? { nodeEngines: safe(verdict.facts.nodeEngines) }
                 : {}),
-              checks: verdict.facts.checks.map((check) => {
-                const redacted: UpdateAdmissionVerdict["facts"]["checks"][number] = {
-                  name: check.name,
-                  status: check.status,
-                };
-                if (check.detail) {
-                  redacted.detail = safe(check.detail);
-                }
-                return redacted;
-              }),
+              checks: verdict.facts.checks.map((check) =>
+                Object.assign(
+                  { name: check.name, status: check.status },
+                  check.detail ? { detail: safe(check.detail) } : {},
+                ),
+              ),
             },
           },
         };

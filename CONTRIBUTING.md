@@ -52,6 +52,15 @@ pnpm's isolated linker, which keeps dependencies in `node_modules/.pnpm` and lin
 them into each workspace package. On supported macOS volumes, this also lets pnpm
 reuse whole-package APFS clones instead of importing every file separately.
 
+Installation also prepares Kysely declarations from the SQL schemas in `src/state`.
+The generated files live in ignored `.artifacts/kysely/`; build, typecheck,
+type-aware lint, and test entrypoints refresh them automatically, including after an install with
+`--ignore-scripts`. Unchanged inputs reuse the declarations without rewriting
+them. `pnpm db:kysely:check` checks schema projection and generator contracts.
+Sparse core, script, and root-test lint prepare only the available schemas and
+retire declarations for omitted schemas. Normal source generation, verification,
+and extension-boundary builds still require complete schemas.
+
 Give each source checkout its own physical dependency installation. Tooling does
 not automatically link a missing `node_modules` to another checkout. Existing
 borrowed installs can still serve direct Node tooling. Normal pnpm install checks
@@ -73,15 +82,16 @@ must declare their own development dependencies rather than rely on hoisting.
 ## Before You PR
 
 - Use **Node 24.16+ LTS** or **Node 26.1+** for source checkouts. Older Node releases can truncate SQLite TEXT reads; Node 22, 23, and 25 are unsupported. See [Node install guidance](docs/install/node.md) if your local version is too old.
-- Run the Vitest 5 suite on Node 24.16+ or Node 26.1+, matching the packaged runtime floor.
+- Run focused Vitest 5 tests on Node 24.16+ or Node 26.1+, matching the packaged runtime floor.
 - Test locally with your OpenClaw instance
 - An explicit maintainer repair-and-land request covers internal database scheduling, admission, and lifecycle decisions. The implementer owns the design and its verification. Get separate design acceptance when changing public contracts, schemas, durability, retention, or permissions; see the [database schema review checkpoint](docs/reference/database-schemas.md#review-checkpoint-for-material-changes).
 - External PRs must describe the user, product, or operational problem in **What Problem This Solves** and include useful validation in **Evidence**. Focused tests, CI results, screenshots, recordings, terminal output, live observations, redacted logs, and artifact links all count. Reviewers will inspect the code, tests, and CI; use the PR body to explain intent and make validation easy to understand.
 - Follow the [PR template](.github/pull_request_template.md): lead with the plain-language problem and concrete user impact, then a brief explanation and useful evidence. Keep technical inventories in the diff or optional details, not the opening summary. Keep important risks, migrations, required actions, and evidence gaps visible; do not invent a user benefit for internal-only work.
 - When ClawSweeper, Barnacle, or a maintainer asks for more context or evidence, edit the PR description instead of only replying in a new comment. Keep **What Problem This Solves**, **User Impact**, **Why This Change Was Made**, and **Evidence** current; a short comment can point reviewers to the update, but the PR body should remain the durable explanation for maintainers and bots.
 - Keep PRs takeover-ready: open them from a branch maintainers can push to. For fork PRs, leave GitHub's **Allow edits by maintainers** option enabled so maintainers can finish urgent fixes or merge prep when needed. If GitHub shows **Allow edits and access to secrets by maintainers**, enable it only when that workflow/secrets access is acceptable and say so in the PR.
-- Do not edit the generated `CHANGELOG.md` index or release-owned `CHANGELOG/**` entries and contribution records in normal PRs or at merge. Initial changelogs are generated at release time from merged PRs and commits; keep release-note context in PR bodies or commit messages until then. Explicit release-docs publication changes follow the [release artifact procedure](docs/reference/RELEASING.md#release-changelog-artifacts).
-- Run tests: `pnpm build && pnpm check && pnpm test`
+- Do not edit the generated `CHANGELOG.md` index or release-owned `CHANGELOG/**` entries and contribution records in normal PRs or at merge. Initial changelogs are generated at release time from merged PRs and commits; keep release-note context in PR bodies or commit messages until then. Explicit release-docs publication changes follow the [release artifact procedure](.agents/skills/openclaw-changelog-update/SKILL.md#post-release-docs-mirrors).
+- Run focused tests for touched code (`pnpm test <file> --maxWorkers=1`) and targeted typecheck, lint, and format checks. Build when the change affects build output or package boundaries. Open a ready PR once focused proof passes; PR CI runs the full suite.
+- After PR CI fails, run `pnpm test:ci-failed <pr>` and read the failure classification. Fix new failures, use `pnpm test:ci-failed <pr> --run` until those pass locally, then push once. Do not rerun CI just to chase green or run the full local suite. Pre-existing failures follow the [failure-table landing rule](.agents/skills/openclaw-pr-maintainer/references/landing.md#red-main-and-inherited-failures).
 - For iterative local commits after running equivalent targeted validation for the touched surface, `git commit --no-verify` skips commit hooks.
 - For extension/plugin changes, run the fast local lane first:
   - `pnpm test:extension <extension-name>`
@@ -89,7 +99,7 @@ must declare their own development dependencies rather than rely on hoisting.
   - If you changed shared plugin or channel surfaces, run `pnpm test:contracts`
   - For targeted shared-surface work, use `pnpm test:contracts:channels` or `pnpm test:contracts:plugins`
   - These commands also cover the shared seam/smoke files that the default unit lane skips
-  - If you changed broader runtime behavior, still run the relevant wider lanes (`pnpm test:extensions`, `pnpm test:channels`, or `pnpm test`) before asking for review
+  - For broader runtime changes, select focused tests that cover the touched contracts; PR CI runs the wider lanes (`pnpm test:extensions`, `pnpm test:channels`, or `pnpm test`) before landing
 - If you touched bundled-plugin boundaries in shared code, run the matching inventories:
   - `node --import tsx scripts/check-src-extension-import-boundary.mts --json` for `src/**`
   - `node --import tsx scripts/check-sdk-package-extension-import-boundary.mts --json` for `src/plugin-sdk/**` and `packages/**`

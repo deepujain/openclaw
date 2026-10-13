@@ -1,8 +1,12 @@
 import fs from "node:fs";
 import { expectDefined } from "@openclaw/normalization-core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { observeHostDataSql } from "../../test/helpers/sqlite-statement-execution-counter.js";
+import {
+  observeHostDataSql,
+  observeSqliteReadSql,
+} from "../../test/helpers/sqlite-statement-execution-counter.js";
 import { testing as cliBackendsTesting } from "../agents/cli-backends.test-support.js";
+import { setRuntimeConfigSnapshot } from "../config/runtime-snapshot.js";
 import * as sessionAccessor from "../config/sessions/session-accessor.js";
 import { resolveSqliteTargetFromSessionStorePath } from "../config/sessions/session-sqlite-target.js";
 import {
@@ -19,7 +23,7 @@ import {
 } from "../state/openclaw-agent-db.js";
 import { withOpenClawTestState } from "../test-utils/openclaw-test-state.js";
 import { backfillSessionRowTranscriptFields } from "./session-row-transcript-backfill.js";
-import { readSessionRowTranscriptFields } from "./session-row-transcript-backfill.kernel.js";
+import { readSessionRowTranscriptFields } from "./session-row-transcript-backfill.worker.js";
 
 const generateConversationLabelWithFallback = vi.hoisted(() => vi.fn());
 vi.mock("../auto-reply/reply/conversation-label-generator.js", () => ({
@@ -92,6 +96,7 @@ async function withSession(
   entry: Partial<InternalSessionEntry> = {},
 ) {
   await withOpenClawTestState({ label: "session-row-backfill" }, async (state) => {
+    setRuntimeConfigSnapshot({});
     const params = {
       agentId: "main",
       storePath: state.statePath("sessions.json"),
@@ -147,15 +152,48 @@ describe("session row transcript backfill", () => {
     );
   });
 
-  it.each(["current", "unavailable", "absent"] as const)(
-    "reads optional terminal fallback fields from %s storage without writer admission",
+  it.each([
+    "current",
+    "unavailable",
+    "absent",
+    "runtime alias",
+    "media-only rewrite",
+    "hidden rewrite",
+    "silent rewrite",
+  ] as const)(
+    "reads optional terminal fallback fields without writer admission (%s)",
     async (storage) => {
+      const alias = storage === "runtime alias";
+      const mediaRewrite = storage === "media-only rewrite" || storage === "hidden rewrite";
+      const silentRewrite = storage === "silent rewrite";
+      const preview = alias
+        ? "Finished on equivalent runtime"
+        : mediaRewrite
+          ? "MEDIA:./proof.png"
+          : silentRewrite
+            ? "NO_REPLY"
+            : "Finished with fallback";
       await withSession(
         async (seeded) => {
+          if (alias) {
+            cliBackendsTesting.setDepsForTest({
+              resolvePluginSetupCliBackend: () => undefined,
+              resolveRuntimeCliBackends: () => [
+                {
+                  id: "synthetic-cli",
+                  modelProvider: "unit-test",
+                  pluginId: "synthetic-runtime",
+                  config: { command: "synthetic-cli" },
+                },
+              ],
+            });
+          }
           const params = {
             ...seeded,
             ...(storage === "absent" ? { storePath: `${seeded.storePath}.missing.sqlite` } : {}),
-            model: { selectedProvider: "unit-test", selectedModel: "selected" },
+            model: alias
+              ? { selectedProvider: "synthetic-cli", selectedModel: "same", config: {} }
+              : { selectedProvider: "unit-test", selectedModel: "selected" },
           };
           const options = sessionDatabaseOptions(params);
           if (storage === "unavailable") {
@@ -169,40 +207,70 @@ describe("session row transcript backfill", () => {
           if (storage === "absent") {
             expect(fs.existsSync(options.path)).toBe(false);
           }
-          await withColdStore(params, async () => {
-            await expect(backfillSessionRowTranscriptFields(params)).resolves.toEqual(
-              storage === "current"
-                ? {
-                    lastMessagePreview: "Finished with fallback",
-                    fallbackModel: { provider: "unit-test", model: "fallback" },
-                  }
-                : {},
-            );
-            if (storage === "unavailable") {
-              expect(isSessionTranscriptIndexReconcileRunning(options)).toBe(false);
-              expect(
-                withOpenClawAgentDatabaseReadOnly(
-                  ({ db }) =>
-                    db
-                      .prepare(
-                        "SELECT needs_rebuild FROM session_transcript_index_state WHERE session_id = ?",
-                      )
-                      .get(params.sessionId),
-                  options,
-                ),
-              ).toEqual({ found: true, value: { needs_rebuild: 1 } });
+          try {
+            await withColdStore(params, async () => {
+              const hostSql = observeHostDataSql();
+              try {
+                await expect(backfillSessionRowTranscriptFields(params)).resolves.toEqual(
+                  storage === "media-only rewrite"
+                    ? { fallbackModel: { provider: "unit-test", model: "fallback" } }
+                    : storage === "current"
+                      ? {
+                          lastMessagePreview: "Finished with fallback",
+                          fallbackModel: { provider: "unit-test", model: "fallback" },
+                        }
+                      : alias
+                        ? { lastMessagePreview: preview }
+                        : {},
+                );
+                for (const statement of hostSql.calls) {
+                  expect(statement).not.toHaveBeenCalled();
+                }
+              } finally {
+                hostSql.restore();
+              }
+              if (storage === "unavailable") {
+                expect(isSessionTranscriptIndexReconcileRunning(options)).toBe(false);
+                expect(
+                  withOpenClawAgentDatabaseReadOnly(
+                    ({ db }) =>
+                      db
+                        .prepare(
+                          "SELECT needs_rebuild FROM session_transcript_index_state WHERE session_id = ?",
+                        )
+                        .get(params.sessionId),
+                    options,
+                  ),
+                ).toEqual({ found: true, value: { needs_rebuild: 1 } });
+              }
+              if (storage === "absent") {
+                expect(fs.existsSync(options.path)).toBe(false);
+              }
+            });
+          } finally {
+            if (alias) {
+              cliBackendsTesting.resetDepsForTest();
             }
-            if (storage === "absent") {
-              expect(fs.existsSync(options.path)).toBe(false);
-            }
-          });
+          }
         },
         [
           {
             role: "assistant",
-            content: "Finished with fallback",
+            content: preview,
+            ...(mediaRewrite || silentRewrite
+              ? {
+                  openclawDisplayContent: [
+                    {
+                      type: "image",
+                      url: "/api/chat/media/outgoing/proof.png",
+                      mimeType: "image/png",
+                    },
+                  ],
+                }
+              : {}),
+            ...(storage === "hidden rewrite" ? { display: false } : {}),
             provider: "unit-test",
-            model: "fallback",
+            model: alias ? "same" : "fallback",
             stopReason: "stop",
             __openclaw: { runId: "terminal-run" },
           },
@@ -211,54 +279,67 @@ describe("session row transcript backfill", () => {
           lastRunId: "terminal-run",
           fallbackNotice: {
             kind: "active",
-            selectedModel: "unit-test/selected",
-            activeModel: "unit-test/fallback",
+            selectedModel: alias ? "synthetic-cli/same" : "unit-test/selected",
+            activeModel: alias ? "unit-test/same" : "unit-test/fallback",
           },
         },
       );
     },
   );
 
-  it("uses the host's runtime aliases when projecting worker-read terminal fallback facts", async () => {
+  it("reads preview and terminal facts once and sees the next committed transcript", async () => {
     await withSession(
       async (params) => {
-        cliBackendsTesting.setDepsForTest({
-          resolvePluginSetupCliBackend: () => undefined,
-          resolveRuntimeCliBackends: () => [
-            {
-              id: "synthetic-cli",
-              modelProvider: "unit-test",
-              pluginId: "synthetic-runtime",
-              config: { command: "synthetic-cli" },
-            },
-          ],
-        });
-        const hostSql = observeHostDataSql();
+        const reads = observeSqliteReadSql(nodeSqlite.requireNodeSqlite().StatementSync.prototype);
+        const read = () => {
+          reads.queries.length = 0;
+          const fields = readSessionRowTranscriptFields({ ...params, includeTerminalModel: true });
+          expect(
+            reads.queries.filter((sql) => sql.includes('from "transcript_events" as "event"')),
+          ).toHaveLength(1);
+          expect(
+            reads.queries.filter(
+              (sql) =>
+                sql.includes('from "session_transcript_active_events" as "active"') &&
+                sql.includes('as "serialized_bytes"'),
+            ),
+          ).toHaveLength(1);
+          return fields;
+        };
         try {
-          await expect(
-            backfillSessionRowTranscriptFields({
-              ...params,
-              model: {
-                selectedProvider: "synthetic-cli",
-                selectedModel: "same",
-                config: {},
+          expect(read()).toEqual({
+            lastMessagePreview: "First terminal reply",
+            terminalModel: { modelProvider: "unit-test", model: "fallback" },
+          });
+          await sessionAccessor.persistSessionTranscriptTurn(params, {
+            messages: [
+              {
+                message: {
+                  role: "assistant",
+                  content: "Next terminal reply",
+                  provider: "unit-test",
+                  model: "next-fallback",
+                  stopReason: "stop",
+                  __openclaw: { runId: "terminal-run" },
+                },
               },
-            }),
-          ).resolves.toEqual({ lastMessagePreview: "Finished on equivalent runtime" });
-          for (const statement of hostSql.calls) {
-            expect(statement).not.toHaveBeenCalled();
-          }
+            ],
+            touchSessionEntry: false,
+          });
+          expect(read()).toEqual({
+            lastMessagePreview: "Next terminal reply",
+            terminalModel: { modelProvider: "unit-test", model: "next-fallback" },
+          });
         } finally {
-          hostSql.restore();
-          cliBackendsTesting.resetDepsForTest();
+          reads.restore();
         }
       },
       [
         {
           role: "assistant",
-          content: "Finished on equivalent runtime",
+          content: "First terminal reply",
           provider: "unit-test",
-          model: "same",
+          model: "fallback",
           stopReason: "stop",
           __openclaw: { runId: "terminal-run" },
         },
@@ -267,8 +348,37 @@ describe("session row transcript backfill", () => {
         lastRunId: "terminal-run",
         fallbackNotice: {
           kind: "active",
-          selectedModel: "synthetic-cli/same",
-          activeModel: "unit-test/same",
+          selectedModel: "unit-test/selected",
+          activeModel: "unit-test/fallback",
+        },
+      },
+    );
+  });
+
+  it("reads terminal facts beyond the preview budget without showing an older preview", async () => {
+    await withSession(
+      async (params) => {
+        expect(readSessionRowTranscriptFields({ ...params, includeTerminalModel: true })).toEqual({
+          terminalModel: { modelProvider: "unit-test", model: "fallback" },
+        });
+      },
+      [
+        { role: "assistant", content: "Older preview" },
+        {
+          role: "assistant",
+          content: "x".repeat(70 * 1024),
+          provider: "unit-test",
+          model: "fallback",
+          stopReason: "stop",
+          __openclaw: { runId: "terminal-run" },
+        },
+      ],
+      {
+        lastRunId: "terminal-run",
+        fallbackNotice: {
+          kind: "active",
+          selectedModel: "unit-test/selected",
+          activeModel: "unit-test/fallback",
         },
       },
     );

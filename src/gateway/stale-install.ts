@@ -1,6 +1,7 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  coerceErrorMessage,
   collectErrorGraphCandidates,
   readErrorCauses,
 } from "@openclaw/normalization-core/error-coercion";
@@ -24,9 +25,30 @@ import {
 } from "../process/gateway-work-admission.js";
 import { resolveGlobalSingleton } from "../shared/global-singleton.js";
 import { resolveRuntimeServiceBuildId, VERSION } from "../version.js";
+import { isGatewayTransportError } from "./transport-error.js";
 
 export const GATEWAY_STALE_INSTALL_CLOSE_REASON =
   "gateway install changed; run: openclaw gateway restart";
+
+export type GatewayStaleConnectionReason = "installation-replaced" | "legacy-handler-unavailable";
+
+export function classifyGatewayStaleConnectionError(
+  error: unknown,
+): GatewayStaleConnectionReason | undefined {
+  if (coerceErrorMessage(error).includes(GATEWAY_STALE_INSTALL_CLOSE_REASON)) {
+    return "installation-replaced";
+  }
+  // Published June Gateways report failed runtime imports before STALE_INSTALL existed.
+  if (
+    isGatewayTransportError(error) &&
+    error.kind === "closed" &&
+    error.code === 1011 &&
+    error.reason === "gateway message handler unavailable"
+  ) {
+    return "legacy-handler-unavailable";
+  }
+  return undefined;
+}
 
 // The install root is process-stable; capture it before an upgrade can replace
 // package metadata, then consult it only after a dynamic import has failed.
@@ -126,19 +148,10 @@ export function checkGatewayInstallationReplacement(): Promise<void> {
   if (observer.check) {
     return observer.check;
   }
-  // A suspend-and-resume can finish during this read. Do not publish its transient
-  // pointer as a replacement, even if admission is open again when the read settles.
-  let admissionChanged = false;
-  const releaseObservation = onGatewaySuspendAdmissionChange(() => {
-    admissionChanged = true;
-  });
   observer.check = tryReadJson(path.join(root, "dist", "build-info.json"), {
     maxBytes: 16 * 1024,
   })
     .then((value) => {
-      if (admissionChanged) {
-        return;
-      }
       const metadata = asNullableRecord(value);
       const version = normalizeNullableString(metadata?.version);
       const buildId = normalizeNullableString(metadata?.buildId);
@@ -151,7 +164,6 @@ export function checkGatewayInstallationReplacement(): Promise<void> {
       }
     })
     .finally(() => {
-      releaseObservation();
       observer.check = undefined;
     });
   return observer.check;

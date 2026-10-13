@@ -1,4 +1,3 @@
-// Archive install helpers extract and validate skill archives during installation.
 import path from "node:path";
 import {
   getAgentWorkspaceAccess,
@@ -10,10 +9,8 @@ import { formatErrorMessage } from "../../infra/errors.js";
 import { pathExists } from "../../infra/fs-safe.js";
 import { withExtractedArchiveRoot } from "../../infra/install-flow.js";
 import { installPackageDir } from "../../infra/install-package-dir.js";
-import {
-  evaluateSkillInstallPolicy,
-  type InstallSecurityScanResult,
-} from "../../plugins/install-security-scan.js";
+import { createSubsystemLogger } from "../../logging/subsystem.js";
+import { evaluateSkillInstallPolicy } from "../../plugins/install-security-scan.js";
 import type { InstallSafetyOverrides } from "../../plugins/install-security-scan.types.js";
 import type { InstallPolicyOrigin, InstallPolicySource } from "../../security/install-policy.js";
 import { resolveWorkspaceSkillInstallDir } from "./install-paths.js";
@@ -35,7 +32,7 @@ import type {
 export type { SkillArchiveInstallFailureKind } from "./workspace-types.js";
 
 const DEFAULT_SKILL_ARCHIVE_ROOT_MARKERS = ["SKILL.md"] as const;
-/** Accepted root marker names for ClawHub skill archive uploads. */
+const log = createSubsystemLogger("skills");
 export const CLAWHUB_SKILL_ARCHIVE_ROOT_MARKERS = [
   "SKILL.md",
   "skill.md",
@@ -71,12 +68,6 @@ async function hasSkillArchiveRoot(
   return false;
 }
 
-function scanBlockedFailureKind(
-  blocked: NonNullable<InstallSecurityScanResult["blocked"]>,
-): SkillArchiveInstallFailureKind {
-  return blocked.code === "security_scan_failed" ? "unavailable" : "invalid-request";
-}
-
 const TRANSIENT_ARCHIVE_ERROR_PATTERNS = [
   "enoent",
   "enospc",
@@ -92,15 +83,10 @@ const TRANSIENT_ARCHIVE_ERROR_PATTERNS = [
 
 function archiveFailureKind(error: string): SkillArchiveInstallFailureKind {
   const lower = error.toLowerCase();
-  if (lower.startsWith("failed to install skill:")) {
-    return "unavailable";
-  }
-  for (const pattern of TRANSIENT_ARCHIVE_ERROR_PATTERNS) {
-    if (lower.includes(pattern)) {
-      return "unavailable";
-    }
-  }
-  return "invalid-request";
+  return lower.startsWith("failed to install skill:") ||
+    TRANSIENT_ARCHIVE_ERROR_PATTERNS.some((pattern) => lower.includes(pattern))
+    ? "unavailable"
+    : "invalid-request";
 }
 
 export async function installExtractedSkillRoot(
@@ -123,6 +109,7 @@ export async function installExtractedSkillRoot(
     }
     const applyRoot = access?.applySkillRoot ?? applyExtractedSkillRoot;
     const { policy: _policy, ...files } = params;
+    params.beforePersistentApply?.();
     const result = await applyRoot({
       ...files,
       ...(captureChanges ? { changes: { source: changeSource, sourceVersion } } : {}),
@@ -142,16 +129,29 @@ export async function installExtractedSkillRoot(
           skillName: params.slug,
           sourceDir: params.extractedRoot,
         });
+        params.beforePersistentApply?.();
         return scanResult?.blocked
           ? {
               error: scanResult.blocked.reason,
-              failureKind: scanBlockedFailureKind(scanResult.blocked),
+              failureKind:
+                scanResult.blocked.code === "security_scan_failed"
+                  ? "unavailable"
+                  : "invalid-request",
             }
           : undefined;
       },
     });
     if (!result.ok) {
       return result;
+    }
+    try {
+      const { refreshSkillsDiscovery } = await import("../runtime/refresh.js");
+      await refreshSkillsDiscovery({
+        workspaceDir: params.workspaceDir,
+        config: params.policy?.config,
+      });
+    } catch (error) {
+      log.warn(`Skill installed, but discovery refresh failed: ${formatErrorMessage(error)}`);
     }
     if (captureChanges) {
       await dispatchCommittedSkillChangeBestEffort({
@@ -171,7 +171,9 @@ export async function installExtractedSkillRoot(
 
 /** Native file replacement on the workspace host; policy and hook dispatch stay with the caller. */
 export async function applyExtractedSkillRoot(
-  params: Parameters<WorkspaceSkillLifecycle["applyExtractedSkillRoot"]>[0],
+  params: Parameters<WorkspaceSkillLifecycle["applyExtractedSkillRoot"]>[0] & {
+    authorizeMutation?: () => Promise<void>;
+  },
 ): Promise<SkillRootApplyResult> {
   try {
     if (
@@ -196,15 +198,16 @@ export async function applyExtractedSkillRoot(
         "invalid-request",
       );
     }
+    const snapshot = (changes: NonNullable<typeof params.changes>, includeSourceVersion = false) =>
+      snapshotCommittedSkillArtifactBestEffort({
+        skillDir: targetDir,
+        skillKey: params.slug,
+        source: changes.source,
+        ...(includeSourceVersion ? { sourceVersion: changes.sourceVersion } : {}),
+        logger: params.logger,
+      });
     const before =
-      params.changes && effectiveMode === "update"
-        ? await snapshotCommittedSkillArtifactBestEffort({
-            skillDir: targetDir,
-            skillKey: params.slug,
-            source: params.changes.source,
-            logger: params.logger,
-          })
-        : undefined;
+      params.changes && effectiveMode === "update" ? await snapshot(params.changes) : undefined;
     const policyFailure = await params.beforeInstall?.(effectiveMode);
     if (policyFailure) {
       return installFailure(policyFailure.error, policyFailure.failureKind);
@@ -219,6 +222,8 @@ export async function applyExtractedSkillRoot(
       timeoutMs: params.timeoutMs ?? 120_000,
       logger: params.logger,
       copyErrorPrefix: "failed to install skill",
+      beforePersistentApply: params.beforePersistentApply,
+      authorizeMutation: params.authorizeMutation,
       hasDeps: false,
       depsLogMessage: "",
       ...(expectedClawHubState !== undefined
@@ -246,15 +251,7 @@ export async function applyExtractedSkillRoot(
         ...(replacementBlocked ? { replacementBlocked } : {}),
       };
     }
-    const after = params.changes
-      ? await snapshotCommittedSkillArtifactBestEffort({
-          skillDir: targetDir,
-          skillKey: params.slug,
-          source: params.changes.source,
-          sourceVersion: params.changes.sourceVersion,
-          logger: params.logger,
-        })
-      : undefined;
+    const after = params.changes ? await snapshot(params.changes, true) : undefined;
     return { ok: true, targetDir, mode: effectiveMode, before, after };
   } catch (err) {
     return installFailure(formatErrorMessage(err), "unavailable");
@@ -269,6 +266,7 @@ export async function installSkillArchiveFromPath(params: {
   timeoutMs?: number;
   logger?: ArchiveLogger;
   policy?: SkillArchiveInstallPolicy;
+  beforePersistentApply?: () => void;
 }): Promise<SkillArchiveInstallResult> {
   const result = await withExtractedArchiveRoot({
     archivePath: params.archivePath,
@@ -285,6 +283,7 @@ export async function installSkillArchiveFromPath(params: {
         timeoutMs: params.timeoutMs,
         logger: params.logger,
         policy: params.policy,
+        beforePersistentApply: params.beforePersistentApply,
       }),
   });
   if (!result.ok) {

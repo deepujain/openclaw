@@ -1,7 +1,8 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { resolveGlobalSingleton } from "../shared/global-singleton.js";
+import { withArtifactPreservingStateReads } from "../state/artifact-preserving-state-reads.js";
+import type { OpenClawStateIntegrityAdmission } from "../state/openclaw-state-db-async-lifecycle.js";
 import { withExistingOpenClawStateSchema } from "../state/openclaw-state-db-schema-policy.js";
-import type { StateDatabaseCoordinatorRuntime } from "./state-database-coordinator.js";
 
 /** Resolved host facts for the canonical shared-state owner, never authority. */
 export type SqliteWorkerStateContext = {
@@ -13,8 +14,11 @@ export type SqliteWorkerStateContext = {
   initializationEnvironment?: NodeJS.ProcessEnv;
   /** Known agent paths preserve deletion-history uncertainty during native initialization. */
   initializationAgentPaths?: readonly string[];
-  coordinatorRuntime: StateDatabaseCoordinatorRuntime;
   existingSchemaPath?: string;
+  stateIntegrity?: OpenClawStateIntegrityAdmission;
+  artifactPreservingReads?: true;
+  /** Actor-owned exclusion for autonomous WAL work, never write authority. */
+  scheduledMaintenanceSuspension?: SharedArrayBuffer;
 };
 
 export function captureSqliteWorkerStateContext(
@@ -28,8 +32,10 @@ export function captureSqliteWorkerStateContext(
     ...(context.initializationAgentPaths
       ? { initializationAgentPaths: [...context.initializationAgentPaths] }
       : {}),
-    coordinatorRuntime: { ...context.coordinatorRuntime },
     existingSchemaPath: context.existingSchemaPath,
+    stateIntegrity: context.stateIntegrity,
+    artifactPreservingReads: context.artifactPreservingReads,
+    scheduledMaintenanceSuspension: context.scheduledMaintenanceSuspension,
   };
 }
 
@@ -51,25 +57,74 @@ export function sqliteWorkerRequestBytes(
           total + Buffer.byteLength(key, "utf8") + Buffer.byteLength(value ?? "", "utf8"),
         bytes,
       ),
-    input.byteLength + (preparation?.byteLength ?? 0) + agentPathBytes,
+    input.byteLength +
+      (preparation?.byteLength ?? 0) +
+      agentPathBytes +
+      (context?.scheduledMaintenanceSuspension?.byteLength ?? 0),
   );
 }
 
 // Source hosts and built backends can load separate module copies in one Worker.
 const stateContexts = resolveGlobalSingleton(
   Symbol.for("openclaw.sqliteWorkerStateContext"),
-  () => new AsyncLocalStorage<SqliteWorkerStateContext>(),
+  () =>
+    new AsyncLocalStorage<
+      SqliteWorkerStateContext & {
+        existingDatabase?: { databasePath: string; identity: string };
+      }
+    >(),
 );
+
+/** Keep the actor's live maintenance holds after the opening command returns. */
+export function captureSqliteWorkerWalMaintenanceSuspension(): (() => boolean) | undefined {
+  const buffer = stateContexts.getStore()?.scheduledMaintenanceSuspension;
+  if (!buffer) {
+    return undefined;
+  }
+  const holds = new Int32Array(buffer);
+  return () => Atomics.load(holds, 0) > 0;
+}
+
+/** Preserve factory facts across later commands without changing their captured host context. */
+export function withSqliteWorkerExistingDatabase<T>(
+  databasePath: string,
+  identity: string,
+  operation: () => T,
+): T {
+  return stateContexts.run(
+    {
+      ...getSqliteWorkerStateContext(),
+      existingDatabase: { databasePath, identity },
+    },
+    operation,
+  );
+}
+
+/** Only cold writable opens need this factory's prior-existence constraint. */
+export function getSqliteWorkerExistingDatabaseIdentity(databasePath: string): string | undefined {
+  const existing = stateContexts.getStore()?.existingDatabase;
+  return existing?.databasePath === databasePath ? existing.identity : undefined;
+}
+
+export function getSqliteWorkerStateIntegrityAdmission():
+  | OpenClawStateIntegrityAdmission
+  | undefined {
+  return stateContexts.getStore()?.stateIntegrity;
+}
 
 export function runWithSqliteWorkerStateContext<T>(
   context: SqliteWorkerStateContext,
   operation: () => T,
 ): T {
-  return stateContexts.run(context, () =>
-    context.existingSchemaPath === undefined
-      ? operation()
-      : withExistingOpenClawStateSchema({ path: context.existingSchemaPath }, operation),
-  );
+  const run = () =>
+    stateContexts.run(context, () =>
+      context.existingSchemaPath === undefined
+        ? operation()
+        : withExistingOpenClawStateSchema({ path: context.existingSchemaPath }, operation),
+    );
+  return context.artifactPreservingReads
+    ? withArtifactPreservingStateReads(run, { agentDatabases: true })
+    : run();
 }
 
 export function getSqliteWorkerStateContext(): SqliteWorkerStateContext {

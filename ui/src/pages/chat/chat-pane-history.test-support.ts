@@ -47,10 +47,9 @@ export type TestChatPane = HTMLElement & {
   syncHistoryObserver: () => void;
   prependUniqueCatalogMessages: (messages: unknown[]) => unknown[];
   loadOlderMessages: () => Promise<boolean>;
-  stagedOlderPage: unknown;
-  stagedOlderLoad: Promise<void> | null;
-  requestReplyMessage: (messageId: string) => void;
+  stagedOlder: { page: unknown; load: Promise<void> | null };
   readReplyMessage: (messageId: string) => unknown;
+  replyMessageStatus: (messageId: string) => string | undefined;
   openReplyMessage: (messageId: string) => void;
   currentReplyNavigationId: (sessionKey: string) => string | null;
   hasOlderMessages: () => boolean;
@@ -60,6 +59,8 @@ export type TestChatPane = HTMLElement & {
   transcriptScrollTop: number | null;
   transcript: {
     activeSessionKey: string | null;
+    readonly isPositionSettled: boolean;
+    readonly isProgrammaticScroll: boolean;
     readonly scrollElement: HTMLDivElement | null;
     revealMessage: (messageId: string) => boolean;
     scrollToOffset: (offset: number) => void;
@@ -138,6 +139,7 @@ export function createTestChatPane(params: {
   pane.state = state;
   pane.connectedClient = params.client;
   pane.connectionGeneration = 4;
+  vi.spyOn(pane.transcript, "isPositionSettled", "get").mockReturnValue(true);
   return { pane, state, requestUpdate };
 }
 

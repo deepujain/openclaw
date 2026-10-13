@@ -5,9 +5,11 @@ import { isTerminalAssistantError } from "../../../llm/utils/retry.js";
 import { hasAcceptedSessionSpawn } from "../../accepted-session-spawn.js";
 import { isPreDispatchToolCallRejectionMessage } from "../../failover/message-patterns.js";
 import { resolveReplyCompletion, resolveReplyExpectation } from "../../reply-completion.js";
+import { readToolEffectReceipt } from "../../tool-effect-receipt.js";
 import { TOOL_FAILURE_INSTRUCTION } from "../../tool-outcome-instructions.js";
 import { resolveSourceReplyDelivery } from "../delivery-evidence.js";
 import { isZeroUsageEmptyStopAssistantTurn } from "../empty-assistant-turn.js";
+import { assessLastAssistantMessage } from "../thinking.js";
 import {
   hasAsyncActivity,
   hasAttemptTerminalState,
@@ -18,8 +20,6 @@ import {
   classifyAssistantTurn,
   hasPositiveOutputTokenUsage,
   isOllamaIncompleteTurnProvider,
-  isReasoningOnlyAssistantTurn,
-  isUnsignedThinkingOnlyAssistantTurn,
   joinAssistantTexts,
   shouldApplyNonVisibleTurnRetryGuard,
   type IncompleteTurnAttempt,
@@ -34,8 +34,22 @@ const REASONING_ONLY_RETRY_INSTRUCTION =
   "The previous assistant turn recorded reasoning but did not produce a user-visible answer. Continue from that partial turn and produce the visible answer now. Do not restate the reasoning or restart from scratch.";
 const EMPTY_RESPONSE_RETRY_INSTRUCTION =
   "The previous attempt did not produce a user-visible answer. Continue from the current state and produce the visible answer now. Do not restart from scratch.";
+const TOOL_USE_WITHOUT_CALL_RETRY_INSTRUCTION =
+  "The previous assistant turn stopped for tool use but contained no tool call, so nothing ran. Continue from the current state: call the tool you need through the tool interface instead of writing the call as text, or produce the visible answer now. Do not restart from scratch.";
+const REJECTED_TOOL_CALL_RETRY_INSTRUCTION =
+  "The previous assistant turn's tool call was rejected before it ran because the provider returned incomplete or malformed tool-call arguments, so nothing ran for that call. Continue from the current state: re-issue the call you need through the tool interface with complete, valid JSON arguments, or produce the visible answer now. Do not repeat completed tool calls or restart from scratch.";
 const SETTLED_TOOL_TERMINAL_CONTINUATION_INSTRUCTION =
   "The previous assistant turn completed its tool calls but did not produce a user-visible answer. Continue from the current transcript and produce the final user-visible answer now. Do not repeat completed tool calls or restart from scratch. Tools are unavailable in this step: it is a text-only pass, so reply with plain text and do not attempt any tool call.";
+
+type IncompleteTurnRecoveryParams = {
+  provider?: string;
+  modelId?: string;
+  modelApi?: string;
+  executionContract?: string;
+  aborted: boolean;
+  timedOut: boolean;
+  attempt: IncompleteTurnAttempt;
+};
 
 export function shouldRetrySilentErrorAssistantTurn(params: {
   attempt: Pick<
@@ -56,15 +70,13 @@ export function shouldRetrySilentErrorAssistantTurn(params: {
   >;
   assistant: EmbeddedRunAttemptResult["lastAssistant"] | null | undefined;
 }): boolean {
-  if (joinAssistantTexts(params.attempt.assistantTexts).length > 0) {
-    return false;
-  }
-  if (hasAttemptTerminalState(params.attempt)) {
-    return false;
-  }
   // Current-attempt evidence avoids blocking on prior committed effects; older
   // harnesses retain the cumulative, fail-closed behavior.
-  if (!isCurrentAttemptReplaySafe(params.attempt)) {
+  if (
+    joinAssistantTexts(params.attempt.assistantTexts).length > 0 ||
+    hasAttemptTerminalState(params.attempt) ||
+    !isCurrentAttemptReplaySafe(params.attempt)
+  ) {
     return false;
   }
 
@@ -101,6 +113,7 @@ function shouldSkipNonVisibleTurnRetry(params: {
   attempt: IncompleteTurnAttempt;
   /** Silent classification can tolerate completed effects, never unfinished work or replay. */
   tolerateSideEffects?: boolean;
+  consumedToolFailure?: boolean;
 }): boolean {
   return Boolean(
     params.aborted ||
@@ -109,7 +122,7 @@ function shouldSkipNonVisibleTurnRetry(params: {
     params.attempt.clientToolCalls ||
     params.attempt.yieldDetected ||
     params.attempt.didSendDeterministicApprovalPrompt ||
-    params.attempt.lastToolError ||
+    (params.attempt.lastToolError && !params.consumedToolFailure) ||
     hasAcceptedSessionSpawn(params.attempt.acceptedSessionSpawns) ||
     params.attempt.itemLifecycle.activeCount > 0 ||
     params.attempt.itemLifecycle.completedCount < params.attempt.itemLifecycle.startedCount ||
@@ -146,42 +159,26 @@ export function shouldTreatEmptyAssistantReplyAsSilent(params: {
  * Builds the retry instruction for reasoning-only turns that consumed provider
  * output budget but produced no visible assistant text.
  */
-export function resolveReasoningOnlyRetryInstruction(params: {
-  provider?: string;
-  modelId?: string;
-  modelApi?: string;
-  executionContract?: string;
-  aborted: boolean;
-  timedOut: boolean;
-  attempt: IncompleteTurnAttempt;
-}): string | null {
-  if (shouldSkipNonVisibleTurnRetry(params)) {
-    return null;
-  }
-
-  if (
-    !shouldApplyNonVisibleTurnRetryGuard({
-      provider: params.provider,
-      modelId: params.modelId,
-      modelApi: params.modelApi,
-      executionContract: params.executionContract,
-    })
-  ) {
+export function resolveReasoningOnlyRetryInstruction(
+  params: IncompleteTurnRecoveryParams,
+): string | null {
+  if (shouldSkipNonVisibleTurnRetry(params) || !shouldApplyNonVisibleTurnRetryGuard(params)) {
     return null;
   }
 
   const assistant = resolveCurrentAttemptAssistant(params.attempt);
-  if (joinAssistantTexts(params.attempt.assistantTexts).length > 0) {
-    return null;
-  }
-  if (assistant?.stopReason === "error") {
-    return null;
-  }
-  if (!isReasoningOnlyAssistantTurn(assistant) && !isUnsignedThinkingOnlyAssistantTurn(assistant)) {
-    return null;
-  }
-
-  return REASONING_ONLY_RETRY_INSTRUCTION;
+  // Unsigned thinking blocks have no cryptographic signature; assessLastAssistantMessage
+  // returns "incomplete-thinking" for them. Empty content also returns "incomplete-thinking",
+  // so the content.length > 0 guard is required to distinguish the two cases.
+  return joinAssistantTexts(params.attempt.assistantTexts).length === 0 &&
+    assistant &&
+    assistant.stopReason !== "error" &&
+    !assistant.openclawDelivery?.tts?.text?.trim() &&
+    Array.isArray(assistant.content) &&
+    assistant.content.length > 0 &&
+    assessLastAssistantMessage(assistant) !== "valid"
+    ? REASONING_ONLY_RETRY_INSTRUCTION
+    : null;
 }
 
 type SettledToolCall = { id: string | null; name: string | null };
@@ -305,22 +302,18 @@ export function resolveSettledToolBatchEvidence(attempt: IncompleteTurnAttempt) 
 }
 
 /** Builds one fresh continuation after settled tools ended without a visible final answer. */
-export function resolveSettledToolTerminalContinuationInstruction(params: {
-  provider?: string;
-  modelId?: string;
-  modelApi?: string;
-  executionContract?: string;
-  allowEmptyStopContinuation?: boolean;
-  payloadCount: number;
-  hasTerminalToolPresentation?: boolean;
-  aborted: boolean;
-  timedOut: boolean;
-  attempt: IncompleteTurnAttempt;
-}): string | null {
+export function resolveSettledToolTerminalContinuationInstruction(
+  params: IncompleteTurnRecoveryParams & {
+    allowEmptyStopContinuation?: boolean;
+    payloadCount: number;
+    hasTerminalToolPresentation?: boolean;
+  },
+): string | null {
   const { attempt } = params;
   const {
     assistant: toolBatchAssistant,
     allToolsProvenSettled,
+    parkedCodeModeRun,
     failedToolNames,
     hasUnsettledToolError,
     intentionalTermination,
@@ -331,6 +324,7 @@ export function resolveSettledToolTerminalContinuationInstruction(params: {
     terminal.phase === "prompt" &&
     terminal.source === "idle" &&
     attempt.currentAttemptReplayMetadata?.hadPotentialSideEffects === true;
+  const assistantState = classifyAssistantTurn(params);
   const emptyStopAfterSettledTools = Boolean(
     params.allowEmptyStopContinuation &&
     attempt.currentAttemptAssistant?.stopReason === "stop" &&
@@ -340,10 +334,14 @@ export function resolveSettledToolTerminalContinuationInstruction(params: {
     attempt.itemLifecycle.completedCount === attempt.itemLifecycle.startedCount &&
     attempt.itemLifecycle.activeCount === 0 &&
     !hasAcceptedSessionSpawn(attempt.acceptedSessionSpawns) &&
-    classifyAssistantTurn(params).emptyResponse,
+    assistantState.emptyResponse,
   );
   if (
     params.payloadCount !== 0 ||
+    // Optional authored silence skips generation without clearing tool failure evidence.
+    (!params.allowEmptyStopContinuation &&
+      assistantState.silent &&
+      assistantState.nonVisibleEligibleForSilentReply) ||
     params.hasTerminalToolPresentation ||
     params.aborted ||
     ((params.timedOut || terminal.kind === "timeout") && !idlePromptTimeout) ||
@@ -352,25 +350,16 @@ export function resolveSettledToolTerminalContinuationInstruction(params: {
       ? !allToolsProvenSettled
       : !emptyStopAfterSettledTools) ||
     intentionalTermination ||
+    parkedCodeModeRun ||
     hasUnsettledToolError ||
     hasAsyncActivity(attempt.toolMetas) ||
     hasAcceptedSessionSpawn(attempt.acceptedSessionSpawns) ||
     attempt.clientToolCalls ||
     attempt.yieldDetected ||
-    attempt.didSendDeterministicApprovalPrompt
-  ) {
-    return null;
-  }
-  if (attempt.hasToolMediaBlockReply || resolveSourceReplyDelivery(attempt) !== "missing") {
-    return null;
-  }
-  if (
-    !shouldApplyNonVisibleTurnRetryGuard({
-      provider: params.provider,
-      modelId: params.modelId,
-      modelApi: params.modelApi,
-      executionContract: params.executionContract,
-    })
+    attempt.didSendDeterministicApprovalPrompt ||
+    attempt.hasToolMediaBlockReply ||
+    resolveSourceReplyDelivery(attempt) !== "missing" ||
+    !shouldApplyNonVisibleTurnRetryGuard(params)
   ) {
     return null;
   }
@@ -383,26 +372,65 @@ export function resolveSettledToolTerminalContinuationInstruction(params: {
  * Builds the retry instruction for empty assistant turns when the provider/model
  * is eligible for non-visible turn recovery.
  */
-export function resolveEmptyResponseRetryInstruction(params: {
-  provider?: string;
-  modelId?: string;
-  modelApi?: string;
-  executionContract?: string;
-  payloadCount: number;
-  aborted: boolean;
-  timedOut: boolean;
-  attempt: IncompleteTurnAttempt;
-}): string | null {
-  if (shouldSkipNonVisibleTurnRetry(params)) {
-    return null;
-  }
-
+export function resolveEmptyResponseRetryInstruction(
+  params: IncompleteTurnRecoveryParams & { payloadCount: number },
+): string | null {
   const assistantState = classifyAssistantTurn(params);
-  if (!assistantState.emptyResponse) {
+  const assistant = assistantState.assistant ?? null;
+  // A pre-dispatch rejection ran nothing. Error turns are never silent replies,
+  // so inspect model output directly rather than the host's failure notice.
+  const rejectedBeforeDispatch =
+    params.attempt.itemLifecycle.completedCount > 0 &&
+    assistantState.visibleText.length === 0 &&
+    !params.attempt.hasToolMediaBlockReply &&
+    resolveSourceReplyDelivery(params.attempt) === "missing" &&
+    assistant?.stopReason === "error" &&
+    (assistant.errorCode === MALFORMED_TOOL_CALL_ARGUMENTS_ERROR_CODE ||
+      isPreDispatchToolCallRejectionMessage(assistant.errorMessage)) &&
+    readSettledToolCalls(assistant).length === 0;
+  let consumedToolFailure = false;
+  if (rejectedBeforeDispatch && params.attempt.lastToolError?.executionStarted === false) {
+    const messages = params.attempt.messagesSnapshot;
+    const failureIndex = messages.findLastIndex(
+      (message) => message.role === "toolResult" && message.isError,
+    );
+    const failure = messages[failureIndex];
+    const latestUserIndex = messages.findLastIndex((message) => message.role === "user");
+    // A later refusal cannot erase an earlier failure that may have caused effects.
+    consumedToolFailure =
+      failureIndex > latestUserIndex &&
+      failureIndex < messages.indexOf(assistant) &&
+      failure?.role === "toolResult" &&
+      failure.toolName === params.attempt.lastToolError.toolName &&
+      messages
+        .slice(latestUserIndex + 1, failureIndex + 1)
+        .every(
+          (message) =>
+            message.role !== "toolResult" ||
+            !message.isError ||
+            readToolEffectReceipt(message)?.state === "not_started",
+        );
+  }
+  if (
+    shouldSkipNonVisibleTurnRetry({
+      ...params,
+      tolerateSideEffects: rejectedBeforeDispatch,
+      consumedToolFailure,
+    })
+  ) {
     return null;
   }
 
-  const assistant = assistantState.assistant ?? null;
+  // A tool-use stop with no structured call executed nothing; its text is not an answer.
+  const toolUseWithoutCall =
+    assistant?.stopReason === "toolUse" &&
+    readSettledToolCalls(assistant).length === 0 &&
+    params.attempt.toolMetas.length === 0 &&
+    params.attempt.itemLifecycle.startedCount === 0;
+  if (!assistantState.emptyResponse && !toolUseWithoutCall && !rejectedBeforeDispatch) {
+    return null;
+  }
+
   if (
     assistant?.stopReason === "stop" &&
     isOllamaIncompleteTurnProvider(params.provider) &&
@@ -412,18 +440,18 @@ export function resolveEmptyResponseRetryInstruction(params: {
   }
 
   if (
-    shouldApplyNonVisibleTurnRetryGuard({
-      provider: params.provider,
-      modelId: params.modelId,
-      modelApi: params.modelApi,
-      executionContract: params.executionContract,
-    }) ||
+    shouldApplyNonVisibleTurnRetryGuard(params) ||
     // Keep the generic zero-usage stop retry for providers that expose a
     // provider-neutral "nothing was generated" signal, even outside the
     // provider allowlist above.
     isZeroUsageEmptyStopAssistantTurn(assistant)
   ) {
-    return EMPTY_RESPONSE_RETRY_INSTRUCTION;
+    if (rejectedBeforeDispatch) {
+      return REJECTED_TOOL_CALL_RETRY_INSTRUCTION;
+    }
+    return toolUseWithoutCall
+      ? TOOL_USE_WITHOUT_CALL_RETRY_INSTRUCTION
+      : EMPTY_RESPONSE_RETRY_INSTRUCTION;
   }
 
   return null;

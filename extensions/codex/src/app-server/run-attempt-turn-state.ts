@@ -172,6 +172,7 @@ export function createCodexAttemptTurnState(resources: CodexAttemptResources) {
   };
   const deadlines = createAgentHarnessAttemptDeadlineController({
     startedAtMs: connection.attemptStartedAt,
+    startedAtMonotonicMs: connection.attemptStartedAtMonotonicMs,
     timeoutMs: params.timeoutMs,
     settlementTimeoutMs: TURN_TERMINAL_SETTLEMENT_TIMEOUT_MS,
     signal: runAbortController.signal,
@@ -232,7 +233,6 @@ export function createCodexAttemptTurnState(resources: CodexAttemptResources) {
     steeringQueueRef,
     completeTurn,
     interruptTurn,
-    renewNativeHookRelayForTurnProgress,
     noteProgress,
     deadlines,
   };

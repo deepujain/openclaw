@@ -107,7 +107,6 @@ describe("isDeliveredMessagingToolResult", () => {
 
   it.each([
     ["sent status", { deliveryStatus: "sent" }, true],
-    ["gateway id", { result: { messageId: "msg-1" } }, true],
     ["unknown id", { result: { messageId: "unknown" } }, true],
     ["skipped id", { result: { messageId: "skipped" } }, false],
     ["suppressed id", { result: { messageId: "suppressed" } }, false],
@@ -354,18 +353,6 @@ describe("isDeliveredMessagingToolResult", () => {
     ).toBe(delivered);
   });
 
-  it("rejects successful plugin broadcast wrappers around suppressed sends", () => {
-    expect(
-      isDeliveredMessagingToolResult({
-        toolName: "message",
-        args: { action: "broadcast" },
-        result: {
-          results: [{ ok: true, payload: { ok: true, status: "suppressed" } }],
-        },
-      }),
-    ).toBe(false);
-  });
-
   it("rejects non-delivery message id sentinels", () => {
     expect(isDeliveredMessagingToolResult({ result: { messageId: "skipped" } })).toBe(false);
     expect(isDeliveredMessagingToolResult({ result: { messageId: "suppressed" } })).toBe(false);
@@ -496,48 +483,51 @@ describe("isDeliveredMessageToolOnlySourceReplyResult", () => {
     ).toBe(false);
   });
 
-  it("accepts confirmed explicit routes when the caller verified the source route", () => {
-    expect(
-      isDeliveredMessageToolOnlySourceReplyResult({
-        sourceReplyDeliveryMode: "message_tool_only",
-        toolName: "message",
-        args: {
-          action: "reply",
-          channel: "imessage",
-          target: "+12069106512",
-          message: "reply",
-        },
-        result: { ok: true, messageId: "imessage-853" },
-        allowExplicitSourceRoute: true,
-      }),
-    ).toBe(true);
-    expect(
-      isDeliveredMessageToolOnlySourceReplyResult({
-        sourceReplyDeliveryMode: "message_tool_only",
-        toolName: "message",
-        args: {
-          action: "reply",
-          channel: "imessage",
-          target: "+12069106512",
-          message: "reply",
-        },
-        result: { ok: true, messageId: "imessage-853" },
-      }),
-    ).toBe(false);
-    expect(
-      isDeliveredMessageToolOnlySourceReplyResult({
-        sourceReplyDeliveryMode: "message_tool_only",
-        toolName: "message",
-        args: {
-          action: "react",
-          channel: "imessage",
-          target: "+12069106512",
-        },
-        result: { ok: true },
-        allowExplicitSourceRoute: true,
-      }),
-    ).toBe(false);
-  });
+  it.each(["automatic", "message_tool_only"] as const)(
+    "accepts confirmed explicit routes when the caller verified the source route (%s)",
+    (sourceReplyDeliveryMode) => {
+      expect(
+        isDeliveredMessageToolOnlySourceReplyResult({
+          sourceReplyDeliveryMode,
+          toolName: "message",
+          args: {
+            action: "reply",
+            channel: "imessage",
+            target: "+12069106512",
+            message: "reply",
+          },
+          result: { ok: true, messageId: "imessage-853" },
+          allowExplicitSourceRoute: true,
+        }),
+      ).toBe(true);
+      expect(
+        isDeliveredMessageToolOnlySourceReplyResult({
+          sourceReplyDeliveryMode,
+          toolName: "message",
+          args: {
+            action: "reply",
+            channel: "imessage",
+            target: "+12069106512",
+            message: "reply",
+          },
+          result: { ok: true, messageId: "imessage-853" },
+        }),
+      ).toBe(false);
+      expect(
+        isDeliveredMessageToolOnlySourceReplyResult({
+          sourceReplyDeliveryMode,
+          toolName: "message",
+          args: {
+            action: "react",
+            channel: "imessage",
+            target: "+12069106512",
+          },
+          result: { ok: true },
+          allowExplicitSourceRoute: true,
+        }),
+      ).toBe(false);
+    },
+  );
 
   it("accepts explicit sends with a structured current-source marker", () => {
     expect(

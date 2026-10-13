@@ -1,3 +1,4 @@
+import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { buildAgentRunTerminalOutcomeFromLifecycleEvent } from "../agent-run-terminal-outcome.js";
 import {
   formatAgentRunRouteChange,
@@ -66,6 +67,7 @@ export function canAdvanceContextEngineTurn(params: {
 
 export function mergeRunEntryExecutionTrace<T extends EmbeddedAgentRunResult>(params: {
   result: T;
+  config: OpenClawConfig;
   terminalStatus: EmbeddedAgentRunEntryTerminal["outcome"]["status"];
   provider: string;
   model: string;
@@ -99,19 +101,12 @@ export function mergeRunEntryExecutionTrace<T extends EmbeddedAgentRunResult>(pa
       attempt.provider === winnerProvider &&
       attempt.model === winnerModel,
   );
-  const attempts = [
-    ...outerAttempts,
-    ...innerAttempts,
-    ...(winnerProvider && winnerModel
-      ? [
-          winnerAttempt ?? {
-            provider: winnerProvider,
-            model: winnerModel,
-            result: "success" as const,
-          },
-        ]
-      : []),
-  ];
+  const attempts = [...outerAttempts, ...innerAttempts];
+  if (winnerProvider && winnerModel) {
+    attempts.push(
+      winnerAttempt ?? { provider: winnerProvider, model: winnerModel, result: "success" },
+    );
+  }
   const terminalReceipt = params.result.meta.agentMeta?.terminalReceipt;
   const requested = { provider: params.requestedProvider, model: params.requestedModel };
   const agentMeta = terminalReceipt
@@ -122,7 +117,7 @@ export function mergeRunEntryExecutionTrace<T extends EmbeddedAgentRunResult>(pa
           requested,
           rerouted:
             terminalReceipt.rerouted ||
-            isProviderModelRerouted(requested, terminalReceipt.effective),
+            isProviderModelRerouted(requested, terminalReceipt.effective, params.config),
         },
       }
     : params.result.meta.agentMeta;
@@ -199,10 +194,7 @@ export function buildRunEntryTerminal(params: {
     normalizedTerminalReceipt?.runId === params.runId
       ? {
           ...normalizedTerminalReceipt,
-          terminalDisposition:
-            terminalReply.disposition === "visible"
-              ? ("visible" as const)
-              : ("not-visible" as const),
+          terminalDisposition: terminalReply.disposition === "visible" ? "visible" : "not-visible",
         }
       : undefined;
   const modelRouteChange = formatAgentRunRouteChange(terminalReceipt, params.runId);
@@ -241,11 +233,10 @@ export function buildRunEntryTerminal(params: {
     if (typeof meta.aborted === "boolean") {
       metadata.aborted = meta.aborted;
     }
-    if (meta.replayInvalid === true) {
-      metadata.replayInvalid = true;
-    }
-    if (meta.yielded === true) {
-      metadata.yielded = true;
+    for (const key of ["replayInvalid", "yielded"] as const) {
+      if (meta[key] === true) {
+        metadata[key] = true;
+      }
     }
   }
   return { outcome, metadata };
@@ -263,8 +254,7 @@ export function preserveFollowupResultForDelivery(
   if (
     !classification ||
     !("code" in classification) ||
-    !classification.code ||
-    !PRESERVED_FOLLOWUP_RESULT_CODES.has(classification.code)
+    !PRESERVED_FOLLOWUP_RESULT_CODES.has(classification.code ?? "")
   ) {
     return classification;
   }

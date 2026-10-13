@@ -4,20 +4,22 @@ import { createMockReplyOperation } from "./test-helpers.js";
 
 const followupTurnTestState = vi.hoisted(() => ({
   execute: vi.fn(),
-  loadEntryReadOnly: vi.fn(),
 }));
 
 vi.mock("./agent-runner-execution.js", () => ({
   executeAgentTurn: (...args: unknown[]) => followupTurnTestState.execute(...args),
 }));
 
+// mock-isolation: Forward the real persistence owners without loading the unrelated accessor barrel graph.
 vi.mock("../../config/sessions/session-accessor.js", async () => {
   const { bindSessionPendingInputSources } =
     await import("../../config/sessions/session-accessor.pending-inputs.js");
+  const { loadSessionEntry, replaceSessionEntry } =
+    await import("../../config/sessions/session-accessor.sqlite-entry.js");
   return {
     bindSessionPendingInputSources,
-    loadSessionEntryReadOnly: (...args: unknown[]) =>
-      followupTurnTestState.loadEntryReadOnly(...args),
+    loadSessionEntry,
+    replaceSessionEntry,
   };
 });
 
@@ -91,7 +93,6 @@ export function createFollowupTurnTestTurn(
 
 export function resetFollowupTurnTestState() {
   vi.clearAllMocks();
-  followupTurnTestState.loadEntryReadOnly.mockReturnValue(undefined);
   followupTurnTestState.execute.mockResolvedValue({
     runId: "run-1",
     outcome: { kind: "rejected", payload: { text: "done" } },

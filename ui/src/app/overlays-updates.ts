@@ -8,8 +8,6 @@ import {
 import { isReportableUpdateRun } from "../../../src/shared/update-outcome.js";
 import { GatewayRequestError } from "../api/gateway.ts";
 import type { UpdateHoldResult } from "../api/types.ts";
-import { controlUiBuildDiffersFrom } from "../build-info.ts";
-import { isConfiguredUiDevGateway } from "../dev-gateway.ts";
 import { t } from "../i18n/index.ts";
 import { formatUiError } from "../lib/format-error.ts";
 import type { ConnectionBootstrapCoordinator } from "./connection-bootstrap.ts";
@@ -25,7 +23,6 @@ import {
   createUpdateStatusRefresher,
   projectUpdateSentinel,
   projectUpdateStatusResponse,
-  projectUpdateCheckoutResponse,
   projectUpdateRunFailure,
   resolveUnknownUpdateOutcomeBanner,
   resolveUpdateStatusBanner,
@@ -84,6 +81,7 @@ export function createApplicationUpdateOverlays(
   let activeHello = gateway.snapshot.hello;
   let connectedSource: NonNullable<typeof activeClient> | null = null;
   let connectedEpoch = 0;
+  let confirmationTargetGeneration = 0;
   let operatorAccess = readGatewayOperatorAccess(gateway.snapshot);
   let updateGatewayScope = gatewayCredentialScope(gateway.connection.gatewayUrl);
   let profileId = gateway.snapshot.selfUser?.id ?? null;
@@ -182,7 +180,7 @@ export function createApplicationUpdateOverlays(
     });
   }
 
-  function publish() {
+  function publish(syncCampaign = false) {
     const campaign = snapshot.updateSchedule?.campaign;
     const applying =
       campaign?.state === "applying" && snapshot.updateRun?.origin.campaignId !== campaign.id;
@@ -199,6 +197,7 @@ export function createApplicationUpdateOverlays(
       ...snapshot,
       diagnosableUpdateFailureId:
         currentFailure &&
+        snapshot.updateRun?.target.installationMethod !== "ocm" &&
         activeClient &&
         isCurrentClient(activeClient) &&
         !snapshot.updateRunning &&
@@ -206,7 +205,9 @@ export function createApplicationUpdateOverlays(
           ? currentFailure.id
           : null,
       reportableUpdateFailureId:
-        snapshot.updateRunning || snapshot.updateReconciliationPending
+        snapshot.updateRunning ||
+        snapshot.updateReconciliationPending ||
+        snapshot.updateRun?.target.installationMethod === "ocm"
           ? null
           : snapshot.updateRun
             ? !isAcknowledgedAbandonedUpdateRun(snapshot.updateRun) &&
@@ -218,6 +219,9 @@ export function createApplicationUpdateOverlays(
               : null,
     };
     onChange();
+    if (syncCampaign) {
+      updateCampaignPoller.sync();
+    }
   }
 
   const publishError = (error: unknown, source?: "read") => {
@@ -257,7 +261,7 @@ export function createApplicationUpdateOverlays(
       recordedUpdateAttempt: failure?.attempt ?? null,
       updateStatusBanner: failure?.banner ?? null,
     };
-    publish();
+    publish(true);
   };
 
   const refreshRun = async () => {
@@ -305,12 +309,9 @@ export function createApplicationUpdateOverlays(
     }
   };
 
-  const applyUpdateStatusResponse = (
-    response: UpdateRestartStatusResponse,
-    preserveInstall = false,
-  ) => {
+  const applyUpdateStatusResponse = (response: UpdateRestartStatusResponse) => {
     const { failure, updateStatusBanner, recordedUpdateAttempt, ...status } =
-      projectUpdateStatusResponse(response, snapshot, preserveInstall);
+      projectUpdateStatusResponse(response, snapshot);
     const run = response.activeRun ?? response.lastRun;
     const history = updateAttempt?.history;
     // A failed history read is not an empty baseline. Until a current identity
@@ -348,7 +349,7 @@ export function createApplicationUpdateOverlays(
   const refreshUpdateStatus = createUpdateStatusRefresher({
     getClient: () => activeClient,
     getEpoch: () => connectedEpoch,
-    getRevision: () => updateStatusRevision,
+    getAuthorization: () => activeHello?.auth,
     canRefresh: () => !disposed && operatorAccess.canAdmin,
     isCurrent: (client, epoch) => epoch === connectedEpoch && isCurrentClient(client),
     onRefreshing: (updateStatusRefreshing) => {
@@ -356,19 +357,6 @@ export function createApplicationUpdateOverlays(
       publish();
     },
     onStatus: applyUpdateStatusResponse,
-    onCheckout: (response, preserveSchedule) => {
-      snapshot = {
-        ...snapshot,
-        ...projectUpdateCheckoutResponse(
-          response,
-          snapshot,
-          preserveSchedule ? "schedule" : undefined,
-        ),
-        updateStatusCheckBanner: null,
-      };
-      publish();
-      updateCampaignPoller.sync();
-    },
     onError: (error, mode) => {
       if (mode === "completion" && snapshot.updateStatusCheckBanner?.mode === "manual") {
         return;
@@ -384,11 +372,20 @@ export function createApplicationUpdateOverlays(
       publish();
     },
   });
+  const hasPendingOcmRun = () => runId?.startsWith("ocm:") && snapshot.updateReconciliationPending;
   const updateCampaignPoller = createUpdateCampaignStatusPoller({
     canPoll: () =>
-      Boolean(activeClient && isCurrentClient(activeClient) && snapshot.updateSchedule?.campaign),
+      Boolean(
+        activeClient &&
+        isCurrentClient(activeClient) &&
+        (snapshot.updateSchedule?.campaign || hasPendingOcmRun()),
+      ),
     refresh: async () => {
-      await refreshUpdateStatus("background");
+      if (hasPendingOcmRun()) {
+        await refreshRun();
+      } else {
+        await refreshUpdateStatus("background");
+      }
     },
   });
   const runConnectionBootstrap = (key: string, task: () => Promise<unknown>) =>
@@ -396,17 +393,21 @@ export function createApplicationUpdateOverlays(
 
   const synchronizeGateway = (next: ApplicationGateway["snapshot"]) => {
     const nextScope = gatewayCredentialScope(gateway.connection.gatewayUrl);
-    const nextProfile = next.selfUser?.id ?? null;
+    // Reconnect can admit hello before users.self resolves; only a known profile retires it.
+    const nextProfile = next.selfUser === undefined ? profileId : (next.selfUser?.id ?? null);
     const nextAccess = readGatewayOperatorAccess(next);
     const accessGranted = !operatorAccess.canAdmin && nextAccess.canAdmin;
     const connected = next.phase === "connected";
     // Disconnects can omit identity. An explicit new auth grant is authoritative
     // even when build-skew fencing delays connection admission.
-    const scopeChanged =
-      nextScope !== updateGatewayScope ||
-      (connected && nextProfile !== profileId) ||
-      (Boolean(next.hello?.auth) && !nextAccess.canAdmin);
+    const targetChanged =
+      nextScope !== updateGatewayScope || (connected && nextProfile !== profileId);
+    const scopeChanged = targetChanged || (Boolean(next.hello?.auth) && !nextAccess.canAdmin);
+    if (targetChanged) {
+      confirmationTargetGeneration++;
+    }
     if (scopeChanged) {
+      connectedEpoch++;
       updateFailureReporter.invalidate();
       updateRunGeneration++;
       updateReadGeneration++;
@@ -475,25 +476,18 @@ export function createApplicationUpdateOverlays(
       publish();
       return;
     }
-    const serverBuildIdentity = {
-      version: next.hello?.server?.version,
-      buildId: next.hello?.server?.buildId,
-      controlUiBuildSource: next.hello?.server?.controlUiBuildSource,
-    };
     snapshot = {
       ...snapshot,
       ...(connectedSourceChanged || helloChanged
         ? projectConnectedUpdateSnapshot(snapshot, next.hello)
         : {}),
-      // Vite owns this document; reloading cannot adopt its proxied Gateway's build.
-      controlUiRefreshRequired: connectedSourceChanged
-        ? !isConfiguredUiDevGateway(gateway.connection.gatewayUrl) &&
-          (Boolean(serverBuildIdentity.buildId?.trim()) || connectedEpoch > 1) &&
-          controlUiBuildDiffersFrom(serverBuildIdentity)
-        : snapshot.controlUiRefreshRequired,
+      // The gateway store owns build staleness: it fences a stale same-origin
+      // hello (projected above) and connects only builds this document may
+      // drive. Cross-origin skew stays unsupported; reloading cannot change a
+      // document that Gateway did not serve (ui/AGENTS.md "Gateway Coupling").
+      controlUiRefreshRequired: false,
     };
-    publish();
-    updateCampaignPoller.sync();
+    publish(true);
     if ((connectedSourceChanged || scopeChanged || accessGranted) && operatorAccess.canAdmin) {
       void runConnectionBootstrap("update-run", () =>
         runId ? refreshRun() : refreshUpdateStatus("background"),
@@ -544,8 +538,7 @@ export function createApplicationUpdateOverlays(
       const previousCampaign = snapshot.updateSchedule?.campaign;
       updateStatusRevision++;
       snapshot = { ...snapshot, ...projectUpdateAvailableEvent(snapshot, payload) };
-      publish();
-      updateCampaignPoller.sync();
+      publish(true);
       if (
         previousCampaign?.state === "applying" &&
         snapshot.updateSchedule?.campaign?.state !== "applying"
@@ -555,6 +548,15 @@ export function createApplicationUpdateOverlays(
     },
     refreshUpdateStatus,
     diagnoseUpdateFailure,
+    captureUpdateTarget(this: void) {
+      const generation = confirmationTargetGeneration;
+      const revision = gateway.connectionRevision;
+      // Keep target identity across reconnects; each action checks its live authority separately.
+      return () =>
+        !disposed &&
+        generation === confirmationTargetGeneration &&
+        revision === gateway.connectionRevision;
+    },
     acknowledgeUpdateRun(this: void) {
       const run = snapshot.updateRun;
       if (run && run.status !== "running") {
@@ -563,7 +565,7 @@ export function createApplicationUpdateOverlays(
         publish();
       }
     },
-    async runUpdate(this: void, options?: { sessionKey?: string }) {
+    async runUpdate(this: void) {
       const client = activeClient;
       if (
         !client ||
@@ -574,7 +576,7 @@ export function createApplicationUpdateOverlays(
         return;
       }
       const generation = ++updateRunGeneration;
-      const sessionKey = options?.sessionKey ?? hooks.getActiveSessionKey?.();
+      const sessionKey = hooks.getActiveSessionKey?.();
       updateStatusRevision++;
       updateReadGeneration++;
       const attempt: UpdateAdmissionAttempt = {
@@ -644,7 +646,7 @@ export function createApplicationUpdateOverlays(
       } finally {
         if (isCurrent()) {
           updateRequestRunning = false;
-          publish();
+          publish(true);
         }
       }
     },
@@ -701,9 +703,7 @@ export function createApplicationUpdateOverlays(
         updateHoldInFlight = false;
       }
     },
-    async reportUpdateFailure(this: void, attemptId: string) {
-      await updateFailureReporter.report(attemptId);
-    },
+    reportUpdateFailure: updateFailureReporter.report,
     dispose() {
       disposed = true;
       updateFailureReporter.invalidate();
