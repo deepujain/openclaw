@@ -55,6 +55,7 @@ import {
 } from "./cli-runner/execute.test-support.js";
 import { writeCliSystemPromptFile } from "./cli-runner/helpers.js";
 import { cliBackendLog } from "./cli-runner/log.js";
+import type { PreparedCliRunContext } from "./cli-runner/types.js";
 
 const executePreparedCliRun = wrapPreparedCliRunWithTestAdmission(executePreparedCliRunImpl);
 
