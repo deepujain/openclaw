@@ -1,0 +1,93 @@
+name: Verify the Settings update repair
+on:
+  push:
+    branches: [proof/pr-200910-b0f0d4a3-7c7d4514]
+permissions: {}
+jobs:
+  proof:
+    if: github.repository == 'deepujain/openclaw' && github.actor == 'deepujain'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        side: [base, candidate]
+    steps:
+      - name: Load only the pinned proof harness
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -m 700 "$RUNNER_TEMP/harness" "$RUNNER_TEMP/work" "$RUNNER_TEMP/result" "$RUNNER_TEMP/verified"
+          cd "$RUNNER_TEMP/harness"
+          git init -q
+          git fetch -q --depth=1 --no-tags https://github.com/deepujain/openclaw.git "$GITHUB_SHA"
+          test "$(git rev-parse FETCH_HEAD)" = "$GITHUB_SHA"
+          git restore --source=FETCH_HEAD --worktree -- proof
+          docker build -t settings-proof - < proof/Dockerfile
+      - name: Test the pinned revision without credentials
+        shell: bash
+        env:
+          SIDE: ${{ matrix.side }}
+        run: |
+          set -euo pipefail
+          marker=$(cat /proc/sys/kernel/random/uuid)
+          printf '::stop-commands::%s\n' "$marker"
+          trap 'printf "::%s::\n" "$marker"' EXIT
+          docker run --rm --init --cap-drop ALL --security-opt no-new-privileges --shm-size=1g \
+            --user "$(id -u):$(id -g)" --workdir /work \
+            --mount "type=bind,src=$RUNNER_TEMP/harness/proof,dst=/proof,readonly" \
+            --mount "type=bind,src=$RUNNER_TEMP/work,dst=/work" \
+            --mount "type=bind,src=$RUNNER_TEMP/result,dst=/result" \
+            --env HOME=/work/home --env CI=true --env NO_COLOR=1 --env GIT_TERMINAL_PROMPT=0 \
+            settings-proof bash /proof/validate.sh "$SIDE"
+      - name: Open built Settings against the loopback Gateway
+        shell: bash
+        env:
+          SIDE: ${{ matrix.side }}
+        run: |
+          set -euo pipefail
+          marker=$(cat /proc/sys/kernel/random/uuid)
+          printf '::stop-commands::%s\n' "$marker"
+          trap 'printf "::%s::\n" "$marker"' EXIT
+          docker run --rm --init --network none --cap-drop ALL --security-opt no-new-privileges --shm-size=1g \
+            --user "$(id -u):$(id -g)" --workdir /work/source \
+            --mount "type=bind,src=$RUNNER_TEMP/harness/proof,dst=/proof,readonly" \
+            --mount "type=bind,src=$RUNNER_TEMP/work,dst=/work" \
+            --mount "type=bind,src=$RUNNER_TEMP/result,dst=/result" \
+            --env HOME=/work/home --env CI=true --env CHROMIUM_PATH=/usr/bin/chromium --env PROOF_CHROMIUM_NO_SANDBOX=1 \
+            settings-proof node /proof/built-settings-proof.mjs "$SIDE" /work/source /result
+      - name: Check artifact files before upload
+        shell: bash
+        env:
+          SIDE: ${{ matrix.side }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/result"
+          names=("settings-$SIDE.png" "settings-recovery-$SIDE.png")
+          if [[ $SIDE == candidate ]]; then names+=(predicates.js SHA256SUMS tree.txt); fi
+          for name in "${names[@]}"; do
+            test -f "$name" && test ! -L "$name" && test "$(stat -c '%h' "$name")" = 1 || exit 1
+            size=$(stat -c '%s' "$name"); (( size > 0 && size < 32000000 )) || exit 1
+            cp -- "$name" "$RUNNER_TEMP/verified/$name"
+          done
+          cd "$RUNNER_TEMP/verified"
+          for image in "settings-$SIDE.png" "settings-recovery-$SIDE.png"; do
+            test "$(od -An -N8 -tx1 "$image" | tr -d ' \n')" = 89504e470d0a1a0a
+          done
+          if [[ $SIDE == candidate ]]; then
+            test "$(wc -c < SHA256SUMS)" -eq 80
+            LC_ALL=C grep -Ex '[0-9a-f]{64}  predicates\.js' SHA256SUMS
+            sha256sum -c SHA256SUMS
+            test "$(wc -l < tree.txt)" -eq 4
+            grep -Fxq 'base=b0f0d4a3f9c1426a1501e97dee51546b7d4ddcec' tree.txt
+            grep -Fxq 'head=7c7d4514405ea59b21f31b68b26b0dcfdca964e0' tree.txt
+            grep -Eq '^tree=[0-9a-f]{40}$' tree.txt
+            grep -Fxq "blob=$(git hash-object predicates.js)" tree.txt
+          fi
+      - name: Save the validated evidence
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: settings-200910-b0f0d4a3-7c7d4514-${{ matrix.side }}
+          path: ${{ runner.temp }}/verified/
+          retention-days: 5
+          if-no-files-found: error
