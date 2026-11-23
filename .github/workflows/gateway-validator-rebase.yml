@@ -1,0 +1,88 @@
+name: Gateway validator rebase proof
+on:
+  push:
+    branches: [proof/pr-200910-04173e59-7c7d4514]
+permissions: {}
+jobs:
+  proof:
+    if: github.repository == 'deepujain/openclaw' && github.actor == 'deepujain'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Reproduce the conflict, regenerate and test the candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -m 700 "$RUNNER_TEMP/candidate" "$RUNNER_TEMP/result"
+          marker=$(cat /proc/sys/kernel/random/uuid)
+          printf '::stop-commands::%s\n' "$marker"
+          trap 'printf "::%s::\n" "$marker"' EXIT
+          docker run --rm -i --cap-drop ALL --security-opt no-new-privileges --user "$(id -u):$(id -g)" \
+            --mount "type=bind,src=$RUNNER_TEMP/candidate,dst=/work" \
+            --mount "type=bind,src=$RUNNER_TEMP/result,dst=/result" \
+            --env HOME=/work/home --env CI=true --env GIT_TERMINAL_PROMPT=0 \
+            --workdir /work node:24.22.1-bookworm bash -seu -o pipefail <<'PROVE'
+          base=04173e5977247578869e6b1746c6f51ed8856450
+          head=7c7d4514405ea59b21f31b68b26b0dcfdca964e0
+          parent=d5c8befeec1f17c437969e3ec983144e4edf847c
+          output=packages/gateway-protocol/src/compiled/protocol.generated/predicates.js
+          mkdir -m 700 "$HOME"
+          git init -q source
+          cd source
+          git config user.name 'Deepak Jain'
+          git config user.email 'deepujain@gmail.com'
+          git fetch --no-tags --depth=1 https://github.com/openclaw/openclaw.git "$base"
+          test "$(git rev-parse FETCH_HEAD)" = "$base"
+          git fetch --no-tags --depth=2 https://github.com/deepujain/openclaw.git "$head"
+          test "$(git rev-parse FETCH_HEAD)" = "$head"
+          test "$(git rev-parse "$head^")" = "$parent"
+          git checkout -q --detach "$head"
+          if git rebase --onto "$base" "$parent"; then echo 'Expected a conflict, got a clean rebase.' >&2; exit 1; fi
+          test "$(git rev-parse HEAD)" = "$base"
+          test "$(git rev-parse REBASE_HEAD)" = "$head"
+          test "$(git diff --name-only --diff-filter=U)" = "$output"
+          git ls-files --unmerged -- "$output"
+          git checkout --ours -- "$output"
+          export PROTOCOL_SINCE_BASE_SHA="$base"
+          export PATH="$HOME/tools/node_modules/.bin:$PATH"
+          npm install --prefix "$HOME/tools" --no-audit --no-fund pnpm@12.15.0 bun@1.4.4
+          node --version; pnpm --version
+          pnpm install --frozen-lockfile
+          pnpm gateway:validators:gen
+          git add -- "$output"
+          git diff --exit-code
+          git diff --cached --check "$base"
+          tree=$(git write-tree)
+          blob=$(git rev-parse ":$output")
+          test "$blob" != "$(git rev-parse "$base:$output")"
+          test "$blob" != "$(git rev-parse "$head:$output")"
+          digest=$(sha256sum "$output" | cut -d' ' -f1)
+          printf 'base=%s\nhead=%s\ntree=%s\nblob=%s\nsha256=%s\n' "$base" "$head" "$tree" "$blob" "$digest"
+          time pnpm protocol:check
+          time pnpm test src/gateway/server-methods/update-status-schedule.test.ts --maxWorkers=1
+          time pnpm test ui/src/pages/config/updates-actions.test.tsx --maxWorkers=1
+          time pnpm build:ci-artifacts
+          git diff --check
+          git diff --exit-code
+          git diff --cached --check "$base"
+          test "$(git write-tree)" = "$tree"
+          test "$(git hash-object "$output")" = "$blob"
+          git cat-file blob "$blob" > /result/predicates.js
+          printf '%s  predicates.js\n' "$digest" > /result/SHA256SUMS
+          printf 'base=%s\nhead=%s\ntree=%s\nblob=%s\n' "$base" "$head" "$tree" "$blob" > /result/tree.txt
+          PROVE
+          cd "$RUNNER_TEMP/result"
+          for name in predicates.js SHA256SUMS tree.txt; do test ! -L "$name" && test -f "$name" || exit 1; done
+          test "$(wc -c < SHA256SUMS)" -eq 80
+          LC_ALL=C grep -Ex '[0-9a-f]{64}  predicates\.js' SHA256SUMS
+          sha256sum -c SHA256SUMS
+      - name: Save generated validator and tested tree identity
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: gateway-validator-200910-04173e59-7c7d4514
+          path: |
+            ${{ runner.temp }}/result/predicates.js
+            ${{ runner.temp }}/result/SHA256SUMS
+            ${{ runner.temp }}/result/tree.txt
+          retention-days: 5
+          if-no-files-found: error
