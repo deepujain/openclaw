@@ -1,17 +1,17 @@
-name: Verify the Settings update repair
+name: Verify the Settings update review fixes
 on:
   push:
     branches: [proof/pr-200910-b0f0d4a3-7c7d4514]
 permissions: {}
 jobs:
   proof:
-    if: github.repository == 'deepujain/openclaw' && github.actor == 'deepujain'
+    if: github.repository == 'deepujain/openclaw' && github.actor == 'deepujain' && github.event.before == '0b6c6d91f7f7021194c779319d7b3fe04e2bf98a'
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
-        side: [base, candidate]
+        side: [candidate]
     steps:
       - name: Load only the pinned proof harness
         shell: bash
@@ -22,7 +22,9 @@ jobs:
           git init -q
           git fetch -q --depth=1 --no-tags https://github.com/deepujain/openclaw.git "$GITHUB_SHA"
           test "$(git rev-parse FETCH_HEAD)" = "$GITHUB_SHA"
+          test "$(git cat-file -p FETCH_HEAD | sed -n '/^$/q;s/^parent //p')" = 0b6c6d91f7f7021194c779319d7b3fe04e2bf98a
           git restore --source=FETCH_HEAD --worktree -- proof
+          python3 -IB proof/review.py inputs
           docker build -t settings-proof - < proof/Dockerfile
       - name: Test the pinned revision without credentials
         shell: bash
@@ -56,13 +58,16 @@ jobs:
           test "$(wc -c < SHA256SUMS)" -eq 80
           LC_ALL=C grep -Ex '[0-9a-f]{64}  predicates\.js' SHA256SUMS
           sha256sum -c SHA256SUMS
+          pins=$(python3 -IB "$RUNNER_TEMP/harness/proof/review.py" pins)
+          read -r tree expected_blob <<< "$pins"
+          test "$(git hash-object predicates.js)" = "$expected_blob"
           printf '%s\n' 'base=b0f0d4a3f9c1426a1501e97dee51546b7d4ddcec' 'head=7c7d4514405ea59b21f31b68b26b0dcfdca964e0' \
-            'tree=0ea8cb4d0192111ffa234d77fe63a01bbe0c20af' "blob=$(git hash-object predicates.js)" | cmp - tree.txt
+            "tree=$tree" "blob=$expected_blob" | cmp - tree.txt
       - name: Save the tested validator before the browser check
         if: matrix.side == 'candidate'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
-          name: validator-200910-b0f0d4a3-7c7d4514
+          name: validator-200910-round4-rereview
           path: ${{ runner.temp }}/validator/
           retention-days: 5
           if-no-files-found: error
@@ -102,7 +107,7 @@ jobs:
       - name: Save the validated evidence
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
-          name: settings-200910-b0f0d4a3-7c7d4514-${{ matrix.side }}
+          name: settings-200910-round4-rereview-${{ matrix.side }}
           path: ${{ runner.temp }}/verified/
           retention-days: 5
           if-no-files-found: error

@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "red": [
+    {"file":"src/gateway/server-methods/update-status-schedule.test.ts","title":"observes a stable package's host marker being added, edited, and removed without remote discovery","assertionContains":"to deeply equal"},
+    {"file":"ui/src/app/update-confirmation.runtime.test.ts","title":"retains the previous failed run when a retry is cancelled: disconnect during drain","assertionContains":"to be null"},
+    {"file":"ui/src/app/update-confirmation.runtime.test.ts","title":"offers a host-owned retry only with a native route: false","assertionContains":"expected true to be false"},
+    {"file":"ui/src/app/update-confirmation.runtime.test.ts","title":"keeps diagnostics without a connection error when retry discovers host ownership","assertionContains":"Retry update"}
+  ],
+  "focused": ["ui/src/app/overlays-update-race.test.ts","ui/src/app/overlays-update-continuity.test.ts","src/infra/update-startup-host-owned.test.ts","src/infra/update-install-status.test.ts","packages/gateway-protocol/src/schema/config.test.ts"]
+}

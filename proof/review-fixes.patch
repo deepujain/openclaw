@@ -1,0 +1,466 @@
+diff --git a/src/gateway/server-methods/update-status-schedule.test.ts b/src/gateway/server-methods/update-status-schedule.test.ts
+index 26aa5d4f08e866c4c893b4c6212ea2738d555715..6e63ab1cf373268cad8e725b147ea9ee26f9ce6f 100644
+--- a/src/gateway/server-methods/update-status-schedule.test.ts
++++ b/src/gateway/server-methods/update-status-schedule.test.ts
+@@ -386,6 +386,54 @@ it("keeps refreshed host guidance for subsequent status reads on dev", async ()
+   expect(install).toHaveBeenCalledTimes(2);
+ });
+ 
++it("observes a stable package's host marker being added, edited, and removed without remote discovery", async () => {
++  vi.stubEnv("OPENCLAW_NO_AUTO_UPDATE", undefined);
++  const config = makeConfig("stable", true);
++  const root = "/opt/OpenClaw.app/openclaw";
++  const pkg = installAt("package", root);
++  const owner = createMacosAppInstallOwner();
++  install.mockResolvedValueOnce(pkg);
++  await lifecycle.initialize();
++  stalePackageSchedule("stable");
++  install.mockClear();
++  const { scheduleChanged } = trackNotifications();
++
++  for (const updateHint of [owner.updateHint, "Choose Check for Updates in OpenClaw.app."]) {
++    install.mockResolvedValueOnce(
++      installAt("host", root, { installOwner: { ...owner, updateHint } }),
++    );
++    const refreshed = await status(config, { refreshCheckout: true });
++    expect(refreshed.schedule).toEqual({
++      channel: "stable",
++      autoEnabled: false,
++      install: {
++        kind: "host",
++        host: { owner: owner.owner, displayName: owner.displayName, updateHint },
++      },
++    });
++    expect(getUpdateSchedule()).toEqual(refreshed.schedule);
++    expect(scheduleChanged).toHaveBeenLastCalledWith(refreshed.schedule);
++    expect((await status(config)).schedule).toEqual(refreshed.schedule);
++  }
++
++  install.mockResolvedValueOnce(pkg);
++  const removed = await status(config, { refreshCheckout: true });
++  expect(removed.schedule).toEqual({
++    channel: "stable",
++    autoEnabled: true,
++    install: { kind: "package" },
++  });
++  expect(getUpdateSchedule()).toEqual(removed.schedule);
++  expect(scheduleChanged).toHaveBeenNthCalledWith(3, removed.schedule);
++  expect((await status(config)).schedule).toEqual(removed.schedule);
++  expect(scheduleChanged).toHaveBeenCalledTimes(3);
++  expect(install.mock.calls.map(([fetchRemoteGit]) => fetchRemoteGit)).toEqual([
++    false,
++    false,
++    false,
++  ]);
++});
++
+ it.for([false, true])(
+   "preserves a no-op refresh after initialization (applying=%s)",
+   async (applying, { signal }) => {
+diff --git a/src/infra/update-status-schedule.ts b/src/infra/update-status-schedule.ts
+index 1588ed05daab0ab78b71cc4004b203ba523fc4ad..bf59ec95ecdf91095f506672c0ba87fe360f105c 100644
+--- a/src/infra/update-status-schedule.ts
++++ b/src/infra/update-status-schedule.ts
+@@ -14,6 +14,7 @@ import {
+   resolveStartupInstallStatus,
+   withUpdateInstallStatus,
+ } from "./update-install-status.js";
++import type { StartupInstallStatus } from "./update-install-status.types.js";
+ import { canRunDevGitCampaign, resolveDevGitUpdate } from "./update-startup-refresh.js";
+ import {
+   getUpdateSchedule,
+@@ -23,6 +24,14 @@ import {
+   withoutUpdateCampaign,
+ } from "./update-status-state.js";
+ 
++function isConfiguredAutoUpdateEnabled(cfg: OpenClawConfig): boolean {
++  return (
++    Boolean(cfg.update?.auto?.enabled) &&
++    cfg.update?.checkOnStart !== false &&
++    !isTruthyEnvValue(process.env.OPENCLAW_NO_AUTO_UPDATE)
++  );
++}
++
+ /** Projects scheduler facts independently of optional checkout discovery. */
+ export function getGatewayUpdateSchedule(
+   cfg: OpenClawConfig,
+@@ -40,10 +49,7 @@ export function getGatewayUpdateSchedule(
+       : { channel };
+   const result = {
+     ...facts,
+-    autoEnabled:
+-      Boolean(cfg.update?.auto?.enabled) &&
+-      cfg.update?.checkOnStart !== false &&
+-      !isTruthyEnvValue(process.env.OPENCLAW_NO_AUTO_UPDATE),
++    autoEnabled: isConfiguredAutoUpdateEnabled(cfg),
+     ...(campaign ? { campaign } : {}),
+   };
+   const install = currentUpdateCheckLifecycle().installStatus;
+@@ -66,6 +72,7 @@ export function refreshGatewayUpdateStatus(getConfig: () => OpenClawConfig): Pro
+   const refresh = lifecycle
+     .run(async (signal) => {
+       const scheduleAtStart = getUpdateSchedule();
++      const cachedInstall = lifecycle.installStatus;
+       const configured = normalizeUpdateChannel(cfg.update?.channel);
+       const channel =
+         configured ??
+@@ -73,8 +80,22 @@ export function refreshGatewayUpdateStatus(getConfig: () => OpenClawConfig): Pro
+           currentVersion: VERSION,
+           ...(await lifecycle.initialize()).status,
+         }).channel;
+-      if (channel !== "dev" && (await lifecycle.initialize()).status.installKind !== "immutable") {
+-        return;
++      let localInstall: StartupInstallStatus | undefined;
++      if (channel !== "dev") {
++        const initialized = await lifecycle.initialize();
++        if (initialized.status.installKind !== "immutable") {
++          localInstall =
++            initialized === cachedInstall
++              ? await resolveStartupInstallStatus(false, signal)
++              : initialized;
++          if (
++            initialized.status.installKind !== "host" &&
++            localInstall.status.installKind !== "host" &&
++            localInstall.status.installKind !== "immutable"
++          ) {
++            return;
++          }
++        }
+       }
+       const assertCurrent = () => {
+         const schedule = getUpdateSchedule();
+@@ -90,12 +111,14 @@ export function refreshGatewayUpdateStatus(getConfig: () => OpenClawConfig): Pro
+         }
+       };
+       assertCurrent();
+-      const { root, status, installReceipt } = await resolveStartupInstallStatus(true, signal);
++      const { root, status, installReceipt } =
++        localInstall ?? (await resolveStartupInstallStatus(true, signal));
+       assertCurrent();
+       const unavailable =
+         status.error ||
+         (channel === "dev" && status.installKind === "unknown") ||
+-        resolveGitScheduleStatus(status, installReceipt, root)?.status === "unavailable";
++        (!localInstall &&
++          resolveGitScheduleStatus(status, installReceipt, root)?.status === "unavailable");
+       // A failed remote fetch does not invalidate freshly read local Git identity.
+       const identityUnavailable =
+         status.error ||
+@@ -117,17 +140,18 @@ export function refreshGatewayUpdateStatus(getConfig: () => OpenClawConfig): Pro
+           (status.installKind === "host" ||
+             lifecycle.installStatus?.status.installKind !== status.installKind ||
+             refreshedChannel !== channel)) ||
++        (!status.error && lifecycle.installStatus?.status.installKind === "host") ||
+         lifecycle.installStatus?.status.installKind === "immutable" ||
+         status.installKind === "immutable"
+       ) {
+         lifecycle.installStatus = { root, status, installReceipt };
+       }
+       const schedule = getUpdateSchedule();
+-      const current =
+-        schedule?.channel === refreshedChannel
+-          ? schedule
+-          : { channel: refreshedChannel, autoEnabled: Boolean(getConfig().update?.auto?.enabled) };
+-      const next = withUpdateInstallStatus(current, status, true, installReceipt, root);
++      const current = {
++        ...(schedule?.channel === refreshedChannel ? schedule : { channel: refreshedChannel }),
++        autoEnabled: isConfiguredAutoUpdateEnabled(getConfig()),
++      };
++      const next = withUpdateInstallStatus(current, status, !localInstall, installReceipt, root);
+       const publishSchedule = (published: UpdateScheduleState) =>
+         setUpdateScheduleCache({
+           next: published,
+@@ -142,7 +166,7 @@ export function refreshGatewayUpdateStatus(getConfig: () => OpenClawConfig): Pro
+         }
+         throw new Error("The latest Dev update could not be checked. Try again.");
+       }
+-      if (refreshedChannel !== "dev" || status.installKind !== "git") {
++      if (localInstall || refreshedChannel !== "dev" || status.installKind !== "git") {
+         // A package check preserves supported package availability, never a
+         // target or campaign owned by a Git checkout that no longer exists.
+         if (status.installKind === "package" && schedule?.target?.kind !== "git") {
+diff --git a/ui/src/app/overlays-updates.ts b/ui/src/app/overlays-updates.ts
+index eb4b5fa612c6839d169684df362c69d29cf5a3f2..b6b1d0d1eed7782edaa8419bea868356fdd2ecf5 100644
+--- a/ui/src/app/overlays-updates.ts
++++ b/ui/src/app/overlays-updates.ts
+@@ -417,7 +417,12 @@ export function createApplicationUpdateOverlays(
+     const targetChanged =
+       nextScope !== updateGatewayScope || (connected && nextProfile !== profileId);
+     const scopeChanged = targetChanged || (Boolean(next.hello?.auth) && !nextAccess.canAdmin);
+-    if (targetChanged) {
++    const nextConnectedSource = connected ? next.client : null;
++    const connectedSourceChanged = connectedSource !== nextConnectedSource;
++    if (
++      targetChanged ||
++      (updateRequestPhase === "draining" && (connectedSourceChanged || scopeChanged))
++    ) {
+       confirmationTargetGeneration++;
+     }
+     if (scopeChanged) {
+@@ -444,8 +449,6 @@ export function createApplicationUpdateOverlays(
+     if (connected) {
+       profileId = nextProfile;
+     }
+-    const nextConnectedSource = connected ? next.client : null;
+-    const connectedSourceChanged = connectedSource !== nextConnectedSource;
+     const helloChanged = activeHello !== next.hello;
+     operatorAccess = nextAccess;
+     activeClient = next.client;
+@@ -562,7 +565,7 @@ export function createApplicationUpdateOverlays(
+     captureUpdateTarget(this: void) {
+       const generation = confirmationTargetGeneration;
+       const revision = gateway.connectionRevision;
+-      // Keep target identity across reconnects; each action checks its live authority separately.
++      // Reconnect retains the target unless it interrupted admission before dispatch.
+       return () =>
+         !disposed &&
+         generation === confirmationTargetGeneration &&
+diff --git a/ui/src/app/update-confirmation.runtime.test.ts b/ui/src/app/update-confirmation.runtime.test.ts
+index f166b9ec2b68e2a384b1d785a3e73334f5a5ae7b..ffae38e94870a83af9a0c71deea6d83ecdec9e44 100644
+--- a/ui/src/app/update-confirmation.runtime.test.ts
++++ b/ui/src/app/update-confirmation.runtime.test.ts
+@@ -343,9 +343,9 @@ it("keeps a repeated request from stacking a second confirmation or update", asy
+   expect(first.startGatewayUpdate).toHaveBeenCalledOnce();
+ });
+ 
+-it.each(["before confirmation", "during the config drain"] as const)(
+-  "retains the previous failed run when host ownership cancels a retry %s",
+-  async (timing) => {
++it.each(["host before confirmation", "host during drain", "disconnect during drain"] as const)(
++  "retains the previous failed run when a retry is cancelled: %s",
++  async (trigger) => {
+     const drain = createDeferred();
+     const previous = createUpdateRunFixture({
+       status: "failed",
+@@ -361,11 +361,11 @@ it.each(["before confirmation", "during the config drain"] as const)(
+     const overlays = createApplicationOverlays(harness.gateway, {
+       drainConfigWrites: () => drain.promise,
+     });
+-    const expectPreviousFailure = () =>
++    const expectPreviousFailure = (connected = true) =>
+       expect(overlays.snapshot).toMatchObject({
+         updateRun: previous,
+         recordedUpdateAttempt: { reason: "build-failed" },
+-        diagnosableUpdateFailureId: previous.runId,
++        diagnosableUpdateFailureId: connected ? previous.runId : null,
+         reportableUpdateFailureId: previous.runId,
+       });
+     let operation: Promise<void> | undefined;
+@@ -381,10 +381,10 @@ it.each(["before confirmation", "during the config drain"] as const)(
+     });
+     try {
+       const { modal } = await getRenderedModalDialog(document.body);
+-      await waitForSolid(expectPreviousFailure);
++      await waitForSolid(() => expectPreviousFailure());
+       const statusReads = () => request.mock.calls.filter(([method]) => method === "update.status");
+       const initialReads = statusReads().length;
+-      if (timing === "during the config drain") {
++      if (trigger !== "host before confirmation") {
+         findButton("Update and restart").click();
+         expect(overlays.snapshot.updateRunning).toBe(true);
+       }
+@@ -400,10 +400,14 @@ it.each(["before confirmation", "during the config drain"] as const)(
+           },
+         },
+       };
+-      harness.emitEvent("update.available", { schedule });
+-      if (timing === "before confirmation") {
+-        findButton("Update and restart").click();
++      if (trigger === "disconnect during drain") {
++        harness.update({ phase: "reconnecting" });
+       } else {
++        harness.emitEvent("update.available", { schedule });
++      }
++      if (trigger === "host before confirmation") {
++        findButton("Update and restart").click();
++      } else if (trigger === "host during drain") {
+         flush();
+         expect(modal.textContent).toContain("Starting update…");
+         expect(modal.querySelector(".update-run-view")).toBeNull();
+@@ -412,8 +416,11 @@ it.each(["before confirmation", "during the config drain"] as const)(
+       await operation;
+       expect(request.mock.calls.map(([method]) => method)).not.toContain("update.run");
+       expect(document.querySelector("openclaw-modal-dialog")).toBeNull();
+-      expectPreviousFailure();
++      expectPreviousFailure(trigger !== "disconnect during drain");
+       expect(statusReads()).toHaveLength(initialReads);
++      if (trigger === "disconnect during drain") {
++        harness.update({ phase: "connected" });
++      }
+       await overlays.refreshUpdateStatus();
+       expectPreviousFailure();
+     } finally {
+@@ -731,6 +738,77 @@ it.each([
+   },
+ );
+ 
++it.each([false, true])("offers a host-owned retry only with a native route: %s", async (native) => {
++  const run = createUpdateRunFixture({
++    status: "failed",
++    phase: "finished",
++    finishedAtMs: 4_000,
++    reason: "build-failed",
++  });
++  const stream = createProgressStream({ run, hostManaged: true });
++  const postMessage = installNativeBridge();
++  const prepareRetry = vi.fn(async () => null);
++  const { settled, startGatewayUpdate } = startUpdate({
++    existingRun: run,
++    prepareRetry,
++    ...(native ? { prepareGatewayFallback: prepareRetry } : {}),
++    watchUpdateProgress: stream.watchUpdateProgress,
++    onCheckStatus: vi.fn(async () => true),
++    onReviewUpdate: vi.fn(),
++  });
++  const { modal } = await getRenderedModalDialog(document.body);
++  const retry = [...modal.querySelectorAll("button")].find(
++    (button) => button.textContent?.trim() === "Retry update",
++  );
++  expect(Boolean(retry)).toBe(native);
++  expect(findButton("Check status").disabled).toBe(false);
++  expect(findButton("Review update").disabled).toBe(false);
++  if (native) {
++    findButton("Retry update").click();
++    flush();
++    findButton("Update Mac app and restart").click();
++    expect(postMessage).toHaveBeenCalledOnce();
++  } else {
++    findButton("Close").click();
++  }
++  await settled;
++  expect(prepareRetry).not.toHaveBeenCalled();
++  expect(startGatewayUpdate).not.toHaveBeenCalled();
++});
++
++it("keeps diagnostics without a connection error when retry discovers host ownership", async () => {
++  const run = createUpdateRunFixture({
++    status: "failed",
++    phase: "finished",
++    finishedAtMs: 4_000,
++    reason: "build-failed",
++  });
++  const stream = createProgressStream({ run });
++  const prepareRetry = vi.fn(async () => {
++    await stream.push({ run, hostManaged: true });
++    return null;
++  });
++  const { settled, startGatewayUpdate } = startUpdate({
++    existingRun: run,
++    prepareRetry,
++    watchUpdateProgress: stream.watchUpdateProgress,
++    onCheckStatus: vi.fn(async () => true),
++    onReviewUpdate: vi.fn(),
++  });
++  const { modal } = await getRenderedModalDialog(document.body);
++  findButton("Retry update").click();
++  await flushMicrotasks();
++  flush();
++  expect(prepareRetry).toHaveBeenCalledOnce();
++  expect(modal.textContent).not.toContain("Retry update");
++  expect(modal.textContent).not.toContain("Couldn’t refresh update status");
++  expect(findButton("Check status").disabled).toBe(false);
++  expect(findButton("Review update").disabled).toBe(false);
++  expect(startGatewayUpdate).not.toHaveBeenCalled();
++  findButton("Close").click();
++  await settled;
++});
++
+ it.each([
+   { status: "running", entry: "existing" },
+   { status: "failed", entry: "existing" },
+diff --git a/ui/src/app/update-confirmation.runtime.tsx b/ui/src/app/update-confirmation.runtime.tsx
+index f59fc33f12a99f1e04f31c7d578ad95ee2f595b0..8e693c2c630dbe974ef778fa73a3a13d9895ced6 100644
+--- a/ui/src/app/update-confirmation.runtime.tsx
++++ b/ui/src/app/update-confirmation.runtime.tsx
+@@ -143,6 +143,17 @@ export async function confirmAndStartUpdateRuntime(
+     };
+     updateDialogOpen = true;
+ 
++    function hasNativeRoute() {
++      return Boolean(
++        (params.viaNativeApp || params.prepareGatewayFallback) && hasNativeUpdateBridge(),
++      );
++    }
++
++    function canRetry() {
++      const hostManaged = latestProgress?.hostManaged ?? Boolean(updateSchedule?.install?.host);
++      return !hostManaged || (hasNativeRoute() && params.canStartNativeUpdate?.() === true);
++    }
++
+     function readView() {
+       const current = phase;
+       const route = viaNativeApp
+@@ -185,6 +196,7 @@ export async function confirmAndStartUpdateRuntime(
+         working,
+         finished,
+         failed,
++        canRetry: failed && canRetry(),
+         statusRead,
+         readError,
+         showRecovery,
+@@ -358,7 +370,7 @@ export async function confirmAndStartUpdateRuntime(
+                       )}
+                     </button>
+                   </Show>
+-                  <Show when={view.failed}>
++                  <Show when={view.canRetry}>
+                     <button
+                       type="button"
+                       class="btn primary"
+@@ -396,6 +408,9 @@ export async function confirmAndStartUpdateRuntime(
+           return false;
+         }
+         if (!target) {
++          if (phase.kind !== "confirm" && !canRetry()) {
++            return false;
++          }
+           throw new Error(t("updates.dialog.statusNotRefreshed"));
+         }
+         ({ updateAvailable, updateSchedule } = target);
+@@ -424,11 +439,7 @@ export async function confirmAndStartUpdateRuntime(
+     }
+ 
+     function restoreNativeOwner(): "unchanged" | "restored" | "denied" {
+-      if (
+-        (!params.viaNativeApp && !params.prepareGatewayFallback) ||
+-        viaNativeApp ||
+-        !hasNativeUpdateBridge()
+-      ) {
++      if (viaNativeApp || !hasNativeRoute()) {
+         return "unchanged";
+       }
+       if (!checkNativePermission()) {
+@@ -440,13 +451,13 @@ export async function confirmAndStartUpdateRuntime(
+     }
+ 
+     async function retry() {
+-      if (checkingStatus || latestProgress?.connected === false || !retainTarget()) {
++      if (checkingStatus || latestProgress?.connected === false || !retainTarget() || !canRetry()) {
+         return;
+       }
+       if (restoreNativeOwner() === "denied") {
+         return;
+       }
+-      if (prepareRetry && !(await refreshTarget(prepareRetry))) {
++      if (prepareRetry && (!(await refreshTarget(prepareRetry)) || !canRetry())) {
+         return;
+       }
+       phase = { kind: "confirm" };
+@@ -543,9 +554,14 @@ export async function confirmAndStartUpdateRuntime(
+         if (phase.kind === "confirm") {
+           return;
+         }
+-        if (phase.kind === "working" && progress.hostManaged && !progress.busy) {
+-          close();
+-          return;
++        if (phase.kind === "working") {
++          if (!retainTarget()) {
++            return;
++          }
++          if (progress.hostManaged && !progress.busy) {
++            close();
++            return;
++          }
+         }
+         if (progress.run && (!staleFailure || progress.run.status === "running")) {
+           sawBusy = true;

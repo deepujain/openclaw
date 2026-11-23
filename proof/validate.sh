@@ -56,10 +56,17 @@ if [[ $side == candidate ]]; then
   blob=$(git rev-parse ":$validator")
   test "$blob" != "$(git rev-parse "$base:$validator")"
   test "$blob" != "$(git rev-parse "$head:$validator")"
+  test "$tree" = 0ea8cb4d0192111ffa234d77fe63a01bbe0c20af
+  test "$blob" = efdf8e8442a7087e14e856b04d02932b7dcbbfac
+  python3 -IB /proof/review.py red-then-apply
+  pins=$(python3 -IB /proof/review.py pins)
+  read -r tree blob <<< "$pins"
+  test "$(git write-tree)" = "$tree"
+  test "$(git rev-parse ":$validator")" = "$blob"
+  time pnpm gateway:validators:check
   time pnpm protocol:check
-  time pnpm test src/gateway/server-methods/update-status-schedule.test.ts --maxWorkers=1
-  time pnpm test "$actions" --maxWorkers=1
-  time pnpm test "$updates" --maxWorkers=1
+  git diff --exit-code
+  time python3 -IB /proof/review.py green
 else
   code=0
   pnpm test "$updates" --maxWorkers=1 --reporter=json --outputFile=/work/base-regression.json || code=$?

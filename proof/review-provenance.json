@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "preReviewTree": "0ea8cb4d0192111ffa234d77fe63a01bbe0c20af",
+  "expectedTree": "580bc22825a5937f3de7199c64e48b5c4ac67837",
+  "validatorBlob": "efdf8e8442a7087e14e856b04d02932b7dcbbfac",
+  "patchSha256": "e56d18dfd4994a4dd4f9748d2c3a19ca7805a6ad58abe04c1bc8c3460e2bab94",
+  "manifestSha256": "53afe99ed3d4800f65df7c3931c29ca50534e3144c23b1f3ea4e9651204d5afa",
+  "changedPaths": [
+    "src/gateway/server-methods/update-status-schedule.test.ts",
+    "src/infra/update-status-schedule.ts",
+    "ui/src/app/overlays-updates.ts",
+    "ui/src/app/update-confirmation.runtime.test.ts",
+    "ui/src/app/update-confirmation.runtime.tsx"
+  ]
+}
