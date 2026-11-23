@@ -1,12 +1,11 @@
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { randomBytes, randomUUID } from 'node:crypto';
 import * as fs from 'node:fs';
 import { createRequire } from 'node:module';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
-import { DatabaseSync } from 'node:sqlite';
 import { setTimeout as sleep } from 'node:timers/promises';
 
 const [leg, source, output, ...extra] = process.argv.slice(2);
@@ -94,19 +93,22 @@ async function freePort() {
   return port;
 }
 function seedFailedRun(id) {
-  const file = join(state, 'state/openclaw.sqlite');
-  assert.ok(fs.statSync(file).isFile(), 'Gateway did not initialize its state database');
-  const db = new DatabaseSync(file);
-  try {
-    db.exec('PRAGMA busy_timeout=10000');
-    const now = Date.now();
-    const steps = [{ step: 'requested', status: 'completed' }, { step: 'staging', status: 'failed' }];
-    const inserted = db.prepare(`INSERT INTO update_runs (run_id, created_at_ms, updated_at_ms,
-      trigger, phase, status, reason, origin_json, target_json, before_json, after_json, steps_json,
-      verification_json, repair_json, finished_at_ms) VALUES (?, ?, ?, 'cli', 'finished', 'failed',
-      'build-failed', '{}', '{}', '{}', '{}', ?, '{}', '[]', ?)`).run(id, now - 2000, now, JSON.stringify(steps), now);
-    assert.equal(inserted.changes, 1);
-  } finally { db.close(); }
+  const writer = `
+    import assert from 'node:assert/strict';
+    import {createUpdateRun, recordUpdateRunPhase, finishUpdateRun, getUpdateRun} from './src/infra/update-run-ledger.ts';
+    const runId = process.argv[1];
+    assert.equal(createUpdateRun({runId, trigger: 'cli'}).runId, runId);
+    recordUpdateRunPhase(runId, 'staging');
+    finishUpdateRun(runId, {status: 'failed', reason: 'build-failed'});
+    const saved = getUpdateRun(runId);
+    assert.equal(saved?.status, 'failed');
+    assert.equal(saved.reason, 'build-failed');
+    assert.ok(saved.steps.some(step => step.step === 'staging' && step.status === 'failed'));
+  `;
+  const child = spawnSync(process.execPath, ['--import', './scripts/tsx.mjs', '--input-type=module', '-e', writer, id],
+    { cwd: root, env, timeout: 90000, stdio: ['ignore', 'ignore', 'pipe'], encoding: 'utf8' });
+  if (child.error) throw child.error;
+  assert.equal(child.status, 0, `Ledger fixture writer failed: ${child.stderr.slice(-1200)}`);
 }
 async function launchBrowser() {
   const noSandbox = process.env.PROOF_CHROMIUM_NO_SANDBOX === '1';
@@ -134,19 +136,22 @@ try {
     auth: { mode: 'token', token: randomBytes(32).toString('hex') }, controlUi: { enabled: true, root: uiRoot } },
     update: { checkOnStart: true, auto: { enabled: false } }, discovery: { mdns: { mode: 'off' } } }));
   tell('starting built Gateway on loopback');
-  const gateway = start(['gateway', 'run', '--bind', 'loopback', '--port', String(port)]);
-  let spawnFailure;
-  gateway.on('error', err => { spawnFailure = err; });
-  const deadline = Date.now() + 180_000;
-  for (;;) {
-    if (spawnFailure) throw spawnFailure;
-    assert.ok(gateway.exitCode === null && gateway.signalCode === null, `Gateway exited before ready (${gateway.exitCode ?? gateway.signalCode})`);
-    assert.ok(Date.now() < deadline, 'Gateway /readyz timeout');
-    const response = await fetch(`${origin}/readyz`, { redirect: 'error', signal: AbortSignal.timeout(2000) }).catch(() => null);
-    await response?.body?.cancel();
-    if (response?.ok) break;
-    await sleep(350);
+  async function startGateway() {
+    const gateway = start(['gateway', 'run', '--bind', 'loopback', '--port', String(port)]);
+    let spawnFailure;
+    gateway.on('error', err => { spawnFailure = err; });
+    const deadline = Date.now() + 180_000;
+    for (;;) {
+      if (spawnFailure) throw spawnFailure;
+      assert.ok(gateway.exitCode === null && gateway.signalCode === null, `Gateway exited before ready (${gateway.exitCode ?? gateway.signalCode})`);
+      assert.ok(Date.now() < deadline, 'Gateway /readyz timeout');
+      const response = await fetch(`${origin}/readyz`, { redirect: 'error', signal: AbortSignal.timeout(2000) }).catch(() => null);
+      await response?.body?.cancel();
+      if (response?.ok) return gateway;
+      await sleep(350);
+    }
   }
+  const firstGateway = await startGateway();
   tell('launching Chromium');
   browser = await launchBrowser();
   const context = await browser.newContext({ viewport: { width: 1440, height: 1000 }, locale: 'en-US',
@@ -221,7 +226,17 @@ try {
   };
   const cleanPng = await capture(status);
   tell('seeding failed update in the disposable Gateway ledger');
+  await page.goto('about:blank');
+  assert.ok(signalGroup(firstGateway.pid, 'SIGTERM'), 'Fixture Gateway unexpectedly stopped');
+  const stopBy = Date.now() + 90000;
+  while (signalGroup(firstGateway.pid, 0)) {
+    assert.ok(Date.now() < stopBy, 'Fixture Gateway did not release its state');
+    await sleep(200);
+  }
+  groups.delete(firstGateway.pid);
   seedFailedRun(runId);
+  tell('opening Settings with the recorded failed update');
+  await startGateway();
   await visitUpdates();
   await verify.poll(() => failedRead, { message: 'Real update.status must return the seeded failed run' }).toBe(true);
   const check = history.getByRole('button', { name: 'Check status', exact: true });
